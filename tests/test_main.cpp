@@ -25,6 +25,9 @@
 #include "backends/android/aaudio_backend.hpp"
 #include "audio_core/dsp/anti_aliasing_filter.hpp"
 #include "audio_core/dsp/dither.hpp"
+#include "audio_core/dsp/fft.hpp"
+#include "audio_core/dsp/crossover.hpp"
+#include "audio_core/analysis/measurement_engine.hpp"
 #include <numbers>
 
 #include <iostream>
@@ -2270,6 +2273,260 @@ void test_anti_aliasing_and_airwindows_dither() {
     }
 }
 
+void test_acoustic_measurement_and_crossover_engine() {
+    std::cout << "[TEST] Running Acoustic Measurement Engine & Linkwitz-Riley Crossover Test..." << std::endl;
+
+    using namespace audio_core::dsp;
+    using namespace audio_core::analysis;
+
+    // 1. FastFourierTransform Forward/Inverse Roundtrip & Convolution
+    {
+        constexpr size_t N = 1024;
+        std::vector<FastFourierTransform::Complex> x(N);
+        for (size_t i = 0; i < N; ++i) {
+            float phase = 2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / 48000.0f;
+            x[i] = FastFourierTransform::Complex(std::sin(phase), std::cos(phase * 0.5f));
+        }
+
+        std::vector<FastFourierTransform::Complex> orig = x;
+        FastFourierTransform::forward(x);
+        FastFourierTransform::inverse(x);
+
+        float max_err = 0.0f;
+        for (size_t i = 0; i < N; ++i) {
+            max_err = std::max(max_err, std::abs(x[i].real() - orig[i].real()));
+            max_err = std::max(max_err, std::abs(x[i].imag() - orig[i].imag()));
+        }
+        TEST_CHECK(max_err < 1e-4f);
+
+        // Fast convolution test: convolve delta impulse with arbitrary signal
+        std::vector<float> sig = {1.0f, 2.0f, 3.0f, 4.0f};
+        std::vector<float> delta = {1.0f, 0.0f, 0.0f};
+        std::vector<float> conv = FastFourierTransform::convolve(sig.data(), sig.size(), delta.data(), delta.size());
+        TEST_CHECK(conv.size() == 6);
+        for (size_t i = 0; i < sig.size(); ++i) {
+            TEST_CHECK(std::abs(conv[i] - sig[i]) < 1e-4f);
+        }
+
+        std::cout << "  -> FFT & Fast Convolution: PASSED (Roundtrip error=" << max_err << " < 1e-4)" << std::endl;
+    }
+
+    // 2. Linkwitz-Riley 4th-Order (LR4) 2-Way Crossover Unity Summation & Isolation
+    {
+        LinkwitzRiley2Way lr(1000.0f, 48000);
+        constexpr uint32_t kFrames = 2048;
+
+        // Test with a multi-frequency composite signal: 100 Hz (bass) + 10 kHz (treble)
+        std::vector<float> in_l(kFrames), in_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            float s_low = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 100.0f * t);
+            float s_high = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * t);
+            in_l[i] = s_low + s_high;
+            in_r[i] = s_low - s_high;
+        }
+
+        std::vector<float> low_l(kFrames), low_r(kFrames);
+        std::vector<float> high_l(kFrames), high_r(kFrames);
+
+        lr.process_stereo(in_l.data(), in_r.data(),
+                          low_l.data(), low_r.data(),
+                          high_l.data(), high_r.data(),
+                          kFrames);
+
+        // Sum low + high and check reconstruction energy after filter settles (samples 500..2048)
+        float rms_in = 0.0f;
+        float rms_sum = 0.0f;
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            float sum_l = low_l[i] + high_l[i];
+            rms_in += in_l[i] * in_l[i];
+            rms_sum += sum_l * sum_l;
+        }
+        rms_in = std::sqrt(rms_in / (kFrames - 500));
+        rms_sum = std::sqrt(rms_sum / (kFrames - 500));
+        TEST_CHECK(std::abs(rms_sum - rms_in) < 0.005f);
+
+        // Isolation: At 10 kHz, low output should be heavily attenuated (>30 dB)
+        float max_low_treble = 0.0f;
+        lr.reset();
+        std::vector<float> pure_10k(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            pure_10k[i] = std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * static_cast<float>(i) / 48000.0f);
+        }
+        lr.process_stereo(pure_10k.data(), pure_10k.data(),
+                          low_l.data(), low_r.data(),
+                          high_l.data(), high_r.data(),
+                          kFrames);
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            max_low_treble = std::max(max_low_treble, std::abs(low_l[i]));
+        }
+        TEST_CHECK(max_low_treble < 0.005f);
+
+        std::cout << "  -> Linkwitz-Riley 2-Way (LR4): PASSED (Flat unity sum, 10kHz leakage into low=" 
+                  << max_low_treble << " (<46dB))" << std::endl;
+    }
+
+    // 3. Linkwitz-Riley 3-Way Crossover (Low / Mid / High Multiband Split)
+    {
+        LinkwitzRiley3Way lr3(200.0f, 3000.0f, 48000);
+        constexpr uint32_t kFrames = 2048;
+
+        std::vector<float> in_l(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            in_l[i] = 0.33f * (std::sin(2.0f * std::numbers::pi_v<float> * 80.0f * t) +
+                               std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * t) +
+                               std::sin(2.0f * std::numbers::pi_v<float> * 8000.0f * t));
+        }
+
+        std::vector<float> low_l(kFrames), low_r(kFrames);
+        std::vector<float> mid_l(kFrames), mid_r(kFrames);
+        std::vector<float> high_l(kFrames), high_r(kFrames);
+
+        lr3.process_stereo(in_l.data(), in_l.data(),
+                           low_l.data(), low_r.data(),
+                           mid_l.data(), mid_r.data(),
+                           high_l.data(), high_r.data(),
+                           kFrames);
+
+        float rms_in = 0.0f, rms_sum = 0.0f;
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            float sum = low_l[i] + mid_l[i] + high_l[i];
+            rms_in += in_l[i] * in_l[i];
+            rms_sum += sum * sum;
+        }
+        rms_in = std::sqrt(rms_in / (kFrames - 500));
+        rms_sum = std::sqrt(rms_sum / (kFrames - 500));
+        TEST_CHECK(std::abs(rms_sum - rms_in) < 0.005f);
+
+        std::cout << "  -> Linkwitz-Riley 3-Way Multiband Split: PASSED (RMS in=" << rms_in 
+                  << " vs sum=" << rms_sum << ", delta < 0.005)" << std::endl;
+    }
+
+    // 4. Farina Exponential Sine Sweep (ESS) Generation & Self-Deconvolution
+    {
+        FarinaSweepGenerator::SweepParams params;
+        params.start_freq = 50.0f;
+        params.stop_freq = 15000.0f;
+        params.duration_sec = 0.2f; // 200ms sweep (9600 samples @ 48k)
+        params.sample_rate = 48000;
+        params.fade_sec = 0.005f;
+
+        FarinaSweepGenerator gen(params);
+        std::vector<float> sweep = gen.generate_sweep();
+        std::vector<float> inv_filter = gen.generate_inverse_filter();
+
+        TEST_CHECK(!sweep.empty());
+        TEST_CHECK(sweep.size() == inv_filter.size());
+
+        // Deconvolve ideal sweep with its own inverse filter (self-deconvolution)
+        std::vector<float> ir = AcousticMeasurementEngine::deconvolve(sweep, inv_filter);
+        TEST_CHECK(!ir.empty());
+
+        // The impulse response should peak at sweep.size() - 1
+        size_t expected_peak_idx = sweep.size() - 1;
+        float max_peak = 0.0f;
+        size_t actual_peak_idx = 0;
+        for (size_t i = 0; i < ir.size(); ++i) {
+            float a = std::abs(ir[i]);
+            if (a > max_peak) {
+                max_peak = a;
+                actual_peak_idx = i;
+            }
+        }
+
+        // Peak must be precisely aligned and sharp (amplitude > 0.5)
+        TEST_CHECK(std::abs(static_cast<int64_t>(actual_peak_idx) - static_cast<int64_t>(expected_peak_idx)) <= 2);
+        TEST_CHECK(max_peak > 0.5f);
+
+        std::cout << "  -> Farina ESS Self-Deconvolution: PASSED (Sharp Dirac peak=" << max_peak 
+                  << " at sample " << actual_peak_idx << ")" << std::endl;
+    }
+
+    // 5. Acoustic Room Simulation: Time-of-Flight & Room Mode Detection
+    {
+        FarinaSweepGenerator::SweepParams params;
+        params.start_freq = 30.0f;
+        params.stop_freq = 16000.0f;
+        params.duration_sec = 0.25f; // 250ms sweep (12000 samples @ 48k)
+        params.sample_rate = 48000;
+        params.fade_sec = 0.005f;
+
+        FarinaSweepGenerator gen(params);
+        std::vector<float> sweep = gen.generate_sweep();
+        std::vector<float> inv_filter = gen.generate_inverse_filter();
+
+        // Synthetic Room Simulation:
+        // Delay D = 480 samples = 10.0 ms = 3.43 meters
+        // Room resonance: 60 Hz mode simulated with a resonator biquad
+        constexpr size_t kDelaySamples = 480;
+        std::vector<float> room_response(sweep.size() + kDelaySamples + 4000, 0.0f);
+
+        // Inject direct sound delayed by 480 samples
+        for (size_t i = 0; i < sweep.size(); ++i) {
+            room_response[i + kDelaySamples] += sweep[i];
+        }
+
+        // Inject a simulated resonant room mode at 60 Hz with ringing tail
+        StereoBiquad mode_filter;
+        // Peak EQ at 60 Hz: Q = 6.0, Boost = +12 dB
+        {
+            float f0 = 60.0f;
+            float q = 6.0f;
+            float gain_db = 12.0f;
+            float A = std::pow(10.0f, gain_db / 40.0f);
+            float w0 = 2.0f * std::numbers::pi_v<float> * f0 / 48000.0f;
+            float alpha = std::sin(w0) / (2.0f * q);
+            float a0 = 1.0f + alpha / A;
+            mode_filter.b0 = (1.0f + alpha * A) / a0;
+            mode_filter.b1 = (-2.0f * std::cos(w0)) / a0;
+            mode_filter.b2 = (1.0f - alpha * A) / a0;
+            mode_filter.a1 = (-2.0f * std::cos(w0)) / a0;
+            mode_filter.a2 = (1.0f - alpha / A) / a0;
+        }
+
+        // Filter room response through resonance
+        for (size_t i = 0; i < room_response.size(); ++i) {
+            float out_l = 0.0f, out_r = 0.0f;
+            mode_filter.process_sample(room_response[i], room_response[i], out_l, out_r);
+            room_response[i] = out_l;
+        }
+
+        // Deconvolve room response
+        std::vector<float> ir = AcousticMeasurementEngine::deconvolve(room_response, inv_filter);
+
+        // Analyze Time-of-Flight
+        float tof_sec = 0.0f;
+        float dist_m = 0.0f;
+        bool tof_ok = AcousticMeasurementEngine::analyze_time_of_flight(ir, 48000, sweep.size(), tof_sec, dist_m);
+        TEST_CHECK(tof_ok);
+
+        // Verify delay: 480 samples / 48000 = 0.010 sec (10.0 ms), distance = 3.43 m
+        TEST_CHECK(std::abs(tof_sec - 0.010f) < 0.0005f); // Within 0.5 ms
+        TEST_CHECK(std::abs(dist_m - 3.43f) < 0.15f);     // Within 15 cm
+
+        // Detect Room Modes
+        size_t peak_offset = (sweep.size() - 1) + kDelaySamples;
+        std::vector<RoomMode> modes = AcousticMeasurementEngine::detect_room_modes(ir, 48000, peak_offset, 8192, 250.0f, 6.0f);
+
+        // Verify that the 60 Hz room mode is found
+        TEST_CHECK(!modes.empty());
+        bool found_60hz = false;
+        for (const auto& m : modes) {
+            if (std::abs(m.frequency_hz - 60.0f) < 5.0f && m.q_factor >= 2.0f) {
+                found_60hz = true;
+                break;
+            }
+        }
+        TEST_CHECK(found_60hz);
+
+        std::cout << "  -> Room Diagnostics: PASSED (TOF=" << tof_sec * 1000.0f 
+                  << " ms, Dist=" << dist_m << " m, Room Mode detected at " 
+                  << modes[0].frequency_hz << " Hz with Q=" << modes[0].q_factor 
+                  << ", Recommended cut=" << modes[0].recommended_notch_gain_db << " dB)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -2300,6 +2557,7 @@ int main() {
     test_native_android_aaudio_backend();
     test_sample_rate_agility_and_hermite_resampling();
     test_anti_aliasing_and_airwindows_dither();
+    test_acoustic_measurement_and_crossover_engine();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
