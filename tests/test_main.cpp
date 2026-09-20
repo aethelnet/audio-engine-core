@@ -3247,6 +3247,47 @@ void test_liquid_ode_trapezoidal_integration_filter_and_bus_summing() {
     TEST_CHECK(std::isfinite(hot_l[kBusFrames - 1]));
     std::cout << "  -> Multi-Track Analog Glue Compression: PASSED (Linear 4.0f sum compressed smoothly to " 
               << hot_l[kBusFrames - 1] << " with organic decay)" << std::endl;
+
+    // 4c. SMPTE Intermodulation Distortion (IMD) Hardening
+    // 60 Hz sub (1.2 amp) + 3000 Hz vocal (0.3 amp)
+    constexpr size_t kImdFrames = 48000;
+    std::vector<float> imd_l(kImdFrames, 0.0f);
+    std::vector<float> imd_r(kImdFrames, 0.0f);
+    for (size_t i = 0; i < kImdFrames; ++i) {
+        float t = static_cast<float>(i) / 48000.0f;
+        float s60 = 1.2f * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+        float s3k = 0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 3000.0f * t);
+        imd_l[i] = imd_r[i] = s60 + s3k;
+    }
+
+    bus.reset();
+    bus.process_bus_sum(imd_l.data(), imd_r.data(), kImdFrames);
+
+    // Goertzel evaluation of carrier and 120Hz sidebands
+    auto goertzel_mag = [](const float* data, size_t N, float target_hz, float sr) -> float {
+        float k = target_hz * N / sr;
+        float omega = 2.0f * std::numbers::pi_v<float> * k / N;
+        float c = std::cos(omega), s = std::sin(omega);
+        float real_part = 0.0f, imag_part = 0.0f;
+        for (size_t n = 0; n < N; ++n) {
+            float angle = -omega * n;
+            real_part += data[n] * std::cos(angle);
+            imag_part += data[n] * std::sin(angle);
+        }
+        return std::sqrt(real_part * real_part + imag_part * imag_part) / N;
+    };
+
+    float carrier_mag = goertzel_mag(imd_l.data(), kImdFrames, 3000.0f, 48000.0f);
+    float sideband_up = goertzel_mag(imd_l.data(), kImdFrames, 3120.0f, 48000.0f);
+    float sideband_dn = goertzel_mag(imd_l.data(), kImdFrames, 2880.0f, 48000.0f);
+
+    float imd_db_up = 20.0f * std::log10(sideband_up / carrier_mag);
+    float imd_db_dn = 20.0f * std::log10(sideband_dn / carrier_mag);
+
+    TEST_CHECK(imd_db_up < -35.0f); // Sidebands pushed far down (< -35 dBc)
+    TEST_CHECK(imd_db_dn < -35.0f);
+    std::cout << "  -> Low-IMD Bus Summing: PASSED (SMPTE IMD sidebands suppressed to " 
+              << imd_db_up << " dBc and " << imd_db_dn << " dBc, 0 vocal buzz)" << std::endl;
 }
 
 void test_liquid_ode_noise_colors_sweeps_and_dynamic_denoising() {

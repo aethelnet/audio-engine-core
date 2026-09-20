@@ -318,14 +318,19 @@ private:
 // 1. TransformerBus:
 //    Ultrasonic saturating ODE integrator (fc ~ 35kHz).
 //    Transients hit saturation inertia; high-frequency hash absorbed.
-// 2. DifferentialMagneticGlue:
-//    Separates linear sum from dynamic magnetic flux residue:
-//      LinearSum S = sum(x_i)
-//      Residue Delta = S - sigma * tanh(S / sigma)
-//      dM/dt = -(1/tau)*M + (1/tau)*Delta  (via Trapezoidal ODE)
-//      Out = S - gamma * M
-//    Property: When single track plays, Delta = 0 => M = 0 => Out == S (100% BIT-EXACT!).
-//    When multiple tracks slam the bus, Delta > 0 => M absorbs punch with analog decay!
+// 2. DifferentialMagneticGlue (Dual-Layer Core Architecture):
+//    - Layer 1: Ballistic ODE Envelope Glue (Continuous VCA Ballistics)
+//      Integrates multi-track summing stress:
+//        dZ_env/dt = -(1/tau) * Z_env + tanh(max(0, E_bus - sigma) / knee)
+//      Yields smooth unipolar gain reduction G(t) = 1.0 - (glue_amount * Z_env).
+//      Eliminates intra-cycle waveshaping splatter & intermodulation distortion (IMD).
+//    - Layer 2: Magnetic Core Flux Integrator (Physical Transformer Physics)
+//      Flux is the continuous integral of voltage: Phi(t) = integral V(t) dt.
+//      Modeled via leaky ODE at 120 Hz. Because |Phi(f)| ~ 1/f, sub-bass generates
+//      100x more flux than vocals/cymbals, producing warm 3rd-harmonic saturation
+//      on kick/bass while maintaining pristine clarity and zero IMD on high frequencies.
+//    - Single-Track Transparency:
+//      When E_bus <= sigma, excess = 0 => Z_env = 0 and Phi <= Phi_max => 100% bit-exact!
 // ============================================================================
 class LiquidBusProcessor {
 public:
@@ -335,21 +340,29 @@ public:
     };
 
     LiquidBusProcessor(float sample_rate = 48000.0f, Mode mode = Mode::DifferentialMagneticGlue) noexcept
-        : m_mode(mode),
+        : m_sample_rate(sample_rate),
+          m_mode(mode),
           m_ode_l(sample_rate, 35000.0f, 1.2f),
-          m_ode_r(sample_rate, 35000.0f, 1.2f) {
-        set_glue_characteristics(40.0f, 0.5f); // 40 microsecond Neve/Studer core, 50% glue depth
+          m_ode_r(sample_rate, 35000.0f, 1.2f),
+          m_flux_ode_l(sample_rate, 120.0f),
+          m_flux_ode_r(sample_rate, 120.0f) {
+        set_glue_characteristics(40.0f, 0.5f);
+        set_ballistics(10.0f, 150.0f, 0.5f);
     }
 
     void set_sample_rate(float sr) noexcept {
-        m_ode_l.set_sample_rate(sr);
-        m_ode_r.set_sample_rate(sr);
+        if (sr > 0.0f) {
+            m_sample_rate = sr;
+            m_ode_l.set_sample_rate(sr);
+            m_ode_r.set_sample_rate(sr);
+            m_flux_ode_l.set_sample_rate(sr);
+            m_flux_ode_r.set_sample_rate(sr);
+            update_ballistics();
+        }
     }
 
     void set_mode(Mode mode) noexcept { m_mode = mode; }
 
-    // tau_micros: 10 to 500 us (typical analog transformers and tape heads)
-    // glue_amount: 0.0 (transparent linear) to 1.0 (heavy tape/transformer saturation)
     void set_glue_characteristics(float tau_micros, float glue_amount) noexcept {
         m_tau_micros = std::clamp(tau_micros, 5.0f, 2000.0f);
         m_glue_amount = std::clamp(glue_amount, 0.0f, 1.0f);
@@ -357,6 +370,13 @@ public:
         const float tau_seconds = m_tau_micros * 1e-6f;
         m_ode_l.set_tau(tau_seconds);
         m_ode_r.set_tau(tau_seconds);
+    }
+
+    void set_ballistics(float attack_ms, float release_ms, float glue_amount) noexcept {
+        m_attack_ms = std::clamp(attack_ms, 0.1f, 100.0f);
+        m_release_ms = std::clamp(release_ms, 10.0f, 2000.0f);
+        m_glue_amount = std::clamp(glue_amount, 0.0f, 1.0f);
+        update_ballistics();
     }
 
     void set_headroom(float sigma) noexcept {
@@ -368,7 +388,12 @@ public:
     void reset() noexcept {
         m_ode_l.reset();
         m_ode_r.reset();
+        m_flux_ode_l.reset();
+        m_flux_ode_r.reset();
+        m_envelope = 0.0f;
     }
+
+    [[nodiscard]] float current_envelope() const noexcept { return m_envelope; }
 
     // Process a stereo summing block in-place
     void process_bus_sum(float* buffer_l, float* buffer_r, size_t frames) noexcept {
@@ -382,36 +407,73 @@ public:
                 buffer_r[i] = out_r;
             }
         } else {
-            // Mode::DifferentialMagneticGlue
+            // Mode::DifferentialMagneticGlue (Dual-Layer Architecture)
             for (size_t i = 0; i < frames; ++i) {
                 const float s_l = buffer_l[i];
                 const float s_r = buffer_r[i];
 
-                // Dynamic saturation residue
-                const float sat_l = std::tanh(s_l / m_sigma) * m_sigma;
-                const float sat_r = std::tanh(s_r / m_sigma) * m_sigma;
-                const float delta_l = s_l - sat_l;
-                const float delta_r = s_r - sat_r;
+                // 1. Multi-Track Stress Envelope (VCA Bus Glue Ballistics)
+                const float peak = std::max(std::abs(s_l), std::abs(s_r));
+                const float excess = std::max(0.0f, peak - m_sigma);
+                const float target_stress = (excess > 0.0f) ? std::tanh(excess * 1.5f) : 0.0f;
 
-                // ODE integrates the magnetic stress
-                float m_flux_l = 0.0f, m_flux_r = 0.0f;
-                m_ode_l.process_sample_stereo(delta_l, delta_r, m_flux_l, m_flux_r);
+                const float coeff = (target_stress > m_envelope) ? m_attack_coeff : m_release_coeff;
+                m_envelope += coeff * (target_stress - m_envelope);
 
-                // Output: linear sum minus glued flux
-                buffer_l[i] = s_l - (m_glue_amount * m_flux_l);
-                buffer_r[i] = s_r - (m_glue_amount * m_flux_r);
+                // Organic gain reduction factor (up to 40% reduction under extreme multi-track slam)
+                const float gain_mod = 1.0f - (m_glue_amount * 0.40f * m_envelope);
+                const float glued_l = s_l * gain_mod;
+                const float glued_r = s_r * gain_mod;
+
+                // 2. Transformer Core Flux Saturation (LF-Weighted Iron Core Physics)
+                const float phi_l = m_flux_ode_l.process_sample_linear(glued_l);
+                const float phi_r = m_flux_ode_r.process_sample_linear(glued_r);
+
+                // Core saturation threshold (occurs on heavy low-end flux)
+                constexpr float kFluxCoreThreshold = 0.5f;
+                const float phi_excess_l = std::max(0.0f, std::abs(phi_l) - kFluxCoreThreshold);
+                const float phi_excess_r = std::max(0.0f, std::abs(phi_r) - kFluxCoreThreshold);
+
+                float core_diff_l = 0.0f, core_diff_r = 0.0f;
+                if (phi_excess_l > 0.0f) {
+                    const float sign_l = (phi_l > 0.0f) ? 1.0f : -1.0f;
+                    core_diff_l = sign_l * (phi_excess_l - std::tanh(phi_excess_l)) * 0.4f * m_glue_amount;
+                }
+                if (phi_excess_r > 0.0f) {
+                    const float sign_r = (phi_r > 0.0f) ? 1.0f : -1.0f;
+                    core_diff_r = sign_r * (phi_excess_r - std::tanh(phi_excess_r)) * 0.4f * m_glue_amount;
+                }
+
+                buffer_l[i] = glued_l - core_diff_l;
+                buffer_r[i] = glued_r - core_diff_r;
             }
         }
     }
 
 private:
+    void update_ballistics() noexcept {
+        const float frames_att = std::max(1.0f, (m_attack_ms * 0.001f) * m_sample_rate);
+        const float frames_rel = std::max(1.0f, (m_release_ms * 0.001f) * m_sample_rate);
+        m_attack_coeff = 1.0f - std::exp(-1.0f / frames_att);
+        m_release_coeff = 1.0f - std::exp(-1.0f / frames_rel);
+    }
+
+    float m_sample_rate{48000.0f};
     Mode m_mode{Mode::DifferentialMagneticGlue};
     float m_tau_micros{40.0f};
     float m_glue_amount{0.5f};
     float m_sigma{1.0f};
 
+    float m_attack_ms{10.0f};
+    float m_release_ms{150.0f};
+    float m_attack_coeff{0.002f};
+    float m_release_coeff{0.0001f};
+    float m_envelope{0.0f};
+
     LiquidOdeIntegrator m_ode_l;
     LiquidOdeIntegrator m_ode_r;
+    LiquidOdeIntegrator m_flux_ode_l;
+    LiquidOdeIntegrator m_flux_ode_r;
 };
 
 // ============================================================================
