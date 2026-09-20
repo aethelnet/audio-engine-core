@@ -6,6 +6,8 @@
 #include "audio_core/dsp/console_processor.hpp"
 #include "audio_core/protocol/command_packet.hpp"
 #include "audio_core/protocol/telemetry_packet.hpp"
+#include "audio_core/sampling/sample_tap.hpp"
+#include "audio_core/network/aoip_receiver.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -53,6 +55,8 @@ public:
         for (auto& s : m_sends) {
             s.active = false;
         }
+        m_clip.reset();
+        m_clip_playhead.store(0, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
         m_active.store(true, std::memory_order_release);
@@ -63,6 +67,8 @@ public:
         for (auto& s : m_sends) {
             s.active = false;
         }
+        m_clip.reset();
+        m_clip_playhead.store(0, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
     }
@@ -127,6 +133,40 @@ public:
 
     [[nodiscard]] AudioBuffer& buffer() noexcept { return m_buffer; }
     [[nodiscard]] const AudioBuffer& buffer() const noexcept { return m_buffer; }
+
+    void set_clip(std::shared_ptr<sampling::AudioClip> clip, bool loop = true) noexcept {
+        m_clip = std::move(clip);
+        m_clip_loop.store(loop, std::memory_order_relaxed);
+        m_clip_playhead.store(0, std::memory_order_relaxed);
+    }
+
+    void clear_clip() noexcept {
+        m_clip.reset();
+        m_clip_playhead.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool has_clip() const noexcept {
+        return m_clip != nullptr;
+    }
+
+    [[nodiscard]] uint64_t clip_playhead() const noexcept {
+        return m_clip_playhead.load(std::memory_order_relaxed);
+    }
+
+    void set_clip_playhead(uint64_t playhead) noexcept {
+        m_clip_playhead.store(playhead, std::memory_order_relaxed);
+    }
+
+    // Called inside RT render loop before channel strip processing
+    void render_input(uint32_t frames) noexcept {
+        if (m_clip) {
+            Sample* left = m_buffer.view().channel(0);
+            Sample* right = m_buffer.view().channel(1);
+            uint64_t ph = m_clip_playhead.load(std::memory_order_relaxed);
+            m_clip->read(ph, left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
+            m_clip_playhead.store(ph, std::memory_order_relaxed);
+        }
+    }
 
     [[nodiscard]] MeterLevels meter() const noexcept {
         return MeterLevels{
@@ -196,6 +236,10 @@ private:
     std::array<InsertSlot, kMaxTrackInsertSlots> m_slots;
     std::array<SendInfo, kMaxTrackSends> m_sends{};
     dsp::ConsoleProcessor m_console;
+
+    std::shared_ptr<sampling::AudioClip> m_clip{nullptr};
+    std::atomic<bool> m_clip_loop{true};
+    std::atomic<uint64_t> m_clip_playhead{0};
 
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
@@ -332,6 +376,7 @@ class MixerGraph {
 public:
     static constexpr size_t kMaxTracks = 32;
     static constexpr size_t kMaxBuses = 16;
+    static constexpr size_t kMaxSampleTaps = 4;
 
     explicit MixerGraph(uint32_t buffer_frames = 1024)
         : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames) {
@@ -342,7 +387,29 @@ public:
         for (size_t i = 0; i < kMaxBuses; ++i) {
             m_buses[i] = std::make_unique<AudioBus>(static_cast<uint32_t>(i + 1), "Bus " + std::to_string(i + 1), buffer_frames);
         }
+        for (size_t i = 0; i < kMaxSampleTaps; ++i) {
+            m_taps[i] = std::make_unique<sampling::SampleTap>(48000, 10.0f);
+        }
         recompute_bus_order();
+    }
+
+    [[nodiscard]] sampling::SampleTap* tap(size_t index) noexcept {
+        return (index < kMaxSampleTaps) ? m_taps[index].get() : nullptr;
+    }
+
+    [[nodiscard]] const sampling::SampleTap* tap(size_t index) const noexcept {
+        return (index < kMaxSampleTaps) ? m_taps[index].get() : nullptr;
+    }
+
+    // Ingest incoming AoIP network frames into all mapped active tracks
+    void ingest_aoip(network::AoipReceiver& receiver, uint32_t frames) noexcept {
+        for (auto& track : m_tracks) {
+            if (track->is_active() && !track->has_clip()) {
+                Sample* l = track->buffer().view().channel(0);
+                Sample* r = track->buffer().view().channel(1);
+                receiver.read_track_frames(track->id(), l, r, frames);
+            }
+        }
     }
 
     Track* allocate_track(const std::string& name) {
@@ -573,16 +640,42 @@ public:
                 continue;
             }
 
+            // Fill from active clip if present
+            track->render_input(frames);
+
+            const Sample* raw_l = track->buffer().view().channel(0);
+            const Sample* raw_r = track->buffer().view().channel(1);
+
+            // Tap Pre-FX track input (raw network stream / local app capture)
+            for (auto& tap : m_taps) {
+                if (tap && tap->is_active()) {
+                    auto src = tap->source();
+                    if (src.type == sampling::TapSourceType::TrackInput && src.source_id == track->id()) {
+                        tap->record(raw_l, raw_r, frames);
+                    }
+                }
+            }
+
             // In-line Channel Strip processing (Inserts + Console)
             track->process_channel_strip(frames);
+
+            const Sample* trk_l = track->buffer().view().channel(0);
+            const Sample* trk_r = track->buffer().view().channel(1);
+
+            // Tap Post-FX track output (inserts + console effects applied live!)
+            for (auto& tap : m_taps) {
+                if (tap && tap->is_active()) {
+                    auto src = tap->source();
+                    if (src.type == sampling::TapSourceType::TrackOutput && src.source_id == track->id()) {
+                        tap->record(trk_l, trk_r, frames);
+                    }
+                }
+            }
 
             const float gain = track->gain();
             const auto [pan_l, pan_r] = calculate_pan_gains(track->pan());
             const float left_gain = gain * pan_l;
             const float right_gain = gain * pan_r;
-
-            const Sample* trk_l = track->buffer().view().channel(0);
-            const Sample* trk_r = track->buffer().view().channel(1);
 
             // Routing destination: Submix bus or Master
             const int32_t target_id = track->target_bus();
@@ -626,6 +719,16 @@ public:
             const Sample* b_l = bus->buffer().view().channel(0);
             const Sample* b_r = bus->buffer().view().channel(1);
 
+            // Tap Submix Bus output (e.g. processed drum bus bounce!)
+            for (auto& tap : m_taps) {
+                if (tap && tap->is_active()) {
+                    auto src = tap->source();
+                    if (src.type == sampling::TapSourceType::BusOutput && src.source_id == bus->id()) {
+                        tap->record(b_l, b_r, frames);
+                    }
+                }
+            }
+
             int32_t tgt_id = bus->target_bus();
             AudioBus* target = (tgt_id >= 1 && tgt_id <= static_cast<int32_t>(kMaxBuses))
                                ? get_bus(static_cast<uint32_t>(tgt_id))
@@ -647,6 +750,16 @@ public:
         const float master_gain = m_master_bus.gain();
         const Sample* final_l = m_master_bus.buffer().view().channel(0);
         const Sample* final_r = m_master_bus.buffer().view().channel(1);
+
+        // Tap Master Output (full mix bounce)
+        for (auto& tap : m_taps) {
+            if (tap && tap->is_active()) {
+                auto src = tap->source();
+                if (src.type == sampling::TapSourceType::MasterOutput) {
+                    tap->record(final_l, final_r, frames);
+                }
+            }
+        }
 
         Sample* out_l = out_master.channel(0);
         Sample* out_r = (out_master.num_channels() > 1) ? out_master.channel(1) : out_l;
@@ -805,6 +918,7 @@ private:
 
     std::array<size_t, kMaxBuses> m_bus_render_order{};
     size_t m_bus_render_order_count{0};
+    std::array<std::unique_ptr<sampling::SampleTap>, kMaxSampleTaps> m_taps;
 };
 
 } // namespace audio_core

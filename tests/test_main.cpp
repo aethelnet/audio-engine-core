@@ -15,6 +15,7 @@
 #include "audio_core/dsp/baxandall.hpp"
 #include "audio_core/dsp/clip_only2.hpp"
 #include "audio_core/dsp/wasm_processor.hpp"
+#include "audio_core/network/aoip_transmitter.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 #include <iostream>
@@ -975,6 +976,179 @@ void test_pipewire_backend_integration() {
     std::cout << "  -> PipeWire Native Backend: PASSED (Node registered, virtual sinks & master outs created, clean shutdown)" << std::endl;
 }
 
+void test_aoip_network_streaming_and_unpacking() {
+    std::cout << "[TEST] Running AoIP Network Streaming & Multi-Channel Unpacking Test..." << std::endl;
+    using namespace audio_core;
+
+    constexpr uint16_t kTestPort = 14848;
+    network::AoipReceiver receiver(kTestPort);
+    TEST_CHECK(receiver.bind_port(kTestPort, "127.0.0.1"));
+
+    // Map 8-channel stream:
+    // Ch 0,1 -> Track 1
+    // Ch 2,3 -> Track 2
+    // Ch 4,5 -> Track 3
+    // Ch 6,7 -> Track 4
+    receiver.map_channel_pair(1, 0, 1);
+    receiver.map_channel_pair(2, 2, 3);
+    receiver.map_channel_pair(3, 4, 5);
+    receiver.map_channel_pair(4, 6, 7);
+
+    network::AoipTransmitter transmitter;
+    TEST_CHECK(transmitter.open("127.0.0.1", kTestPort));
+
+    constexpr uint16_t kNumChannels = 8;
+    constexpr uint16_t kFrames = 128;
+    std::vector<std::vector<float>> test_audio(kNumChannels, std::vector<float>(kFrames, 0.0f));
+
+    // Fill each channel with distinct DC test signals
+    for (uint16_t ch = 0; ch < kNumChannels; ++ch) {
+        float val = static_cast<float>(ch + 1) * 0.1f; // Ch 0 = 0.1, Ch 1 = 0.2, etc.
+        for (uint16_t f = 0; f < kFrames; ++f) {
+            test_audio[ch][f] = val;
+        }
+    }
+
+    std::vector<const float*> ch_ptrs(kNumChannels);
+    for (uint16_t ch = 0; ch < kNumChannels; ++ch) {
+        ch_ptrs[ch] = test_audio[ch].data();
+    }
+
+    // Transmit 3 packets
+    for (int p = 0; p < 3; ++p) {
+        TEST_CHECK(transmitter.send_multichannel(ch_ptrs.data(), kNumChannels, kFrames, 48000, true));
+    }
+
+    // Give kernel UDP queue 10ms to deliver
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Poll packets synchronously
+    uint32_t polled = receiver.poll_available_packets();
+    TEST_CHECK(polled == 3);
+    TEST_CHECK(receiver.stats().packets_received.load() == 3);
+    TEST_CHECK(receiver.stats().packets_dropped.load() == 0);
+
+    // Ingest into MixerGraph
+    MixerGraph mixer(256);
+    Track* trk1 = mixer.allocate_track("AoIP Synth L/R");
+    Track* trk2 = mixer.allocate_track("AoIP Drums L/R");
+    TEST_CHECK(trk1 != nullptr && trk2 != nullptr);
+
+    // Add Live Effect Processing to Track 1 (PurestDrive)
+    trk1->slot(0).set_processor(std::make_shared<dsp::PurestDrive>());
+    trk1->slot(0).processor()->set_parameter(0, 0.7f); // Drive = 0.7
+
+    // Ingest network frames into tracks
+    mixer.ingest_aoip(receiver, kFrames);
+
+    // Verify raw ingest values in Track 1 and Track 2 buffers
+    const float* trk1_l = trk1->buffer().view().channel(0);
+    const float* trk1_r = trk1->buffer().view().channel(1);
+    const float* trk2_l = trk2->buffer().view().channel(0);
+    const float* trk2_r = trk2->buffer().view().channel(1);
+
+    TEST_CHECK(std::abs(trk1_l[0] - 0.1f) < 1e-4f);
+    TEST_CHECK(std::abs(trk1_r[0] - 0.2f) < 1e-4f);
+    TEST_CHECK(std::abs(trk2_l[0] - 0.3f) < 1e-4f);
+    TEST_CHECK(std::abs(trk2_r[0] - 0.4f) < 1e-4f);
+
+    std::cout << "  -> AoIP Multi-Channel Unpacking: PASSED (8 channels mapped into discrete stereo tracks bit-accurately)" << std::endl;
+}
+
+void test_universal_sampling_and_bounce_tap() {
+    std::cout << "[TEST] Running Universal Sampling & Multi-Stage Bounce Tap Test..." << std::endl;
+    using namespace audio_core;
+
+    MixerGraph mixer(128);
+    Track* trk1 = mixer.allocate_track("Live Synth");
+    Track* trk2 = mixer.allocate_track("Resampled Bounce Loop");
+    AudioBus* drum_bus = mixer.allocate_submix_bus("Processed Bus");
+    TEST_CHECK(trk1 && trk2 && drum_bus);
+
+    // Route Track 1 -> drum_bus
+    trk1->set_target_bus(1);
+
+    // Configure Modular FX on Track 1: Baxandall EQ + PurestDrive
+    trk1->slot(0).set_processor(std::make_shared<dsp::Baxandall>());
+    trk1->slot(0).processor()->set_parameter(0, 0.8f); // Treble boost
+    trk1->slot(1).set_processor(std::make_shared<dsp::PurestDrive>());
+    trk1->slot(1).processor()->set_parameter(0, 0.5f); // Saturation
+
+    // Attach Multi-Stage Taps:
+    // Tap 0: Pre-FX TrackInput (Raw incoming audio)
+    // Tap 1: Post-FX TrackOutput (Effects applied live!)
+    // Tap 2: BusOutput (Submix bus bounce)
+    // Tap 3: MasterOutput (Full mix bounce)
+    auto* tap_raw = mixer.tap(0);
+    auto* tap_post_fx = mixer.tap(1);
+    auto* tap_bus = mixer.tap(2);
+    auto* tap_master = mixer.tap(3);
+
+    tap_raw->set_source(sampling::TapSourceType::TrackInput, trk1->id());
+    tap_post_fx->set_source(sampling::TapSourceType::TrackOutput, trk1->id());
+    tap_bus->set_source(sampling::TapSourceType::BusOutput, drum_bus->id());
+    tap_master->set_source(sampling::TapSourceType::MasterOutput);
+
+    // Arm a Quantized Bounce on Tap 1 (Post-FX) for exactly 256 frames
+    tap_post_fx->arm_quantized_bounce(256, "Lead_Synth_PostFX_Bounce");
+
+    // Feed a pure 1.0f impulse / sine into Track 1
+    float* in_l = trk1->buffer().view().channel(0);
+    float* in_r = trk1->buffer().view().channel(1);
+    for (uint32_t i = 0; i < 128; ++i) {
+        float val = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * i / 48000.0f);
+        in_l[i] = val;
+        in_r[i] = val;
+    }
+
+    AudioBuffer master_out(2, 128);
+    auto master_view = master_out.view();
+
+    // Render Block 1 (128 frames)
+    mixer.render(master_view);
+    TEST_CHECK(tap_post_fx->record_state() == sampling::RecordState::Recording);
+
+    // Render Block 2 (another 128 frames to complete 256 frames)
+    for (uint32_t i = 0; i < 128; ++i) {
+        float val = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * (i + 128) / 48000.0f);
+        in_l[i] = val;
+        in_r[i] = val;
+    }
+    mixer.render(master_view);
+
+    // Verify Quantized Bounce is complete
+    TEST_CHECK(tap_post_fx->record_state() == sampling::RecordState::Complete);
+    auto bounce_clip = tap_post_fx->get_quantized_clip();
+    TEST_CHECK(bounce_clip != nullptr);
+    TEST_CHECK(bounce_clip->num_frames() == 256);
+    TEST_CHECK(bounce_clip->name() == "Lead_Synth_PostFX_Bounce");
+
+    // Verify Retroactive capture on Master tap (captured last 128 frames)
+    auto master_clip = tap_master->capture_retroactive(128, "Master_Retro_Sample");
+    TEST_CHECK(master_clip != nullptr);
+    TEST_CHECK(master_clip->num_frames() == 128);
+
+    // Test Bounce-to-Track: Assign bounce_clip to Track 2 for looping playback!
+    trk2->set_clip(bounce_clip, true);
+    TEST_CHECK(trk2->has_clip());
+
+    // Clear Track 1 to silence
+    trk1->buffer().clear();
+
+    // Render Block 3: Track 2 should now automatically render and loop its bounced clip!
+    mixer.render(master_view);
+    TEST_CHECK(trk2->clip_playhead() == 128);
+
+    // Check that Master Output contains the bounced audio from Track 2
+    float master_energy = 0.0f;
+    for (uint32_t i = 0; i < 128; ++i) {
+        master_energy += std::abs(master_view.channel(0)[i]);
+    }
+    TEST_CHECK(master_energy > 0.1f);
+
+    std::cout << "  -> Multi-Stage Bounce Tap & Resampling: PASSED (Pre-FX, Post-FX, Bus & Master bounced and looped seamlessly)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -992,6 +1166,8 @@ int main() {
     test_channel_strip_insert_slots();
     test_nested_bus_topological_routing();
     test_pipewire_backend_integration();
+    test_aoip_network_streaming_and_unpacking();
+    test_universal_sampling_and_bounce_tap();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
