@@ -19,7 +19,13 @@ compile_commands.json
 # CMake
 CMakeCache.txt
 CMakeFiles/
+Makefile
 cmake_install.cmake
+
+# Audio Renders
+renders/
+*.wav
+
 Makefile
 CTestTestfile.cmake
 Testing/

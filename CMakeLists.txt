@@ -113,3 +113,10 @@ add_executable(pipewire_desk_daemon
     examples/pipewire_desk_daemon.cpp
 )
 target_link_libraries(pipewire_desk_daemon PRIVATE audio_core)
+
+# A/B Summing Shootout & Audio Renderer
+add_executable(ab_summing_shootout
+    examples/ab_summing_shootout.cpp
+)
+target_link_libraries(ab_summing_shootout PRIVATE audio_core)
+
