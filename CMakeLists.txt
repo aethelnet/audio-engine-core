@@ -80,11 +80,22 @@ target_link_libraries(audio_core PUBLIC
     m
 )
 
-# Test Suite Executable
+# Test Suite Executable & Automated Verification Harness
+enable_testing()
 add_executable(audio_tests
     tests/test_main.cpp
 )
 target_link_libraries(audio_tests PRIVATE audio_core)
+
+add_test(NAME AudioCoreTestSuite COMMAND audio_tests)
+
+# Automatic Post-Build Verification: Compiling automatically runs the full 20-test harness!
+# If ANY regression or audio bug is introduced, the build halts with an error.
+add_custom_command(TARGET audio_tests POST_BUILD
+    COMMAND audio_tests
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Running audio-engine-core automated verification suite..."
+)
 
 # Interactive CLI Synth Executable
 add_executable(cli_synth

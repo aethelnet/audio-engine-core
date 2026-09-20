@@ -204,6 +204,7 @@ void test_wasm_dsp() {
     audio_core::WasmDspPlugin plugin;
 
     bool loaded = plugin.load_from_file("plugins/saturator/saturator.wasm");
+    if (!loaded) loaded = plugin.load_from_file("../plugins/saturator/saturator.wasm");
     TEST_CHECK(loaded);
     TEST_CHECK(plugin.is_loaded());
 
@@ -843,6 +844,7 @@ void test_channel_strip_insert_slots() {
         // Slot 3: Sandboxed WASM Saturator Plugin
         auto wasm = std::make_unique<audio_core::WasmDspPlugin>();
         bool loaded = wasm->load_from_file("plugins/saturator/saturator.wasm");
+        if (!loaded) loaded = wasm->load_from_file("../plugins/saturator/saturator.wasm");
         TEST_CHECK(loaded);
         auto wasm_proc = std::make_shared<audio_core::dsp::WasmProcessor>(std::move(wasm), "WASM Saturator");
         wasm_proc->init(kSampleRate);
