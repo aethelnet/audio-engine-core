@@ -569,7 +569,34 @@ void test_mixer_graph_routing() {
         TEST_CHECK(master_meter.peak_l > 0.1f);
         TEST_CHECK(master_meter.rms_l > 0.1f);
 
-        std::cout << "  -> Aux Sends & Telemetry: PASSED (Sends route correctly, Peak/RMS meters active)" << std::endl;
+        // Test Pre-Fader vs Post-Fader Send
+        // Post-Fader: fader at 0.0 -> send is 0.0
+        vocal->set_gain(0.0f);
+        vocal->set_send(reverb_bus->id(), 0.5f, /*pre_fader=*/false);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            vocal->buffer().channel(0)[i] = 0.4f;
+            vocal->buffer().channel(1)[i] = 0.4f;
+        }
+        mixer.render(view);
+        TEST_CHECK(std::abs(reverb_bus->buffer().channel(0)[0]) < 1e-5f);
+
+        // Pre-Fader: fader at 0.0 -> send STILL sends 0.5f!
+        vocal->set_send(reverb_bus->id(), 0.5f, /*pre_fader=*/true);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            vocal->buffer().channel(0)[i] = 0.4f;
+            vocal->buffer().channel(1)[i] = 0.4f;
+        }
+        mixer.render(view);
+        TEST_CHECK(std::abs(reverb_bus->buffer().channel(0)[0]) > 0.1f);
+
+        // Test Mute resets meters
+        vocal->set_mute(true);
+        mixer.render(view);
+        auto muted_meter = vocal->meter();
+        TEST_CHECK(std::abs(muted_meter.peak_l) < 1e-5f);
+        TEST_CHECK(std::abs(muted_meter.rms_l) < 1e-5f);
+
+        std::cout << "  -> Aux Sends & Telemetry: PASSED (Pre/Post-fader sends and meter mute reset verified)" << std::endl;
     }
 }
 

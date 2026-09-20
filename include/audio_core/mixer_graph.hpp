@@ -47,14 +47,22 @@ public:
     void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
     [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
 
-    void set_send(uint32_t bus_id, float amount) noexcept {
+    void set_send(uint32_t bus_id, float amount, bool pre_fader = false) noexcept {
         for (auto& s : m_sends) {
             if (s.bus_id == bus_id) {
                 s.amount = std::clamp(amount, 0.0f, 2.0f);
+                s.pre_fader = pre_fader;
                 return;
             }
         }
-        m_sends.push_back({bus_id, std::clamp(amount, 0.0f, 2.0f)});
+        m_sends.push_back({bus_id, std::clamp(amount, 0.0f, 2.0f), pre_fader});
+    }
+
+    void reset_meters() noexcept {
+        m_meter_peak_l.store(0.0f, std::memory_order_relaxed);
+        m_meter_peak_r.store(0.0f, std::memory_order_relaxed);
+        m_meter_rms_l.store(0.0f, std::memory_order_relaxed);
+        m_meter_rms_r.store(0.0f, std::memory_order_relaxed);
     }
 
     void set_console_type(dsp::ConsoleType type) noexcept {
@@ -109,6 +117,7 @@ public:
     struct SendInfo {
         uint32_t bus_id;
         float amount;
+        bool pre_fader{false};
     };
     [[nodiscard]] const std::vector<SendInfo>& sends() const noexcept { return m_sends; }
 
@@ -257,6 +266,13 @@ public:
         return {std::cos(theta), std::sin(theta)};
     }
 
+    void set_master_limiter_enabled(bool enabled) noexcept {
+        m_limiter_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_master_limiter_enabled() const noexcept {
+        return m_limiter_enabled.load(std::memory_order_relaxed);
+    }
+
     // Real-Time Render Pipeline: Fully lock-free, zero allocation
     void render(AudioBufferView& out_master) noexcept {
         const uint32_t frames = std::min(out_master.num_frames(), m_buffer_frames);
@@ -279,6 +295,7 @@ public:
         // 3. Process each Track and Route/Accumulate
         for (auto& track : m_tracks) {
             if (track->is_muted() || (any_solo && !track->is_solo())) {
+                track->reset_meters();
                 continue;
             }
 
@@ -312,7 +329,7 @@ public:
                 if (send_bus && send.amount > 0.0f) {
                     Sample* s_l = send_bus->buffer().view().channel(0);
                     Sample* s_r = send_bus->buffer().view().channel(1);
-                    float s_gain = gain * send.amount;
+                    float s_gain = send.pre_fader ? send.amount : (gain * send.amount);
                     for (uint32_t i = 0; i < frames; ++i) {
                         s_l[i] += trk_l[i] * s_gain * pan_l;
                         s_r[i] += trk_r[i] * s_gain * pan_r;
@@ -348,17 +365,32 @@ public:
         Sample* out_l = out_master.channel(0);
         Sample* out_r = (out_master.num_channels() > 1) ? out_master.channel(1) : out_l;
 
-        // Copy to output buffer with soft-clipping safety
+        const bool limiter = m_limiter_enabled.load(std::memory_order_relaxed);
+
+        // Copy to output buffer with optional transparent threshold limiter
         for (uint32_t i = 0; i < frames; ++i) {
-            out_l[i] = std::tanh(final_l[i] * master_gain);
+            float val_l = final_l[i] * master_gain;
+            float val_r = final_r[i] * master_gain;
+
+            if (limiter) {
+                // Transparent bit-accurate passthrough below 0.95, smooth asymptotic tanh ceiling above
+                if (val_l > 0.95f) val_l = 0.95f + 0.05f * std::tanh((val_l - 0.95f) / 0.05f);
+                else if (val_l < -0.95f) val_l = -0.95f + 0.05f * std::tanh((val_l + 0.95f) / 0.05f);
+
+                if (val_r > 0.95f) val_r = 0.95f + 0.05f * std::tanh((val_r - 0.95f) / 0.05f);
+                else if (val_r < -0.95f) val_r = -0.95f + 0.05f * std::tanh((val_r + 0.95f) / 0.05f);
+            }
+
+            out_l[i] = val_l;
             if (out_master.num_channels() > 1) {
-                out_r[i] = std::tanh(final_r[i] * master_gain);
+                out_r[i] = val_r;
             }
         }
     }
 
 private:
     uint32_t m_buffer_frames;
+    std::atomic<bool> m_limiter_enabled{true};
     std::vector<std::unique_ptr<Track>> m_tracks;
     std::vector<std::unique_ptr<AudioBus>> m_buses;
     AudioBus m_master_bus;
