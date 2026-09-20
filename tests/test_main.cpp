@@ -14,6 +14,7 @@
 #include "audio_core/dsp/buttercomp2.hpp"
 #include "audio_core/dsp/baxandall.hpp"
 #include "audio_core/dsp/clip_only2.hpp"
+#include "audio_core/dsp/interstage.hpp"
 #include "audio_core/dsp/wasm_processor.hpp"
 #include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/clock/link_bridge.hpp"
@@ -1332,6 +1333,153 @@ void test_seamless_loop_equal_power_conditioning() {
     std::cout << "  -> Seamless Loop Equal-Power Seam: PASSED (Heaviside step jump eliminated, DC offset suppressed)" << std::endl;
 }
 
+// Mock rogue / corrupt plugin simulating broken community WASM code
+class RogueWasmPlugin : public audio_core::IProcessor {
+public:
+    void init(uint32_t) noexcept override {}
+    void reset() noexcept override {}
+    void process_stereo(audio_core::Sample* left, audio_core::Sample* right, uint32_t frames) noexcept override {
+        for (uint32_t i = 0; i < frames; ++i) {
+            if (i % 8 == 0) {
+                left[i] = std::numeric_limits<float>::quiet_NaN();
+                right[i] = std::numeric_limits<float>::infinity();
+            } else if (i % 8 == 1) {
+                left[i] = 1000.0f; // Acoustic explosion
+                right[i] = -500.0f;
+            } else {
+                left[i] = 0.5f; // DC bias
+                right[i] = 0.5f;
+            }
+        }
+    }
+    void set_parameter(uint32_t, float) noexcept override {}
+    [[nodiscard]] float get_parameter(uint32_t) const noexcept override { return 0.0f; }
+    [[nodiscard]] const char* name() const noexcept override { return "RogueWasmPlugin"; }
+};
+
+void test_insert_slot_safety_hardening_and_circuit_breaker() {
+    std::cout << "[TEST] Running InsertSlot Safety Hardening & Circuit Breaker Test..." << std::endl;
+    using namespace audio_core;
+
+    enable_ftz_daz();
+
+    InsertSlot slot;
+    slot.init(48000);
+
+    TEST_CHECK(!slot.is_bypassed());
+    TEST_CHECK(!slot.has_fault());
+    TEST_CHECK(!slot.is_circuit_breaker_tripped());
+    TEST_CHECK(slot.corrupt_samples_detected() == 0);
+
+    // Mount rogue plugin
+    slot.set_processor(std::make_shared<RogueWasmPlugin>());
+
+    constexpr uint32_t kFrames = 256;
+    std::vector<Sample> left(kFrames, 0.0f);
+    std::vector<Sample> right(kFrames, 0.0f);
+
+    // Process through hardened slot: rogue plugin will throw NaNs, Infs, and huge amplitudes
+    slot.process_stereo(left.data(), right.data(), kFrames);
+
+    // 1. Verify Circuit Breaker was tripped and slot was auto-bypassed
+    TEST_CHECK(slot.has_fault());
+    TEST_CHECK(slot.is_circuit_breaker_tripped());
+    TEST_CHECK(slot.is_bypassed());
+    TEST_CHECK(slot.corrupt_samples_detected() > 0);
+
+    // 2. Verify corrupted block was zeroed out to protect user ears
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        TEST_CHECK(std::isfinite(left[i]));
+        TEST_CHECK(std::isfinite(right[i]));
+        TEST_CHECK(left[i] == 0.0f);
+        TEST_CHECK(right[i] == 0.0f);
+    }
+
+    // 3. Test DC-Blocking filter on a well-behaved plugin with DC offset
+    class DcOffsetPlugin : public IProcessor {
+    public:
+        void init(uint32_t) noexcept override {}
+        void reset() noexcept override {}
+        void process_stereo(Sample* l, Sample* r, uint32_t frames) noexcept override {
+            for (uint32_t i = 0; i < frames; ++i) {
+                l[i] = 0.5f; // Pure +0.5f DC offset
+                r[i] = 0.5f;
+            }
+        }
+        void set_parameter(uint32_t, float) noexcept override {}
+        [[nodiscard]] float get_parameter(uint32_t) const noexcept override { return 0.0f; }
+        [[nodiscard]] const char* name() const noexcept override { return "DcOffsetPlugin"; }
+    };
+
+    InsertSlot dc_slot;
+    dc_slot.init(48000);
+    dc_slot.set_processor(std::make_shared<DcOffsetPlugin>());
+
+    // Run 48000 frames (1 second) of DC through the slot
+    std::vector<Sample> dc_l(1024, 0.0f);
+    std::vector<Sample> dc_r(1024, 0.0f);
+    for (int block = 0; block < 48; ++block) {
+        dc_slot.process_stereo(dc_l.data(), dc_r.data(), 1024);
+    }
+
+    // After 1 second of 5Hz highpass filtering, the DC level must be attenuated towards 0
+    TEST_CHECK(std::abs(dc_l[1023]) < 0.05f);
+    TEST_CHECK(std::abs(dc_r[1023]) < 0.05f);
+
+    std::cout << "  -> InsertSlot Safety Hardening: PASSED (NaNs intercepted, explosions clamped, circuit breaker auto-bypassed, DC filtered)" << std::endl;
+}
+
+void test_airwindows_interstage_processor() {
+    std::cout << "[TEST] Running Airwindows Interstage Processor Test..." << std::endl;
+    using namespace audio_core::dsp;
+
+    Interstage interstage;
+    interstage.init(48000);
+
+    TEST_CHECK(std::string_view(interstage.name()) == "Interstage");
+
+    // 1. Transparency test on moderate signal (0.1 amplitude 1kHz sine)
+    constexpr uint32_t kFrames = 480;
+    std::vector<audio_core::Sample> l(kFrames, 0.0f);
+    std::vector<audio_core::Sample> r(kFrames, 0.0f);
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float s = 0.1f * std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * i / 48000.0f);
+        l[i] = s;
+        r[i] = s;
+    }
+
+    interstage.process_stereo(l.data(), r.data(), kFrames);
+
+    // Verify signal is preserved and stable
+    float max_val = 0.0f;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        TEST_CHECK(std::isfinite(l[i]));
+        TEST_CHECK(std::isfinite(r[i]));
+        if (std::abs(l[i]) > max_val) max_val = std::abs(l[i]);
+    }
+    TEST_CHECK(max_val > 0.05f && max_val <= 0.15f);
+
+    // 2. Transformer Slew-Rate Limiting Test:
+    // Feed high-amplitude high-frequency step transients (harsh digital slews)
+    interstage.reset();
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        l[i] = (i % 2 == 0) ? +0.9f : -0.9f; // Alternating Nyquist spike
+        r[i] = l[i];
+    }
+
+    interstage.process_stereo(l.data(), r.data(), kFrames);
+
+    // Interstage slew-limiting must tame the Nyquist edge
+    for (uint32_t i = 1; i < kFrames; ++i) {
+        float slew = std::abs(l[i] - l[i - 1]);
+        TEST_CHECK(slew < 1.8f); // Slew rate restricted by analog transformer emulation
+        TEST_CHECK(std::isfinite(l[i]));
+    }
+
+    std::cout << "  -> Airwindows Interstage: PASSED (Analog transformer coupling, slew-rate limiting, and Nyquist softening verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1354,6 +1502,8 @@ int main() {
     test_timeline_clock_and_link_bridge_master_authority();
     test_transient_detection_and_slice_engine();
     test_seamless_loop_equal_power_conditioning();
+    test_insert_slot_safety_hardening_and_circuit_breaker();
+    test_airwindows_interstage_processor();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
