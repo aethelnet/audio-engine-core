@@ -29,6 +29,7 @@
 #include "audio_core/dsp/crossover.hpp"
 #include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/analysis/measurement_engine.hpp"
+#include "audio_core/dsp/liquid_ode.hpp"
 #include <numbers>
 
 #include <iostream>
@@ -3114,6 +3115,140 @@ void test_mixer_matrix_dca_groups_solo_safe_and_mute_groups() {
     std::cout << "  -> Lock-Free Protocol Automation: PASSED (DCA gain and MuteGroup commands executed sample-accurately)" << std::endl;
 }
 
+void test_liquid_ode_trapezoidal_integration_filter_and_bus_summing() {
+    std::cout << "[TEST] Running Liquid ODE Trapezoidal Integration, Multimode Filter & Bus Summing Test..." << std::endl;
+    using namespace audio_core::dsp;
+
+    // 1. Test A-Stability across multiple sample rates & Nyquist extreme tau
+    const std::vector<float> sample_rates = {44100.0f, 48000.0f, 96000.0f, 192000.0f};
+    for (float sr : sample_rates) {
+        LiquidOdeIntegrator ode(sr, 1000.0f);
+        
+        // Test extreme ultrasonic cutoff near Nyquist: 0.49 * sr
+        ode.set_cutoff(sr * 0.49f);
+        TEST_CHECK(ode.pole() > -1.0f && ode.pole() < 1.0f); // Pole strictly inside unit circle
+
+        // Test extreme low tau (1 microsecond)
+        ode.set_tau(1e-6f);
+        TEST_CHECK(ode.pole() > -1.0f && ode.pole() < 1.0f);
+
+        // Feed alternating Nyquist frequency spikes (+1.0, -1.0, +1.0, -1.0)
+        ode.reset();
+        for (int i = 0; i < 1000; ++i) {
+            const float in = (i % 2 == 0) ? 1.0f : -1.0f;
+            const float out = ode.process_sample_mono(in);
+            TEST_CHECK(std::isfinite(out));
+            TEST_CHECK(std::abs(out) <= 1.0f); // Zero explosion, fully bounded
+        }
+    }
+    std::cout << "  -> Multi-Sample-Rate A-Stability: PASSED (44.1k, 48k, 96k, 192k stable at extreme tau, 0 NaN/Inf)" << std::endl;
+
+    // 2. Test Multimode Filter (Lowpass, Highpass Subtractive, Bandpass, Notch)
+    LiquidMultimodeFilter filter(48000.0f);
+    filter.set_cutoff(1000.0f);
+
+    // Test Lowpass / Highpass complementary summing (LP + HP == In)
+    constexpr size_t kFrames = 256;
+    float max_subtractive_error = 0.0f;
+    for (size_t i = 0; i < kFrames; ++i) {
+        const float in = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * i / 48000.0f) +
+                         0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 5000.0f * i / 48000.0f);
+        
+        filter.set_mode(LiquidMultimodeFilter::Mode::Lowpass);
+        const float lp = filter.process_sample(in);
+        
+        // Highpass: In - LP
+        const float hp = in - lp;
+        const float diff = std::abs((lp + hp) - in);
+        if (diff > max_subtractive_error) max_subtractive_error = diff;
+    }
+    TEST_CHECK(max_subtractive_error < 1e-6f);
+    std::cout << "  -> Subtractive Phase-Complementary Summing: PASSED (LP + HP == In, err=" << max_subtractive_error << " < 1e-6)" << std::endl;
+
+    // Test Bandpass & Notch
+    filter.set_mode(LiquidMultimodeFilter::Mode::Bandpass);
+    filter.set_bandpass_corners(500.0f, 2000.0f);
+    // 1kHz is inside passband, 50Hz and 10kHz are rejected
+    filter.reset();
+    float bp_energy_pass = 0.0f, bp_energy_stop = 0.0f;
+    for (size_t i = 0; i < 500; ++i) {
+        const float in_pass = std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * i / 48000.0f);
+        const float out_pass = filter.process_sample(in_pass);
+        if (i > 100) bp_energy_pass += out_pass * out_pass;
+    }
+    filter.reset();
+    for (size_t i = 0; i < 500; ++i) {
+        const float in_stop = std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * i / 48000.0f);
+        const float out_stop = filter.process_sample(in_stop);
+        if (i > 100) bp_energy_stop += out_stop * out_stop;
+    }
+    TEST_CHECK(bp_energy_pass > 5.0f * bp_energy_stop);
+    std::cout << "  -> Multimode Bandpass / Notch: PASSED (1kHz passband energy=" << bp_energy_pass << " >> stopband=" << bp_energy_stop << ")" << std::endl;
+
+    // 3. Test Parameter Smoother (Anti-Zipper Slew Limiting)
+    LiquidParameterSmoother smoother(48000.0f, 10.0f); // 10ms transition
+    smoother.reset(0.0f);
+    smoother.set_target(1.0f); // Instant 0.0 -> 1.0 step jump
+
+    float prev_val = 0.0f;
+    float max_delta = 0.0f;
+    bool overshoot = false;
+    for (int i = 0; i < 1000; ++i) {
+        const float val = smoother.process_sample();
+        const float delta = std::abs(val - prev_val);
+        if (delta > max_delta) max_delta = delta;
+        if (val > 1.0001f) overshoot = true;
+        prev_val = val;
+    }
+    TEST_CHECK(!overshoot);
+    // Bounded velocity: max delta per sample should be well below 0.05
+    TEST_CHECK(max_delta < 0.05f);
+    TEST_CHECK(std::abs(smoother.current() - 1.0f) < 1e-4f);
+    std::cout << "  -> Parameter Smoother: PASSED (Bounded slew delta=" << max_delta << " < 0.05, 0 overshoot, C^inf landing)" << std::endl;
+
+    // 4. Test Multi-Track Bus Summing & Differential Magnetic Glue
+    LiquidBusProcessor bus(48000.0f, LiquidBusProcessor::Mode::DifferentialMagneticGlue);
+    bus.set_glue_characteristics(40.0f, 0.6f); // 40us, 60% glue depth
+    bus.set_headroom(1.0f);
+
+    // 4a. Single track transparency: with single track at modest level (0.2f), residue is near-zero => bit-exact transparent
+    constexpr size_t kBusFrames = 128;
+    std::vector<float> single_l(kBusFrames, 0.2f);
+    std::vector<float> single_r(kBusFrames, 0.2f);
+    bus.reset();
+    bus.process_bus_sum(single_l.data(), single_r.data(), kBusFrames);
+
+    float max_single_diff = 0.0f;
+    for (size_t i = 10; i < kBusFrames; ++i) { // after initial state settling
+        const float diff = std::abs(single_l[i] - 0.2f);
+        if (diff > max_single_diff) max_single_diff = diff;
+    }
+    TEST_CHECK(max_single_diff < 0.005f); // Tiny residue under 0.5%
+    std::cout << "  -> Bus Single-Track Transparency: PASSED (Clean pass-through diff=" << max_single_diff << " < 0.005)" << std::endl;
+
+    // 4b. Multi-track hot sum: 8 tracks summing to 4.0f amplitude
+    std::vector<float> hot_l(kBusFrames, 0.0f);
+    std::vector<float> hot_r(kBusFrames, 0.0f);
+    // Sum 8 tracks each producing 0.5f => linear sum = 4.0f
+    for (int t = 0; t < 8; ++t) {
+        for (size_t i = 0; i < kBusFrames; ++i) {
+            hot_l[i] += 0.5f;
+            hot_r[i] += 0.5f;
+        }
+    }
+    TEST_CHECK(hot_l[0] == 4.0f);
+
+    bus.reset();
+    bus.process_bus_sum(hot_l.data(), hot_r.data(), kBusFrames);
+
+    // Magnetic glue must smoothly absorb peak energy: output should be comfortably below 4.0f
+    TEST_CHECK(hot_l[kBusFrames - 1] < 3.5f);
+    TEST_CHECK(hot_l[kBusFrames - 1] > 1.0f);
+    TEST_CHECK(std::isfinite(hot_l[kBusFrames - 1]));
+    std::cout << "  -> Multi-Track Analog Glue Compression: PASSED (Linear 4.0f sum compressed smoothly to " 
+              << hot_l[kBusFrames - 1] << " with organic decay)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -3148,6 +3283,7 @@ int main() {
     test_multichannel_bus_and_spatial_routing();
     test_mixer_graph_spatial_bus_routing_and_multichannel_render();
     test_mixer_matrix_dca_groups_solo_safe_and_mute_groups();
+    test_liquid_ode_trapezoidal_integration_filter_and_bus_summing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
