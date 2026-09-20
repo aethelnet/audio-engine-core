@@ -27,6 +27,16 @@ enum class MixerCommandType : uint16_t {
     SetSampleRate,
     SetTrackAzimuth,
     ConfigureSpatialBus,
+    SetTrackSoloSafe,
+    SetTrackDcaMask,
+    SetTrackMuteGroupMask,
+    SetBusMute,
+    SetBusSolo,
+    SetBusSoloSafe,
+    SetDcaGain,
+    SetDcaMute,
+    SetDcaSolo,
+    SetMuteGroupActive,
 };
 
 // ============================================================================

@@ -60,6 +60,9 @@ public:
         m_custom_azimuth.store(false, std::memory_order_relaxed);
         m_mute.store(false, std::memory_order_relaxed);
         m_solo.store(false, std::memory_order_relaxed);
+        m_solo_safe.store(false, std::memory_order_relaxed);
+        m_dca_mask.store(0, std::memory_order_relaxed);
+        m_mute_group_mask.store(0, std::memory_order_relaxed);
         m_target_bus.store(-1, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
@@ -75,6 +78,9 @@ public:
         m_active.store(false, std::memory_order_release);
         m_azimuth.store(0.0f, std::memory_order_relaxed);
         m_custom_azimuth.store(false, std::memory_order_relaxed);
+        m_solo_safe.store(false, std::memory_order_relaxed);
+        m_dca_mask.store(0, std::memory_order_relaxed);
+        m_mute_group_mask.store(0, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -107,6 +113,31 @@ public:
 
     void set_solo(bool solo) noexcept { m_solo.store(solo, std::memory_order_relaxed); }
     [[nodiscard]] bool is_solo() const noexcept { return m_solo.load(std::memory_order_relaxed); }
+
+    void set_solo_safe(bool safe) noexcept { m_solo_safe.store(safe, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_solo_safe() const noexcept { return m_solo_safe.load(std::memory_order_relaxed); }
+
+    void set_dca_mask(uint8_t mask) noexcept { m_dca_mask.store(mask, std::memory_order_relaxed); }
+    [[nodiscard]] uint8_t dca_mask() const noexcept { return m_dca_mask.load(std::memory_order_relaxed); }
+    void assign_dca(uint8_t dca_idx, bool enable) noexcept {
+        if (dca_idx < 8) {
+            uint8_t mask = m_dca_mask.load(std::memory_order_relaxed);
+            if (enable) mask |= static_cast<uint8_t>(1 << dca_idx);
+            else mask &= static_cast<uint8_t>(~(1 << dca_idx));
+            m_dca_mask.store(mask, std::memory_order_relaxed);
+        }
+    }
+
+    void set_mute_group_mask(uint8_t mask) noexcept { m_mute_group_mask.store(mask, std::memory_order_relaxed); }
+    [[nodiscard]] uint8_t mute_group_mask() const noexcept { return m_mute_group_mask.load(std::memory_order_relaxed); }
+    void assign_mute_group(uint8_t group_idx, bool enable) noexcept {
+        if (group_idx < 8) {
+            uint8_t mask = m_mute_group_mask.load(std::memory_order_relaxed);
+            if (enable) mask |= static_cast<uint8_t>(1 << group_idx);
+            else mask &= static_cast<uint8_t>(~(1 << group_idx));
+            m_mute_group_mask.store(mask, std::memory_order_relaxed);
+        }
+    }
 
     void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
     [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
@@ -292,6 +323,9 @@ private:
     std::atomic<bool> m_custom_azimuth{false};
     std::atomic<bool> m_mute{false};
     std::atomic<bool> m_solo{false};
+    std::atomic<bool> m_solo_safe{false};
+    std::atomic<uint8_t> m_dca_mask{0};
+    std::atomic<uint8_t> m_mute_group_mask{0};
     std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master, -2 = Spatial Bus
 
     std::array<InsertSlot, kMaxTrackInsertSlots> m_slots;
@@ -332,6 +366,9 @@ public:
         m_id = id;
         m_name = std::move(name);
         m_gain.store(1.0f, std::memory_order_relaxed);
+        m_mute.store(false, std::memory_order_relaxed);
+        m_solo.store(false, std::memory_order_relaxed);
+        m_solo_safe.store(false, std::memory_order_relaxed);
         m_target_bus.store(-1, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
@@ -340,6 +377,9 @@ public:
 
     void deactivate() noexcept {
         m_active.store(false, std::memory_order_release);
+        m_mute.store(false, std::memory_order_relaxed);
+        m_solo.store(false, std::memory_order_relaxed);
+        m_solo_safe.store(false, std::memory_order_relaxed);
         m_target_bus.store(-1, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
@@ -347,6 +387,15 @@ public:
 
     void set_gain(float gain) noexcept { m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
+
+    void set_mute(bool mute) noexcept { m_mute.store(mute, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_muted() const noexcept { return m_mute.load(std::memory_order_relaxed); }
+
+    void set_solo(bool solo) noexcept { m_solo.store(solo, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_solo() const noexcept { return m_solo.load(std::memory_order_relaxed); }
+
+    void set_solo_safe(bool safe) noexcept { m_solo_safe.store(safe, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_solo_safe() const noexcept { return m_solo_safe.load(std::memory_order_relaxed); }
 
     void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
     [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
@@ -426,6 +475,9 @@ private:
 
     std::atomic<bool> m_active{false};
     std::atomic<float> m_gain{1.0f};
+    std::atomic<bool> m_mute{false};
+    std::atomic<bool> m_solo{false};
+    std::atomic<bool> m_solo_safe{false};
     std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master, or target submix bus ID
     std::array<InsertSlot, kMaxBusInsertSlots> m_slots;
     dsp::ConsoleProcessor m_console;
@@ -444,6 +496,8 @@ public:
     static constexpr size_t kMaxTracks = 32;
     static constexpr size_t kMaxBuses = 16;
     static constexpr size_t kMaxSampleTaps = 4;
+    static constexpr size_t kMaxDcaGroups = 8;
+    static constexpr size_t kMaxMuteGroups = 8;
 
     explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true, uint32_t sample_rate = 48000)
         : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames),
@@ -452,6 +506,10 @@ public:
           m_clock(sample_rate, 120.0),
           m_worker_pool(enable_multithreading ? threading::AudioWorkerPool::kAutoDetect : 0) {
         m_master_bus.set_active(true);
+        for (auto& g : m_dca_gains) g.store(1.0f, std::memory_order_relaxed);
+        for (auto& m : m_dca_mutes) m.store(false, std::memory_order_relaxed);
+        for (auto& s : m_dca_solos) s.store(false, std::memory_order_relaxed);
+        for (auto& mg : m_mute_groups) mg.store(false, std::memory_order_relaxed);
         for (size_t i = 0; i < kMaxTracks; ++i) {
             m_tracks[i] = std::make_unique<Track>(static_cast<uint32_t>(i + 1), "Track " + std::to_string(i + 1), buffer_frames);
         }
@@ -677,6 +735,69 @@ public:
         m_spatial_master_bus.set_channel_count(channels);
     }
 
+    void set_dca_gain(uint8_t idx, float gain) noexcept {
+        if (idx < kMaxDcaGroups) m_dca_gains[idx].store(std::max(0.0f, gain), std::memory_order_relaxed);
+    }
+    [[nodiscard]] float dca_gain(uint8_t idx) const noexcept {
+        return (idx < kMaxDcaGroups) ? m_dca_gains[idx].load(std::memory_order_relaxed) : 1.0f;
+    }
+
+    void set_dca_mute(uint8_t idx, bool mute) noexcept {
+        if (idx < kMaxDcaGroups) m_dca_mutes[idx].store(mute, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_dca_muted(uint8_t idx) const noexcept {
+        return (idx < kMaxDcaGroups) ? m_dca_mutes[idx].load(std::memory_order_relaxed) : false;
+    }
+
+    void set_dca_solo(uint8_t idx, bool solo) noexcept {
+        if (idx < kMaxDcaGroups) m_dca_solos[idx].store(solo, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_dca_solo(uint8_t idx) const noexcept {
+        return (idx < kMaxDcaGroups) ? m_dca_solos[idx].load(std::memory_order_relaxed) : false;
+    }
+
+    void set_mute_group_active(uint8_t idx, bool active) noexcept {
+        if (idx < kMaxMuteGroups) m_mute_groups[idx].store(active, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_mute_group_active(uint8_t idx) const noexcept {
+        return (idx < kMaxMuteGroups) ? m_mute_groups[idx].load(std::memory_order_relaxed) : false;
+    }
+
+    [[nodiscard]] bool is_track_effectively_muted(const Track* track) const noexcept {
+        if (!track || track->is_muted()) return true;
+        uint8_t mg = track->mute_group_mask();
+        for (size_t g = 0; g < kMaxMuteGroups; ++g) {
+            if ((mg & (1 << g)) && m_mute_groups[g].load(std::memory_order_relaxed)) return true;
+        }
+        uint8_t dca = track->dca_mask();
+        for (size_t d = 0; d < kMaxDcaGroups; ++d) {
+            if ((dca & (1 << d)) && m_dca_mutes[d].load(std::memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool is_track_effectively_solo(const Track* track) const noexcept {
+        if (!track) return false;
+        if (track->is_solo()) return true;
+        uint8_t dca = track->dca_mask();
+        for (size_t d = 0; d < kMaxDcaGroups; ++d) {
+            if ((dca & (1 << d)) && m_dca_solos[d].load(std::memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] float compute_track_effective_gain(const Track* track) const noexcept {
+        if (!track) return 0.0f;
+        float g = track->gain();
+        uint8_t dca = track->dca_mask();
+        for (size_t d = 0; d < kMaxDcaGroups; ++d) {
+            if (dca & (1 << d)) {
+                g *= m_dca_gains[d].load(std::memory_order_relaxed);
+            }
+        }
+        return g;
+    }
+
     [[nodiscard]] size_t track_count() const noexcept {
         size_t count = 0;
         for (const auto& t : m_tracks) {
@@ -768,12 +889,20 @@ public:
             }
         }
 
-        // 2. Evaluate Solo state across active tracks
+        // 2. Evaluate Solo state across active tracks and DCAs
         bool any_solo = false;
-        for (const auto& track : m_tracks) {
-            if (track->is_active() && track->is_solo()) {
+        for (size_t d = 0; d < kMaxDcaGroups; ++d) {
+            if (m_dca_solos[d].load(std::memory_order_relaxed)) {
                 any_solo = true;
                 break;
+            }
+        }
+        if (!any_solo) {
+            for (const auto& track : m_tracks) {
+                if (track->is_active() && track->is_solo()) {
+                    any_solo = true;
+                    break;
+                }
             }
         }
 
@@ -799,7 +928,9 @@ public:
             auto* track = ctx->self->m_tracks[track_idx].get();
             if (!track->is_active()) return;
 
-            if (track->is_muted() || (ctx->any_solo && !track->is_solo())) {
+            bool trk_muted = ctx->self->is_track_effectively_muted(track);
+            bool trk_solo = ctx->self->is_track_effectively_solo(track);
+            if (trk_muted || (ctx->any_solo && !trk_solo && !track->is_solo_safe())) {
                 track->reset_meters();
                 return;
             }
@@ -840,12 +971,14 @@ public:
         // 3b. Vectorized Bus & Master Accumulation (SIMD linear reduction)
         for (auto& track : m_tracks) {
             if (!track->is_active()) continue;
-            if (track->is_muted() || (any_solo && !track->is_solo())) continue;
+            bool trk_muted = is_track_effectively_muted(track.get());
+            bool trk_solo = is_track_effectively_solo(track.get());
+            if (trk_muted || (any_solo && !trk_solo && !track->is_solo_safe())) continue;
 
             const Sample* trk_l = track->buffer().view().channel(0);
             const Sample* trk_r = track->buffer().view().channel(1);
 
-            const float gain = track->gain();
+            const float gain = compute_track_effective_gain(track.get());
             const auto [pan_l, pan_r] = calculate_pan_gains(track->pan());
             const float left_gain = gain * pan_l;
             const float right_gain = gain * pan_r;
@@ -895,6 +1028,15 @@ public:
             }
         }
 
+        // Check if any submix bus has solo
+        bool any_bus_solo = false;
+        for (const auto& b : m_buses) {
+            if (b->is_active() && b->is_solo()) {
+                any_bus_solo = true;
+                break;
+            }
+        }
+
         // 4. Process Active Submix Buses in Topological DAG Order
         for (size_t k = 0; k < m_bus_render_order_count; ++k) {
             size_t idx = m_bus_render_order[k];
@@ -902,6 +1044,12 @@ public:
             if (!bus->is_active()) {
                 continue;
             }
+
+            if (bus->is_muted() || (any_bus_solo && !bus->is_solo() && !bus->is_solo_safe())) {
+                bus->reset_meters();
+                continue;
+            }
+
             bus->process_buss_strip(frames);
 
             const float bus_gain = bus->gain();
@@ -1128,6 +1276,58 @@ public:
                 }
                 break;
             }
+            case protocol::MixerCommandType::SetTrackSoloSafe: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_solo_safe((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackDcaMask: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_dca_mask(static_cast<uint8_t>(cmd.flags));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackMuteGroupMask: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_mute_group_mask(static_cast<uint8_t>(cmd.flags));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusMute: {
+                if (auto* bus = get_bus(cmd.target_id)) {
+                    bus->set_mute((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusSolo: {
+                if (auto* bus = get_bus(cmd.target_id)) {
+                    bus->set_solo((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusSoloSafe: {
+                if (auto* bus = get_bus(cmd.target_id)) {
+                    bus->set_solo_safe((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetDcaGain: {
+                set_dca_gain(static_cast<uint8_t>(cmd.target_id), cmd.value1);
+                break;
+            }
+            case protocol::MixerCommandType::SetDcaMute: {
+                set_dca_mute(static_cast<uint8_t>(cmd.target_id), (cmd.flags & 1) != 0);
+                break;
+            }
+            case protocol::MixerCommandType::SetDcaSolo: {
+                set_dca_solo(static_cast<uint8_t>(cmd.target_id), (cmd.flags & 1) != 0);
+                break;
+            }
+            case protocol::MixerCommandType::SetMuteGroupActive: {
+                set_mute_group_active(static_cast<uint8_t>(cmd.target_id), (cmd.flags & 1) != 0);
+                break;
+            }
             default:
                 break;
         }
@@ -1143,6 +1343,11 @@ private:
     AudioBus m_master_bus;
     dsp::MultiChannelBus m_spatial_master_bus;
     AudioBuffer m_scratch_stereo_buffer;
+
+    std::array<std::atomic<float>, kMaxDcaGroups> m_dca_gains;
+    std::array<std::atomic<bool>, kMaxDcaGroups> m_dca_mutes;
+    std::array<std::atomic<bool>, kMaxDcaGroups> m_dca_solos;
+    std::array<std::atomic<bool>, kMaxMuteGroups> m_mute_groups;
 
     std::array<size_t, kMaxBuses> m_bus_render_order{};
     size_t m_bus_render_order_count{0};

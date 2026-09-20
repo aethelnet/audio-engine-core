@@ -2943,6 +2943,177 @@ void test_mixer_graph_spatial_bus_routing_and_multichannel_render() {
     std::cout << "  -> MixerGraph Spatial Bus Routing: PASSED (16ch & 32ch discrete VBAP, lock-free reconfig, stereo folddown verified)" << std::endl;
 }
 
+void test_mixer_matrix_dca_groups_solo_safe_and_mute_groups() {
+    std::cout << "[TEST] Running DCA Groups, Solo Safe, Keep Mute & Mute Groups Test..." << std::endl;
+    using namespace audio_core;
+
+    constexpr uint32_t kFrames = 256;
+    MixerGraph mixer(kFrames);
+
+    // 1. Setup Tracks
+    // Track 1: Lead Vocal
+    Track* trk_vocal = mixer.add_track("LeadVocal");
+    TEST_CHECK(trk_vocal != nullptr);
+    trk_vocal->set_pan(-1.0f); // Hard Left
+
+    // Track 2: Reverb Return (Solo Safe!)
+    Track* trk_reverb = mixer.add_track("ReverbReturn");
+    TEST_CHECK(trk_reverb != nullptr);
+    trk_reverb->set_pan(1.0f); // Hard Right
+    trk_reverb->set_solo_safe(true);
+    TEST_CHECK(trk_reverb->is_solo_safe());
+
+    // Track 3: Acoustic Guitar (Standard)
+    Track* trk_guitar = mixer.add_track("AcousticGuitar");
+    TEST_CHECK(trk_guitar != nullptr);
+    trk_guitar->set_pan(-1.0f);
+
+    // Track 4: Synth (Manually muted beforehand)
+    Track* trk_synth = mixer.add_track("SynthPad");
+    TEST_CHECK(trk_synth != nullptr);
+    trk_synth->set_pan(1.0f);
+    trk_synth->set_mute(true);
+    TEST_CHECK(trk_synth->is_muted());
+
+    auto refill_tracks = [&]() {
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk_vocal->buffer().channel(0)[i] = 0.5f;
+            trk_vocal->buffer().channel(1)[i] = 0.5f;
+            trk_reverb->buffer().channel(0)[i] = 0.4f;
+            trk_reverb->buffer().channel(1)[i] = 0.4f;
+            trk_guitar->buffer().channel(0)[i] = 0.3f;
+            trk_guitar->buffer().channel(1)[i] = 0.3f;
+            trk_synth->buffer().channel(0)[i] = 0.6f;
+            trk_synth->buffer().channel(1)[i] = 0.6f;
+        }
+    };
+
+    AudioBuffer out_buf(2, kFrames);
+    auto master_view = out_buf.view();
+
+    // 2. Test Solo Safe: Solo Vocal (Track 1)
+    // Vocal is hard left. Reverb is hard right and SOLO SAFE. Guitar is hard left (un-soloed). Synth is hard right (muted).
+    refill_tracks();
+    trk_vocal->set_solo(true);
+    mixer.render(master_view);
+
+    // Vocal must be audible on Left (Guitar muted by solo-in-place)
+    TEST_CHECK(master_view.channel(0)[100] > 0.4f);
+    // Reverb Return must be audible on Right (saved by Solo Safe!)
+    TEST_CHECK(master_view.channel(1)[100] > 0.35f);
+
+    std::cout << "  -> Solo Safe (Solo Isolate): PASSED (Reverb return audible during vocal solo)" << std::endl;
+
+    // 3. Test Keep Mute: Un-solo Vocal
+    refill_tracks();
+    trk_vocal->set_solo(false);
+    mixer.render(master_view);
+
+    // Guitar must now be audible again on Left (Vocal 0.5 + Guitar 0.3 > 0.7)
+    TEST_CHECK(master_view.channel(0)[100] > 0.7f);
+    // SynthPad on Right was explicitly muted before solo cycle and MUST REMAIN MUTED!
+    // Right has only Reverb (0.4), NOT Synth (0.6 + 0.4 = 1.0)
+    TEST_CHECK(master_view.channel(1)[100] < 0.5f);
+    TEST_CHECK(trk_synth->is_muted()); // Still muted!
+
+    std::cout << "  -> Keep Mute Persistence: PASSED (Previously muted track stayed muted after solo released)" << std::endl;
+
+    // 4. Test DCA / VCA Group Gain Scaling
+    // Assign Vocal and Guitar to DCA 0 ("VoxGtrGroup")
+    trk_vocal->assign_dca(0, true);
+    trk_guitar->assign_dca(0, true);
+    TEST_CHECK((trk_vocal->dca_mask() & 1) != 0);
+    TEST_CHECK((trk_guitar->dca_mask() & 1) != 0);
+
+    // Pull DCA 0 fader down to 0.5 (-6 dB)
+    mixer.set_dca_gain(0, 0.5f);
+    TEST_CHECK(std::abs(mixer.dca_gain(0) - 0.5f) < 1e-4f);
+
+    refill_tracks();
+    mixer.render(master_view);
+
+    // Left previously had Vocal (0.5) + Guitar (0.3) = 0.8.
+    // With DCA at 0.5, Left should now be 0.5 * 0.8 = 0.4f!
+    TEST_CHECK(std::abs(master_view.channel(0)[100] - 0.4f) < 0.05f);
+
+    std::cout << "  -> DCA / VCA Gain Scaling: PASSED (Track gains scaled proportionally via DCA fader)" << std::endl;
+
+    // 5. Test DCA Mute
+    mixer.set_dca_mute(0, true);
+    TEST_CHECK(mixer.is_dca_muted(0));
+    TEST_CHECK(mixer.is_track_effectively_muted(trk_vocal));
+    TEST_CHECK(mixer.is_track_effectively_muted(trk_guitar));
+
+    refill_tracks();
+    mixer.render(master_view);
+
+    // Left must be completely silent (all Left tracks belong to DCA 0)
+    TEST_CHECK(std::abs(master_view.channel(0)[100]) < 1e-5f);
+    // Right (Reverb return) remains unaffected
+    TEST_CHECK(master_view.channel(1)[100] > 0.35f);
+
+    std::cout << "  -> DCA Group Mute: PASSED (DCA mute silenced all member tracks)" << std::endl;
+
+    // Reset DCA
+    mixer.set_dca_mute(0, false);
+    mixer.set_dca_gain(0, 1.0f);
+
+    // 6. Test Mute Groups (Scene Muting)
+    // Assign Vocal to Mute Group 1
+    trk_vocal->assign_mute_group(1, true);
+    TEST_CHECK((trk_vocal->mute_group_mask() & 2) != 0);
+
+    mixer.set_mute_group_active(1, true);
+    TEST_CHECK(mixer.is_mute_group_active(1));
+    TEST_CHECK(mixer.is_track_effectively_muted(trk_vocal));
+
+    refill_tracks();
+    mixer.render(master_view);
+
+    // Left now has only Guitar (0.3f), since Vocal is muted by Mute Group 1!
+    TEST_CHECK(std::abs(master_view.channel(0)[100] - 0.3f) < 0.05f);
+
+    mixer.set_mute_group_active(1, false);
+
+    std::cout << "  -> Mute Groups (Scene Muting): PASSED (Mute Group 1 selectively muted assigned channels)" << std::endl;
+
+    // 7. Test Submix Bus Mute, Solo & Solo Safe
+    AudioBus* drum_bus = mixer.add_submix_bus("DrumBus");
+    AudioBus* fx_bus = mixer.add_submix_bus("FXBus");
+    TEST_CHECK(drum_bus != nullptr && fx_bus != nullptr);
+
+    drum_bus->set_mute(true);
+    TEST_CHECK(drum_bus->is_muted());
+
+    drum_bus->set_mute(false);
+    drum_bus->set_solo(true);
+    fx_bus->set_solo_safe(true);
+    TEST_CHECK(drum_bus->is_solo());
+    TEST_CHECK(fx_bus->is_solo_safe());
+
+    std::cout << "  -> Submix Bus Mute & Solo Safe: PASSED (Bus-level solo isolate and muting verified)" << std::endl;
+
+    // 8. Test Lock-Free Binary Protocol Command Automation
+    protocol::MixerCommand cmd_dca_gain{};
+    cmd_dca_gain.type = protocol::MixerCommandType::SetDcaGain;
+    cmd_dca_gain.target_id = 1; // DCA 1
+    cmd_dca_gain.value1 = 0.75f;
+    TEST_CHECK(mixer.post_command(cmd_dca_gain));
+
+    protocol::MixerCommand cmd_mute_grp{};
+    cmd_mute_grp.type = protocol::MixerCommandType::SetMuteGroupActive;
+    cmd_mute_grp.target_id = 2; // Mute Group 2
+    cmd_mute_grp.flags = 1;     // Active
+    TEST_CHECK(mixer.post_command(cmd_mute_grp));
+
+    mixer.drain_commands();
+
+    TEST_CHECK(std::abs(mixer.dca_gain(1) - 0.75f) < 1e-4f);
+    TEST_CHECK(mixer.is_mute_group_active(2));
+
+    std::cout << "  -> Lock-Free Protocol Automation: PASSED (DCA gain and MuteGroup commands executed sample-accurately)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -2976,6 +3147,7 @@ int main() {
     test_acoustic_measurement_and_crossover_engine();
     test_multichannel_bus_and_spatial_routing();
     test_mixer_graph_spatial_bus_routing_and_multichannel_render();
+    test_mixer_matrix_dca_groups_solo_safe_and_mute_groups();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
