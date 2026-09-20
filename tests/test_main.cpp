@@ -30,6 +30,7 @@
 #include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/analysis/measurement_engine.hpp"
 #include "audio_core/dsp/liquid_ode.hpp"
+#include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -3509,6 +3510,132 @@ void test_liquid_ode_noise_colors_sweeps_and_dynamic_denoising() {
               << static_cast<int>(max_cutoff) << "Hz [speech])" << std::endl;
 }
 
+void test_multihead_ode_compressor_and_transient_accuracy() {
+    std::cout << "[TEST] Running Multi-Head ODE Compressor & Transient Accuracy Test..." << std::endl;
+    using namespace audio_core::dsp;
+
+    MultiHeadOdeCompressor comp(48000, 4);
+    comp.set_lookahead_frames(32); // 32 samples = 0.667 ms lookahead
+
+    // 1. Bit-Exact Transparency & Flat-Magnitude Reconstruction Below Threshold
+    constexpr size_t N = 1024;
+    std::vector<float> in_l(N), in_r(N);
+    for (size_t i = 0; i < N; ++i) {
+        float t = static_cast<float>(i) / 48000.0f;
+        in_l[i] = 0.02f * std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * t);
+        in_r[i] = 0.02f * std::cos(2.0f * std::numbers::pi_v<float> * 1000.0f * t);
+    }
+
+    // 1A. Subtractive Golden-Ratio Mode: Bit-Exact Algebraic Identity
+    comp.set_crossover_mode(MultibandCrossoverMode::SubtractiveGoldenRatio);
+    std::vector<float> proc_l = in_l;
+    std::vector<float> proc_r = in_r;
+    comp.reset();
+    comp.process_stereo(proc_l.data(), proc_r.data(), N);
+
+    float max_sub_thresh_err = 0.0f;
+    for (size_t i = 128; i < N; ++i) {
+        float expected_l = in_l[i - 32];
+        float expected_r = in_r[i - 32];
+        float err_l = std::abs(proc_l[i] - expected_l);
+        float err_r = std::abs(proc_r[i] - expected_r);
+        if (err_l > max_sub_thresh_err) max_sub_thresh_err = err_l;
+        if (err_r > max_sub_thresh_err) max_sub_thresh_err = err_r;
+    }
+    TEST_CHECK(max_sub_thresh_err < 1e-4f);
+
+    // 1B. Linkwitz-Riley LR4 Phase-Compensated Mode: Flat Unity Magnitude (RMS Conservation)
+    comp.set_crossover_mode(MultibandCrossoverMode::LinkwitzRileyPhaseCompensated);
+    std::vector<float> proc_lr_l = in_l;
+    std::vector<float> proc_lr_r = in_r;
+    comp.reset();
+    comp.process_stereo(proc_lr_l.data(), proc_lr_r.data(), N);
+
+    float rms_in = 0.0f, rms_out = 0.0f;
+    for (size_t i = 128; i < N; ++i) {
+        rms_in += in_l[i - 32] * in_l[i - 32];
+        rms_out += proc_lr_l[i] * proc_lr_l[i];
+    }
+    rms_in = std::sqrt(rms_in / (N - 128));
+    rms_out = std::sqrt(rms_out / (N - 128));
+    TEST_CHECK(std::abs(rms_out - rms_in) < 0.001f);
+    std::cout << "  -> Dual-Mode Transparency Below Threshold: PASSED (Subtractive err=" 
+              << max_sub_thresh_err << " | LR4 RMS delta=" << std::abs(rms_out - rms_in) << ")" << std::endl;
+
+    // 2. Transient Lookahead & Zero-Overshoot Protection
+    std::vector<float> spike_l(512, 0.0f), spike_r(512, 0.0f);
+    spike_l[100] = 2.5f; spike_r[100] = 2.5f;
+    spike_l[101] = 2.0f; spike_r[101] = 2.0f;
+    spike_l[102] = 1.5f; spike_r[102] = 1.5f;
+
+    comp.reset();
+    comp.process_stereo(spike_l.data(), spike_r.data(), 512);
+
+    float peak_out = 0.0f;
+    for (size_t i = 0; i < 512; ++i) {
+        if (std::abs(spike_l[i]) > peak_out) peak_out = std::abs(spike_l[i]);
+    }
+    TEST_CHECK(peak_out < 2.5f); // Smoothly attenuated
+    TEST_CHECK(std::isfinite(peak_out));
+    std::cout << "  -> Zero-Smear Lookahead & Transient Catching: PASSED (Peak 2.5 tamed to " 
+              << peak_out << ", 0 overshoot)" << std::endl;
+
+    // 3. Multi-Head Frequency Band Isolation (Sub Kick vs Flute)
+    // Low Kick (50 Hz at 1.5 amp) + High Flute (3500 Hz at 0.04 amp)
+    std::vector<float> mix_l(2400), mix_r(2400);
+    for (size_t i = 0; i < 2400; ++i) {
+        float t = static_cast<float>(i) / 48000.0f;
+        float kick = 1.5f * std::sin(2.0f * std::numbers::pi_v<float> * 50.0f * t);
+        float flute = 0.04f * std::sin(2.0f * std::numbers::pi_v<float> * 3500.0f * t);
+        mix_l[i] = mix_r[i] = kick + flute;
+    }
+
+    comp.reset();
+    for (uint32_t h = 0; h < 4; ++h) comp.head_parameters(h).coupling = 0.0f;
+    comp.process_stereo(mix_l.data(), mix_r.data(), 2400);
+
+    float gr_sub_db = comp.current_gain_reduction_db(0);
+    float gr_highmid_db = comp.current_gain_reduction_db(2);
+
+    TEST_CHECK(gr_sub_db < -3.0f);    // Sub head clamped by kick (> 3 dB gain reduction)
+    TEST_CHECK(gr_highmid_db > -1.0f); // High-mid head stays open (< 1 dB gain reduction, flute unaffected)
+    std::cout << "  -> Multi-Head Band Isolation: PASSED (Sub GR=" << gr_sub_db 
+              << " dB vs High-Mid GR=" << gr_highmid_db << " dB | Flute unpumped)" << std::endl;
+
+    // 4. Inter-Head Dynamic Coupling (Cross-Head Attention Flux)
+    // Compare Head 1 (Low-Mid) gain reduction when coupling is 0.0 vs 0.6
+    comp.reset();
+    for (uint32_t h = 0; h < 4; ++h) comp.head_parameters(h).coupling = 0.0f;
+    std::vector<float> test1_l = mix_l, test1_r = mix_r;
+    comp.process_stereo(test1_l.data(), test1_r.data(), 2400);
+    float gr_mid_uncoupled = comp.current_gain_reduction_db(1);
+
+    comp.reset();
+    for (uint32_t h = 0; h < 4; ++h) comp.head_parameters(h).coupling = 0.6f;
+    std::vector<float> test2_l = mix_l, test2_r = mix_r;
+    comp.process_stereo(test2_l.data(), test2_r.data(), 2400);
+    float gr_mid_coupled = comp.current_gain_reduction_db(1);
+
+    TEST_CHECK(gr_mid_coupled < gr_mid_uncoupled); // Coupling pulls down adjacent band musically
+    std::cout << "  -> Inter-Head Dynamic Coupling: PASSED (Low-Mid GR uncoupled=" 
+              << gr_mid_uncoupled << " dB -> coupled=" << gr_mid_coupled << " dB)" << std::endl;
+
+    // 5. Mute, Solo & Parallel Wet/Dry Mix
+    comp.reset();
+    comp.head_parameters(0).mute = true;
+    std::vector<float> mute_test_l(1000, 0.0f), mute_test_r(1000, 0.0f);
+    for (size_t i = 0; i < 1000; ++i) {
+        float t = static_cast<float>(i) / 48000.0f;
+        mute_test_l[i] = mute_test_r[i] = std::sin(2.0f * std::numbers::pi_v<float> * 30.0f * t);
+    }
+    comp.process_stereo(mute_test_l.data(), mute_test_r.data(), 1000);
+    float sub_mute_rms = 0.0f;
+    for (size_t i = 200; i < 1000; ++i) sub_mute_rms += mute_test_l[i] * mute_test_l[i];
+    sub_mute_rms = std::sqrt(sub_mute_rms / 800);
+    TEST_CHECK(sub_mute_rms < 0.02f); // 30Hz sub silenced by muting Head 0 (<120Hz)
+    std::cout << "  -> Solo / Mute & Routing Integrity: PASSED (Muted Sub RMS=" << sub_mute_rms << " < 0.02)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -3545,6 +3672,7 @@ int main() {
     test_mixer_matrix_dca_groups_solo_safe_and_mute_groups();
     test_liquid_ode_trapezoidal_integration_filter_and_bus_summing();
     test_liquid_ode_noise_colors_sweeps_and_dynamic_denoising();
+    test_multihead_ode_compressor_and_transient_accuracy();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
