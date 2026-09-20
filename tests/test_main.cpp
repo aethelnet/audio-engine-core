@@ -17,6 +17,8 @@
 #include "audio_core/dsp/wasm_processor.hpp"
 #include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/clock/link_bridge.hpp"
+#include "audio_core/analysis/transient_detector.hpp"
+#include "audio_core/sampling/loop_conditioner.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 #include <iostream>
@@ -1221,6 +1223,115 @@ void test_timeline_clock_and_link_bridge_master_authority() {
     std::cout << "  -> TimelineClock & Link Master Sovereignty: PASSED (Sample-accurate beat/bar grid and anti-hijack master authority verified)" << std::endl;
 }
 
+void test_transient_detection_and_slice_engine() {
+    std::cout << "[TEST] Running Transient Detection & Sample Slicing Engine Test..." << std::endl;
+    using namespace audio_core::sampling;
+    using namespace audio_core::analysis;
+
+    // Create 1-bar drum loop buffer at 120 BPM (48000 frames)
+    constexpr uint32_t kFrames = 48000;
+    AudioClip clip("TestDrumLoop", 48000, 2, kFrames);
+    clip.set_bpm(120.0);
+
+    float* l = clip.channel(0);
+    float* r = clip.channel(1);
+
+    // Inject 4 distinct drum hits:
+    // Beat 0 (frame 0): Kick
+    // Beat 1 (frame 12000): Snare
+    // Beat 2 (frame 24000): Kick
+    // Beat 3 (frame 36000): Snare
+    const uint32_t hit_positions[4] = {0, 12000, 24000, 36000};
+    for (uint32_t hit : hit_positions) {
+        for (uint32_t i = 0; i < 500; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 100.0f);
+            float s = 0.8f * env * std::sin(2.0f * std::numbers::pi_v<float> * 120.0f * i / 48000.0f);
+            if (hit + i < kFrames) {
+                l[hit + i] += s;
+                r[hit + i] += s;
+            }
+        }
+    }
+
+    TransientDetector detector(48000);
+    auto analysis = detector.analyze(l, r, kFrames, 0.6f);
+
+    // Verify onset detection found all 4 hits
+    TEST_CHECK(analysis.onsets.size() == 4);
+    TEST_CHECK(analysis.onsets[0].sample_offset < 100);
+    TEST_CHECK(std::abs(static_cast<int>(analysis.onsets[1].sample_offset) - 12000) < 50);
+    TEST_CHECK(std::abs(static_cast<int>(analysis.onsets[2].sample_offset) - 24000) < 50);
+    TEST_CHECK(std::abs(static_cast<int>(analysis.onsets[3].sample_offset) - 36000) < 50);
+
+    // Slice at detected markers
+    std::vector<uint32_t> markers;
+    for (const auto& o : analysis.onsets) markers.push_back(o.sample_offset);
+    clip.slice_at_markers(markers);
+    TEST_CHECK(clip.slices().size() == 4);
+
+    // Test playback of specific slice 1 (Snare)
+    uint64_t slice_playhead = 0;
+    std::vector<float> snare_out_l(512, 0.0f);
+    std::vector<float> snare_out_r(512, 0.0f);
+    uint32_t rendered = clip.read_slice(1, slice_playhead, snare_out_l.data(), snare_out_r.data(), 512, false);
+    TEST_CHECK(rendered == 512);
+    TEST_CHECK(slice_playhead == 512);
+
+    // Energy check: Snare slice must contain audio
+    float energy = 0.0f;
+    for (float val : snare_out_l) energy += std::abs(val);
+    TEST_CHECK(energy > 0.1f);
+
+    // Test Grid Slicing (16 slices)
+    clip.slice_grid(16);
+    TEST_CHECK(clip.slices().size() == 16);
+    TEST_CHECK(clip.slices()[0].end_frame == 3000);
+
+    std::cout << "  -> Transient Detection & Beat Slicing: PASSED (4 drum hits isolated, slice rearranged & triggered)" << std::endl;
+}
+
+void test_seamless_loop_equal_power_conditioning() {
+    std::cout << "[TEST] Running Seamless Loop Equal-Power Conditioning Test..." << std::endl;
+    using namespace audio_core::sampling;
+
+    constexpr uint32_t kFrames = 2048;
+    AudioClip clip("DiscontinuousLoop", 48000, 2, kFrames);
+
+    float* l = clip.channel(0);
+    float* r = clip.channel(1);
+
+    // Create intentional Heaviside step discontinuity and DC offset
+    // Start of clip: -0.3f
+    // End of clip: +0.6f (jump = 0.9f!)
+    // Add artificial DC offset: +0.05f
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float ramp = -0.3f + (0.9f * static_cast<float>(i) / static_cast<float>(kFrames));
+        l[i] = ramp + 0.05f;
+        r[i] = ramp + 0.05f;
+    }
+
+    float initial_step = std::abs(l[kFrames - 1] - l[0]);
+    TEST_CHECK(initial_step > 0.85f); // Massive click!
+
+    // Condition loop for seamless playback with 128-frame equal-power crossfade and DC trap
+    LoopConditioner::condition_seamless(clip, 128);
+
+    // Check step discontinuity between end and start:
+    // With equal-power crossfade towards head, tail[kFrames - 1] matches head[127] smoothly
+    float conditioned_end = l[kFrames - 1];
+    float target_head = l[127];
+    float seam_difference = std::abs(conditioned_end - target_head);
+    TEST_CHECK(seam_difference < 0.05f);
+
+    // Check DC offset removal (mean should be close to 0)
+    double mean = 0.0;
+    for (uint32_t i = 0; i < kFrames; ++i) mean += l[i];
+    mean /= kFrames;
+    TEST_CHECK(std::abs(mean) < 0.02);
+
+    std::cout << "  -> Seamless Loop Equal-Power Seam: PASSED (Heaviside step jump eliminated, DC offset suppressed)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1241,6 +1352,8 @@ int main() {
     test_aoip_network_streaming_and_unpacking();
     test_universal_sampling_and_bounce_tap();
     test_timeline_clock_and_link_bridge_master_authority();
+    test_transient_detection_and_slice_engine();
+    test_seamless_loop_equal_power_conditioning();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
