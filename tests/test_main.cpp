@@ -2469,7 +2469,116 @@ void test_acoustic_measurement_and_crossover_engine() {
                   << max_sum_diff << ", 10kHz leakage=" << max_treble_in_low << " [<-48dB])" << std::endl;
     }
 
-    // 5. Farina Exponential Sine Sweep (ESS) Generation & Self-Deconvolution
+    // 5. Mastering-Grade Multiband Crossover Matrix (Beyond FabFilter: 4-Band & 6-Band Verification)
+    {
+        MultibandCrossoverMatrix matrix;
+        constexpr uint32_t kFrames = 2048;
+
+        // A. 4-Band Subtractive Golden-Ratio Tree: Bit-Exact Reconstruction & Band Isolation
+        std::array<float, 3> freqs_4band = {80.0f, 500.0f, 3500.0f};
+        matrix.configure(4, freqs_4band.data(), 48000, MultibandCrossoverMode::SubtractiveGoldenRatio);
+
+        std::vector<float> in_l(kFrames), in_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            in_l[i] = 0.25f * (std::sin(2.0f * std::numbers::pi_v<float> * 40.0f * t) +
+                               std::sin(2.0f * std::numbers::pi_v<float> * 250.0f * t) +
+                               std::sin(2.0f * std::numbers::pi_v<float> * 1500.0f * t) +
+                               std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * t));
+            in_r[i] = in_l[i] * 0.9f;
+        }
+
+        std::array<std::vector<float>, 8> bands_l, bands_r;
+        for (size_t b = 0; b < 8; ++b) {
+            bands_l[b].resize(kFrames);
+            bands_r[b].resize(kFrames);
+        }
+
+        std::array<float*, 8> ptrs_l, ptrs_r;
+        for (size_t b = 0; b < 8; ++b) {
+            ptrs_l[b] = bands_l[b].data();
+            ptrs_r[b] = bands_r[b].data();
+        }
+
+        matrix.process_block(in_l.data(), in_r.data(), ptrs_l.data(), ptrs_r.data(), kFrames);
+
+        // Verify Bit-Exact Algebraic Identity on Sum
+        float max_4band_err = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float sum_l = bands_l[0][i] + bands_l[1][i] + bands_l[2][i] + bands_l[3][i];
+            float sum_r = bands_r[0][i] + bands_r[1][i] + bands_r[2][i] + bands_r[3][i];
+            max_4band_err = std::max({max_4band_err, std::abs(sum_l - in_l[i]), std::abs(sum_r - in_r[i])});
+        }
+        TEST_CHECK(max_4band_err < 1e-6f); // Exact null cancellation!
+
+        // B. 6-Band FabFilter Pro-MB Style Configuration (60, 250, 1000, 4000, 10000 Hz)
+        std::array<float, 5> freqs_6band = {60.0f, 250.0f, 1000.0f, 4000.0f, 10000.0f};
+        matrix.configure(6, freqs_6band.data(), 48000, MultibandCrossoverMode::SubtractiveGoldenRatio);
+        matrix.process_block(in_l.data(), in_r.data(), ptrs_l.data(), ptrs_r.data(), kFrames);
+
+        float max_6band_err = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float sum_l = 0.0f;
+            for (uint32_t b = 0; b < 6; ++b) sum_l += bands_l[b][i];
+            max_6band_err = std::max(max_6band_err, std::abs(sum_l - in_l[i]));
+        }
+        TEST_CHECK(max_6band_err < 1e-6f);
+
+        // Test Solo Logic: Solo Band 2 (1000 Hz band)
+        matrix.set_band_solo(2, true);
+        matrix.process_block(in_l.data(), in_r.data(), ptrs_l.data(), ptrs_r.data(), kFrames);
+        for (uint32_t b = 0; b < 6; ++b) {
+            if (b != 2) {
+                TEST_CHECK(std::abs(bands_l[b][100]) == 0.0f);
+            } else {
+                TEST_CHECK(std::abs(bands_l[b][100]) > 0.0f);
+            }
+        }
+        matrix.set_band_solo(2, false);
+
+        // C. Linkwitz-Riley 4th Order Phase-Compensated Multi-Way Tree (Flat Magnitude Verification)
+        constexpr uint32_t kFramesLR = 4800; // Exactly 4 cycles of 40 Hz, 25 cycles of 250 Hz @ 48k
+        std::vector<float> in_lr_l(kFramesLR), in_lr_r(kFramesLR);
+        for (uint32_t i = 0; i < kFramesLR; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            in_lr_l[i] = 0.25f * (std::sin(2.0f * std::numbers::pi_v<float> * 40.0f * t) +
+                                  std::sin(2.0f * std::numbers::pi_v<float> * 250.0f * t) +
+                                  std::sin(2.0f * std::numbers::pi_v<float> * 1500.0f * t) +
+                                  std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * t));
+            in_lr_r[i] = in_lr_l[i];
+        }
+
+        std::array<std::vector<float>, 8> lr_bands_l, lr_bands_r;
+        for (size_t b = 0; b < 8; ++b) {
+            lr_bands_l[b].resize(kFramesLR);
+            lr_bands_r[b].resize(kFramesLR);
+        }
+        std::array<float*, 8> lr_ptrs_l, lr_ptrs_r;
+        for (size_t b = 0; b < 8; ++b) {
+            lr_ptrs_l[b] = lr_bands_l[b].data();
+            lr_ptrs_r[b] = lr_bands_r[b].data();
+        }
+
+        matrix.configure(4, freqs_4band.data(), 48000, MultibandCrossoverMode::LinkwitzRileyPhaseCompensated);
+        matrix.process_block(in_lr_l.data(), in_lr_r.data(), lr_ptrs_l.data(), lr_ptrs_r.data(), kFramesLR);
+
+        // Evaluate after IIR settling (samples 2400..4800 = exactly 2 integer cycles of 40 Hz)
+        float rms_in = 0.0f, rms_lr_sum = 0.0f;
+        for (uint32_t i = 2400; i < kFramesLR; ++i) {
+            float sum_l = lr_bands_l[0][i] + lr_bands_l[1][i] + lr_bands_l[2][i] + lr_bands_l[3][i];
+            rms_in += in_lr_l[i] * in_lr_l[i];
+            rms_lr_sum += sum_l * sum_l;
+        }
+        rms_in = std::sqrt(rms_in / 2400);
+        rms_lr_sum = std::sqrt(rms_lr_sum / 2400);
+        TEST_CHECK(std::abs(rms_lr_sum - rms_in) < 0.005f); // Phase-compensated tree guarantees flat magnitude (<0.005 delta)
+
+        std::cout << "  -> Multiband Crossover Matrix (4-Way & 6-Way): PASSED (Subtractive 4-band err=" 
+                  << max_4band_err << ", 6-band err=" << max_6band_err 
+                  << ", LR4 Phase-Compensated delta=" << std::abs(rms_lr_sum - rms_in) << ")" << std::endl;
+    }
+
+    // 6. Farina Exponential Sine Sweep (ESS) Generation & Self-Deconvolution
     {
         FarinaSweepGenerator::SweepParams params;
         params.start_freq = 50.0f;
