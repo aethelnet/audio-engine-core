@@ -25,6 +25,8 @@ enum class MixerCommandType : uint16_t {
     SetBusSlotParam,
     ResetMeters,
     SetSampleRate,
+    SetTrackAzimuth,
+    ConfigureSpatialBus,
 };
 
 // ============================================================================

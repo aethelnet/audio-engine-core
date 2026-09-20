@@ -44,8 +44,8 @@ public:
         : m_num_channels(std::clamp(num_channels, 1u, kMaxChannels))
         , m_frames(frames)
         , m_name(std::move(name)) {
-        m_storage.resize(m_num_channels * m_frames, 0.0f);
-        m_channel_ptrs.resize(m_num_channels);
+        m_storage.resize(kMaxChannels * m_frames, 0.0f);
+        m_channel_ptrs.resize(kMaxChannels);
         update_ptrs();
         reset_meters();
     }
@@ -53,9 +53,14 @@ public:
     void resize(uint32_t num_channels, uint32_t frames) {
         m_num_channels = std::clamp(num_channels, 1u, kMaxChannels);
         m_frames = frames;
-        m_storage.resize(m_num_channels * m_frames, 0.0f);
-        m_channel_ptrs.resize(m_num_channels);
+        m_storage.resize(kMaxChannels * m_frames, 0.0f);
+        m_channel_ptrs.resize(kMaxChannels);
         update_ptrs();
+        reset_meters();
+    }
+
+    void set_channel_count(uint32_t num_channels) noexcept {
+        m_num_channels = std::clamp(num_channels, 1u, kMaxChannels);
         reset_meters();
     }
 
@@ -72,7 +77,7 @@ public:
     }
 
     void clear() noexcept {
-        std::fill(m_storage.begin(), m_storage.end(), 0.0f);
+        clear_frames(m_frames);
     }
 
     void clear_frames(uint32_t frames) noexcept {
@@ -175,7 +180,7 @@ public:
             return;
         }
 
-        if (m_num_channels >= 6) {
+        if (m_num_channels == 6) {
             // 5.1 Surround Downmix (ITU-R BS.775)
             // L_tot = L + 0.7071 * C + 0.7071 * Ls
             // R_tot = R + 0.7071 * C + 0.7071 * Rs
@@ -195,13 +200,18 @@ public:
             return;
         }
 
-        // Generic multichannel equal-power downmix (e.g. Quad or WFS ring)
+        // Circular / Ambisonics / WFS array projection to stereo
         const float norm = 1.0f / std::sqrt(static_cast<float>(m_num_channels) * 0.5f);
         for (uint32_t ch = 0; ch < m_num_channels; ++ch) {
             const float* c = m_channel_ptrs[ch];
+            // Azimuth angle of speaker ch around horizontal circle [0..2pi)
             const float angle = (2.0f * std::numbers::pi_v<float> * static_cast<float>(ch)) / static_cast<float>(m_num_channels);
-            const float pan_l = std::max(0.0f, std::cos(angle));
-            const float pan_r = std::max(0.0f, -std::cos(angle));
+            // Lateral position x in [-1, 1]: 0 = Front/Center, +1 = Right, -1 = Left
+            const float x = std::sin(angle);
+            // Constant-power stereo panning: phi in [0, pi/2]
+            const float phi = (x + 1.0f) * 0.25f * std::numbers::pi_v<float>;
+            const float pan_l = std::cos(phi);
+            const float pan_r = std::sin(phi);
 
             for (uint32_t i = 0; i < count; ++i) {
                 out_l[i] += c[i] * pan_l * norm;
@@ -274,7 +284,7 @@ public:
 
 private:
     void update_ptrs() noexcept {
-        for (uint32_t ch = 0; ch < m_num_channels; ++ch) {
+        for (uint32_t ch = 0; ch < kMaxChannels; ++ch) {
             m_channel_ptrs[ch] = m_storage.data() + (ch * m_frames);
         }
     }

@@ -2833,6 +2833,116 @@ void test_multichannel_bus_and_spatial_routing() {
     }
 }
 
+void test_mixer_graph_spatial_bus_routing_and_multichannel_render() {
+    std::cout << "[TEST] Running MixerGraph Spatial Bus Routing & MultiChannel Render Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+
+    constexpr uint32_t kFrames = 256;
+    constexpr uint32_t kSpatialChannels = 16;
+    MixerGraph mixer(kFrames);
+    mixer.configure_spatial_bus(kSpatialChannels);
+    TEST_CHECK(mixer.spatial_master_bus().num_channels() == kSpatialChannels);
+
+    // 1. Setup Track 1: Front Center (azimuth = 0.0) -> Spatial Bus
+    Track* trk_front = mixer.add_track("SpatialFrontCenter");
+    TEST_CHECK(trk_front != nullptr);
+    trk_front->route_to_spatial_bus();
+    trk_front->set_azimuth(0.0f);
+    TEST_CHECK(trk_front->target_bus() == kSpatialMasterBusId);
+    TEST_CHECK(trk_front->azimuth() == 0.0f);
+
+    // 2. Setup Track 2: Hard Right (azimuth = pi/2) -> Spatial Bus
+    Track* trk_right = mixer.add_track("SpatialRight");
+    TEST_CHECK(trk_right != nullptr);
+    trk_right->route_to_spatial_bus();
+    trk_right->set_azimuth(std::numbers::pi_v<float> * 0.5f);
+    TEST_CHECK(trk_right->azimuth() == std::numbers::pi_v<float> * 0.5f);
+
+    // 3. Setup Track 3: Standard Stereo Track -> Master Bus (azimuth auto-synced from pan)
+    Track* trk_stereo = mixer.add_track("DirectStereo");
+    TEST_CHECK(trk_stereo != nullptr);
+    trk_stereo->route_to_master();
+    trk_stereo->set_pan(-1.0f); // Hard Left in stereo master
+    TEST_CHECK(trk_stereo->target_bus() == kStereoMasterBusId);
+
+    // Fill buffers with DC test signals
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        trk_front->buffer().channel(0)[i] = 1.0f;
+        trk_front->buffer().channel(1)[i] = 1.0f;
+
+        trk_right->buffer().channel(0)[i] = 0.8f;
+        trk_right->buffer().channel(1)[i] = 0.8f;
+
+        trk_stereo->buffer().channel(0)[i] = 0.5f;
+        trk_stereo->buffer().channel(1)[i] = 0.5f;
+    }
+
+    // 4. Render Multichannel: Render 16-channel spatial bus and capture stereo monitor
+    MultiChannelBus out_spatial(kSpatialChannels, kFrames, "RenderedSpatial");
+    AudioBuffer out_stereo(2, kFrames);
+    auto stereo_view = out_stereo.view();
+
+    mixer.render_multichannel(out_spatial, &stereo_view);
+
+    // Assert Sector 0 (Speaker 0 = Front Center) received Track 1
+    // At azimuth 0 on 16 channels, speaker 0 receives 1.0f
+    TEST_CHECK(out_spatial.channel(0)[100] > 0.99f);
+
+    // Assert Sector 4 (Speaker 4 = Hard Right at pi/2) received Track 2
+    // 16 speakers * (0.5*pi / 2*pi) = 16 * 0.25 = 4!
+    TEST_CHECK(out_spatial.channel(4)[100] > 0.79f);
+
+    // Assert Unrelated Speakers (e.g. Speaker 2, Speaker 6, Speaker 10) are isolated / silent
+    TEST_CHECK(std::abs(out_spatial.channel(2)[100]) < 1e-5f);
+    TEST_CHECK(std::abs(out_spatial.channel(6)[100]) < 1e-5f);
+    TEST_CHECK(std::abs(out_spatial.channel(10)[100]) < 1e-5f);
+
+    // Assert Stereo Master Folddown:
+    // Direct Stereo Track 3 (hard left 0.5f) + Spatial Bus folddown (Front center + Right)
+    // Left stereo channel must contain Track 3 + downmixed Front Center
+    TEST_CHECK(stereo_view.channel(0)[100] > 0.5f);
+    // Right stereo channel must contain downmixed Front Center + downmixed Right
+    TEST_CHECK(stereo_view.channel(1)[100] > 0.0f);
+
+    // Assert Spatial Bus telemetry meters updated
+    TEST_CHECK(mixer.spatial_master_bus().peak(0) > 0.9f);
+    TEST_CHECK(mixer.spatial_master_bus().peak(4) > 0.7f);
+    TEST_CHECK(mixer.spatial_master_bus().peak(2) == 0.0f);
+
+    // 5. Test Lock-Free Automation: Automate Azimuth and Reconfigure Spatial Bus via Protocol
+    protocol::MixerCommand cmd_azimuth{};
+    cmd_azimuth.type = protocol::MixerCommandType::SetTrackAzimuth;
+    cmd_azimuth.target_id = trk_front->id();
+    cmd_azimuth.value1 = std::numbers::pi_v<float>; // Rotate Front track to Rear (180 deg)
+    TEST_CHECK(mixer.post_command(cmd_azimuth));
+
+    protocol::MixerCommand cmd_resize{};
+    cmd_resize.type = protocol::MixerCommandType::ConfigureSpatialBus;
+    cmd_resize.target_id = 32; // Reconfigure to 32 channels on the fly
+    TEST_CHECK(mixer.post_command(cmd_resize));
+
+    // Refill and render next block
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        trk_front->buffer().channel(0)[i] = 1.0f;
+        trk_front->buffer().channel(1)[i] = 1.0f;
+    }
+
+    MultiChannelBus out_spatial_32(32, kFrames, "Spatial32");
+    mixer.render_multichannel(out_spatial_32, &stereo_view);
+
+    // Verify command executed on audio thread:
+    TEST_CHECK(mixer.spatial_master_bus().num_channels() == 32);
+    TEST_CHECK(trk_front->azimuth() == std::numbers::pi_v<float>);
+
+    // On 32 channels, angle pi is speaker 32 * 0.5 = 16!
+    TEST_CHECK(out_spatial_32.channel(16)[100] > 0.99f);
+    // Speaker 0 should now be silent!
+    TEST_CHECK(std::abs(out_spatial_32.channel(0)[100]) < 1e-5f);
+
+    std::cout << "  -> MixerGraph Spatial Bus Routing: PASSED (16ch & 32ch discrete VBAP, lock-free reconfig, stereo folddown verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -2865,6 +2975,7 @@ int main() {
     test_anti_aliasing_and_airwindows_dither();
     test_acoustic_measurement_and_crossover_engine();
     test_multichannel_bus_and_spatial_routing();
+    test_mixer_graph_spatial_bus_routing_and_multichannel_render();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

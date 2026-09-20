@@ -11,6 +11,7 @@
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
+#include "audio_core/dsp/multichannel_bus.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -21,6 +22,9 @@
 #include <atomic>
 
 namespace audio_core {
+
+inline constexpr int32_t kStereoMasterBusId = -1;
+inline constexpr int32_t kSpatialMasterBusId = -2;
 
 struct MeterLevels {
     float peak_l{0.0f};
@@ -52,6 +56,8 @@ public:
         m_name = std::move(name);
         m_gain.store(1.0f, std::memory_order_relaxed);
         m_pan.store(0.0f, std::memory_order_relaxed);
+        m_azimuth.store(0.0f, std::memory_order_relaxed);
+        m_custom_azimuth.store(false, std::memory_order_relaxed);
         m_mute.store(false, std::memory_order_relaxed);
         m_solo.store(false, std::memory_order_relaxed);
         m_target_bus.store(-1, std::memory_order_relaxed);
@@ -67,6 +73,8 @@ public:
 
     void deactivate() noexcept {
         m_active.store(false, std::memory_order_release);
+        m_azimuth.store(0.0f, std::memory_order_relaxed);
+        m_custom_azimuth.store(false, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -79,8 +87,20 @@ public:
     void set_gain(float gain) noexcept { m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
 
-    void set_pan(float pan) noexcept { m_pan.store(std::clamp(pan, -1.0f, 1.0f), std::memory_order_relaxed); }
+    void set_pan(float pan) noexcept {
+        float p = std::clamp(pan, -1.0f, 1.0f);
+        m_pan.store(p, std::memory_order_relaxed);
+        if (!m_custom_azimuth.load(std::memory_order_relaxed)) {
+            m_azimuth.store(p * std::numbers::pi_v<float> * 0.5f, std::memory_order_relaxed);
+        }
+    }
     [[nodiscard]] float pan() const noexcept { return m_pan.load(std::memory_order_relaxed); }
+
+    void set_azimuth(float azimuth_rad) noexcept {
+        m_azimuth.store(azimuth_rad, std::memory_order_relaxed);
+        m_custom_azimuth.store(true, std::memory_order_relaxed);
+    }
+    [[nodiscard]] float azimuth() const noexcept { return m_azimuth.load(std::memory_order_relaxed); }
 
     void set_mute(bool mute) noexcept { m_mute.store(mute, std::memory_order_relaxed); }
     [[nodiscard]] bool is_muted() const noexcept { return m_mute.load(std::memory_order_relaxed); }
@@ -90,6 +110,9 @@ public:
 
     void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
     [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
+    void route_to_master() noexcept { set_target_bus(kStereoMasterBusId); }
+    void route_to_spatial_bus() noexcept { set_target_bus(kSpatialMasterBusId); }
+    void route_to_submix_bus(uint32_t bus_id) noexcept { set_target_bus(static_cast<int32_t>(bus_id)); }
 
     void set_send(uint32_t bus_id, float amount, bool pre_fader = false) noexcept {
         for (auto& s : m_sends) {
@@ -265,9 +288,11 @@ private:
     std::atomic<bool> m_active{false};
     std::atomic<float> m_gain{1.0f};
     std::atomic<float> m_pan{0.0f};
+    std::atomic<float> m_azimuth{0.0f};
+    std::atomic<bool> m_custom_azimuth{false};
     std::atomic<bool> m_mute{false};
     std::atomic<bool> m_solo{false};
-    std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master
+    std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master, -2 = Spatial Bus
 
     std::array<InsertSlot, kMaxTrackInsertSlots> m_slots;
     std::array<SendInfo, kMaxTrackSends> m_sends{};
@@ -325,6 +350,9 @@ public:
 
     void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
     [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
+    void route_to_master() noexcept { set_target_bus(kStereoMasterBusId); }
+    void route_to_spatial_bus() noexcept { set_target_bus(kSpatialMasterBusId); }
+    void route_to_submix_bus(uint32_t bus_id) noexcept { set_target_bus(static_cast<int32_t>(bus_id)); }
 
     void set_console_type(dsp::ConsoleType type) noexcept {
         m_console.set_type(type);
@@ -419,6 +447,8 @@ public:
 
     explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true, uint32_t sample_rate = 48000)
         : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames),
+          m_spatial_master_bus(16, buffer_frames, "Spatial Master Bus"),
+          m_scratch_stereo_buffer(2, buffer_frames),
           m_clock(sample_rate, 120.0),
           m_worker_pool(enable_multithreading ? threading::AudioWorkerPool::kAutoDetect : 0) {
         m_master_bus.set_active(true);
@@ -640,6 +670,13 @@ public:
     [[nodiscard]] AudioBus& master_bus() noexcept { return m_master_bus; }
     [[nodiscard]] const AudioBus& master_bus() const noexcept { return m_master_bus; }
 
+    [[nodiscard]] dsp::MultiChannelBus& spatial_master_bus() noexcept { return m_spatial_master_bus; }
+    [[nodiscard]] const dsp::MultiChannelBus& spatial_master_bus() const noexcept { return m_spatial_master_bus; }
+
+    void configure_spatial_bus(uint32_t channels) noexcept {
+        m_spatial_master_bus.set_channel_count(channels);
+    }
+
     [[nodiscard]] size_t track_count() const noexcept {
         size_t count = 0;
         for (const auto& t : m_tracks) {
@@ -693,6 +730,25 @@ public:
         }
     }
 
+    // Multichannel spatial rendering (Planar / Poly-WAV destination with optional stereo monitor output)
+    void render_multichannel(dsp::MultiChannelBus& out_spatial, AudioBufferView* out_stereo_master = nullptr) noexcept {
+        if (out_stereo_master) {
+            render(*out_stereo_master);
+        } else {
+            auto scratch_view = m_scratch_stereo_buffer.view_frames(m_buffer_frames);
+            render(scratch_view);
+        }
+
+        const uint32_t frames = std::min(out_spatial.num_frames(), m_buffer_frames);
+        const uint32_t channels = std::min(out_spatial.num_channels(), m_spatial_master_bus.num_channels());
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+            std::memcpy(out_spatial.channel(ch), m_spatial_master_bus.channel(ch), frames * sizeof(float));
+        }
+        for (uint32_t ch = channels; ch < out_spatial.num_channels(); ++ch) {
+            std::memset(out_spatial.channel(ch), 0, frames * sizeof(float));
+        }
+    }
+
     // Real-Time Render Pipeline: Fully lock-free, zero allocation
     void render(AudioBufferView& out_master) noexcept {
         const uint32_t frames = std::min(out_master.num_frames(), m_buffer_frames);
@@ -703,8 +759,9 @@ public:
         const auto boundary_events = m_clock.advance_block(frames);
         (void)boundary_events;
 
-        // 1. Clear Master and Active Submix Buses
+        // 1. Clear Master, Spatial Master, and Active Submix Buses
         m_master_bus.clear();
+        m_spatial_master_bus.clear_frames(frames);
         for (auto& bus : m_buses) {
             if (bus->is_active()) {
                 bus->clear();
@@ -793,20 +850,30 @@ public:
             const float left_gain = gain * pan_l;
             const float right_gain = gain * pan_r;
 
-            // Routing destination: Submix bus or Master
+            // Routing destination: Spatial Master Bus, Submix bus or Master
             const int32_t target_id = track->target_bus();
-            AudioBus* target_bus = (target_id > 0) ? get_bus(static_cast<uint32_t>(target_id)) : &m_master_bus;
-            if (!target_bus) target_bus = &m_master_bus;
+            if (target_id == kSpatialMasterBusId) {
+                // Vector-Base Spatial Panning into Spatial Master Bus
+                // Downmix track stereo output to mono point source in scratch buffer
+                Sample* scratch_mono = m_scratch_stereo_buffer.channel(0);
+                for (uint32_t i = 0; i < frames; ++i) {
+                    scratch_mono[i] = 0.5f * (trk_l[i] + trk_r[i]);
+                }
+                m_spatial_master_bus.pan_mono_circular(scratch_mono, gain, track->azimuth(), frames);
+            } else {
+                AudioBus* target_bus = (target_id > 0) ? get_bus(static_cast<uint32_t>(target_id)) : &m_master_bus;
+                if (!target_bus) target_bus = &m_master_bus;
 
-            Sample* dst_l = target_bus->buffer().view().channel(0);
-            Sample* dst_r = target_bus->buffer().view().channel(1);
+                Sample* dst_l = target_bus->buffer().view().channel(0);
+                Sample* dst_r = target_bus->buffer().view().channel(1);
 
-            #if defined(__GNUC__) || defined(__clang__)
-            #pragma GCC ivdep
-            #endif
-            for (uint32_t i = 0; i < frames; ++i) {
-                dst_l[i] += trk_l[i] * left_gain;
-                dst_r[i] += trk_r[i] * right_gain;
+                #if defined(__GNUC__) || defined(__clang__)
+                #pragma GCC ivdep
+                #endif
+                for (uint32_t i = 0; i < frames; ++i) {
+                    dst_l[i] += trk_l[i] * left_gain;
+                    dst_r[i] += trk_r[i] * right_gain;
+                }
             }
 
             // Auxiliary Sends (e.g. Reverb / Delay Busses)
@@ -852,18 +919,35 @@ public:
             }
 
             int32_t tgt_id = bus->target_bus();
-            AudioBus* target = (tgt_id >= 1 && tgt_id <= static_cast<int32_t>(kMaxBuses))
-                               ? get_bus(static_cast<uint32_t>(tgt_id))
-                               : &m_master_bus;
-            if (!target) target = &m_master_bus;
+            if (tgt_id == kSpatialMasterBusId) {
+                // Route stereo submix bus into front channels of spatial bus
+                m_spatial_master_bus.mix_stereo_pair(0, b_l, b_r, bus_gain, frames);
+            } else {
+                AudioBus* target = (tgt_id >= 1 && tgt_id <= static_cast<int32_t>(kMaxBuses))
+                                   ? get_bus(static_cast<uint32_t>(tgt_id))
+                                   : &m_master_bus;
+                if (!target) target = &m_master_bus;
 
-            Sample* dst_l = target->buffer().view().channel(0);
-            Sample* dst_r = target->buffer().view().channel(1);
+                Sample* dst_l = target->buffer().view().channel(0);
+                Sample* dst_r = target->buffer().view().channel(1);
 
-            for (uint32_t i = 0; i < frames; ++i) {
-                dst_l[i] += b_l[i] * bus_gain;
-                dst_r[i] += b_r[i] * bus_gain;
+                for (uint32_t i = 0; i < frames; ++i) {
+                    dst_l[i] += b_l[i] * bus_gain;
+                    dst_r[i] += b_r[i] * bus_gain;
+                }
             }
+        }
+
+        // 4b. Telemetry & Stereo Folddown of Spatial Master Bus (ITU-R BS.775 / Equal-Power)
+        m_spatial_master_bus.update_meters(frames);
+        Sample* down_l = m_scratch_stereo_buffer.channel(0);
+        Sample* down_r = m_scratch_stereo_buffer.channel(1);
+        m_spatial_master_bus.downmix_to_stereo(down_l, down_r, frames);
+        Sample* mst_l = m_master_bus.buffer().view().channel(0);
+        Sample* mst_r = m_master_bus.buffer().view().channel(1);
+        for (uint32_t i = 0; i < frames; ++i) {
+            mst_l[i] += down_l[i];
+            mst_r[i] += down_r[i];
         }
 
         // 5. Process Master Bus Strip (Console Decode + Master Inserts + Peak Safety)
@@ -1031,6 +1115,19 @@ public:
                 }
                 break;
             }
+            case protocol::MixerCommandType::SetTrackAzimuth: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_azimuth(cmd.value1);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::ConfigureSpatialBus: {
+                uint32_t ch = (cmd.target_id > 0) ? cmd.target_id : cmd.flags;
+                if (ch > 0) {
+                    configure_spatial_bus(ch);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -1044,6 +1141,8 @@ private:
     std::array<std::unique_ptr<Track>, kMaxTracks> m_tracks;
     std::array<std::unique_ptr<AudioBus>, kMaxBuses> m_buses;
     AudioBus m_master_bus;
+    dsp::MultiChannelBus m_spatial_master_bus;
+    AudioBuffer m_scratch_stereo_buffer;
 
     std::array<size_t, kMaxBuses> m_bus_render_order{};
     size_t m_bus_render_order_count{0};
