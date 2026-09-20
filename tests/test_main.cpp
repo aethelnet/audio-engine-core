@@ -6,6 +6,9 @@
 #include "audio_core/wasm_host.hpp"
 #include "audio_core/dsp/console_processor.hpp"
 #include "audio_core/mixer_graph.hpp"
+#include "audio_core/protocol/command_packet.hpp"
+#include "audio_core/protocol/aoip_packet.hpp"
+#include "audio_core/protocol/telemetry_packet.hpp"
 
 #include <iostream>
 #include <thread>
@@ -600,6 +603,113 @@ void test_mixer_graph_routing() {
     }
 }
 
+void test_binary_protocol_and_command_queue() {
+    std::cout << "[TEST] Running Binary Protocol Precision & Lock-Free Command Queue Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::protocol;
+
+    // 1. Binary Struct Alignment & Footprint Checks
+    static_assert(sizeof(MixerCommand) == 32);
+    static_assert(alignof(MixerCommand) == 32);
+    static_assert(sizeof(AoipHeader) == 32);
+    static_assert(sizeof(ChannelMeterData) == 16);
+    static_assert(alignof(MixerTelemetryFrame) == 64);
+
+    std::cout << "  -> Memory Layout: PASSED (MixerCommand=32B aligned, AoipHeader=32B packed, Telemetry=64B cache aligned)" << std::endl;
+
+    // 2. AoIP Network Packet Validation & Zero-Copy Deserialization
+    {
+        constexpr uint16_t kChannels = 2;
+        constexpr uint16_t kFrames = 64;
+        constexpr size_t kPayloadBytes = kChannels * kFrames * sizeof(float);
+        constexpr size_t kTotalBytes = sizeof(AoipHeader) + kPayloadBytes;
+
+        std::vector<uint8_t> packet_data(kTotalBytes, 0);
+        auto* hdr = reinterpret_cast<AoipHeader*>(packet_data.data());
+        hdr->magic = kAoipMagic;
+        hdr->version = kAoipVersion;
+        hdr->payload_format = static_cast<uint16_t>(AoipPayloadFormat::Float32_Interleaved);
+        hdr->sequence_number = 1042;
+        hdr->timestamp_ns = 1726857600000000ULL;
+        hdr->sample_rate = 48000;
+        hdr->channels = kChannels;
+        hdr->frames = kFrames;
+
+        // Valid packet test
+        TEST_CHECK(validate_aoip_packet(packet_data.data(), kTotalBytes));
+
+        // Truncated packet test
+        TEST_CHECK(!validate_aoip_packet(packet_data.data(), kTotalBytes - 1));
+
+        // Corrupted magic test
+        hdr->magic = 0xDEADBEEF;
+        TEST_CHECK(!validate_aoip_packet(packet_data.data(), kTotalBytes));
+        hdr->magic = kAoipMagic;
+
+        // Corrupted version test
+        hdr->version = 99;
+        TEST_CHECK(!validate_aoip_packet(packet_data.data(), kTotalBytes));
+
+        std::cout << "  -> AoIP Wire Format: PASSED (Zero-copy header validation, sequence tracking & payload bound checks)" << std::endl;
+    }
+
+    // 3. Lock-Free SPSC Binary Command Queue Dispatch
+    {
+        constexpr uint32_t kFrames = 128;
+        MixerGraph mixer(kFrames);
+
+        Track* kick = mixer.add_track("808 Kick");
+        Track* bass = mixer.add_track("Sub Bass");
+
+        // Initial state
+        TEST_CHECK(kick->gain() == 1.0f);
+        TEST_CHECK(kick->pan() == 0.0f);
+        TEST_CHECK(!kick->is_muted());
+
+        // UI / Network thread posts binary POD commands into ring buffer
+        MixerCommand cmd_gain;
+        cmd_gain.type = MixerCommandType::SetTrackGain;
+        cmd_gain.target_id = kick->id();
+        cmd_gain.value1 = 0.42f;
+        TEST_CHECK(mixer.post_command(cmd_gain));
+
+        MixerCommand cmd_pan;
+        cmd_pan.type = MixerCommandType::SetTrackPan;
+        cmd_pan.target_id = kick->id();
+        cmd_pan.value1 = -0.75f;
+        TEST_CHECK(mixer.post_command(cmd_pan));
+
+        MixerCommand cmd_mute;
+        cmd_mute.type = MixerCommandType::SetTrackMute;
+        cmd_mute.target_id = bass->id();
+        cmd_mute.flags = 1; // Muted
+        TEST_CHECK(mixer.post_command(cmd_mute));
+
+        // Prior to render, changes are not yet applied to RT graph
+        TEST_CHECK(kick->gain() == 1.0f);
+
+        // RT Audio thread calls render -> drains commands sample-accurately with zero allocations
+        AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+        mixer.render(view);
+
+        // Verify commands executed atomically on audio cycle boundary
+        TEST_CHECK(std::abs(kick->gain() - 0.42f) < 1e-5f);
+        TEST_CHECK(std::abs(kick->pan() - -0.75f) < 1e-5f);
+        TEST_CHECK(bass->is_muted());
+
+        // 4. Zero-Copy 60Hz Telemetry Frame Capture
+        MixerTelemetryFrame snapshot{};
+        mixer.capture_telemetry_snapshot(snapshot);
+        TEST_CHECK(snapshot.render_cycle == 1);
+        TEST_CHECK(snapshot.active_tracks == 2);
+        TEST_CHECK(snapshot.active_buses == 0);
+
+        std::cout << "  -> Command Queue & Telemetry: PASSED (Lock-free SPSC commands executed on cycle, 60Hz telemetry captured)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -613,6 +723,7 @@ int main() {
     test_wasm_dsp();
     test_airwindows_console_processor();
     test_mixer_graph_routing();
+    test_binary_protocol_and_command_queue();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

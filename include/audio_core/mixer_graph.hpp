@@ -1,7 +1,10 @@
 #pragma once
 
 #include "audio_core/types.hpp"
+#include "audio_core/ring_buffer.hpp"
 #include "audio_core/dsp/console_processor.hpp"
+#include "audio_core/protocol/command_packet.hpp"
+#include "audio_core/protocol/telemetry_packet.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -273,9 +276,33 @@ public:
         return m_limiter_enabled.load(std::memory_order_relaxed);
     }
 
+    // Lock-free command dispatch: UI or Network pushes binary POD packets
+    bool post_command(const protocol::MixerCommand& cmd) noexcept {
+        return m_command_queue.try_push(cmd);
+    }
+
+    // Lock-free telemetry capture: UI copies 60Hz state snapshot without blocking audio thread
+    void capture_telemetry_snapshot(protocol::MixerTelemetryFrame& out_frame) const noexcept {
+        out_frame.render_cycle = m_render_cycle.load(std::memory_order_relaxed);
+        out_frame.active_tracks = static_cast<uint32_t>(std::min(m_tracks.size(), protocol::kMaxTelemetryTracks));
+        out_frame.active_buses = static_cast<uint32_t>(m_buses.size());
+
+        auto mm = m_master_bus.meter();
+        out_frame.master_meter = {mm.peak_l, mm.peak_r, mm.rms_l, mm.rms_r};
+
+        for (size_t i = 0; i < out_frame.active_tracks; ++i) {
+            auto tm = m_tracks[i]->meter();
+            out_frame.track_meters[i] = {tm.peak_l, tm.peak_r, tm.rms_l, tm.rms_r};
+        }
+    }
+
     // Real-Time Render Pipeline: Fully lock-free, zero allocation
     void render(AudioBufferView& out_master) noexcept {
         const uint32_t frames = std::min(out_master.num_frames(), m_buffer_frames);
+
+        // 0. Drain and execute queued binary commands (Zero allocation, sample-exact)
+        drain_commands();
+        m_render_cycle.fetch_add(1, std::memory_order_relaxed);
 
         // 1. Clear Master and Submix Buses
         m_master_bus.clear();
@@ -388,9 +415,93 @@ public:
         }
     }
 
+    void drain_commands() noexcept {
+        protocol::MixerCommand cmd;
+        while (m_command_queue.try_pop(cmd)) {
+            execute_command(cmd);
+        }
+    }
+
+    void execute_command(const protocol::MixerCommand& cmd) noexcept {
+        switch (cmd.type) {
+            case protocol::MixerCommandType::SetTrackGain: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_gain(cmd.value1);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackPan: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_pan(cmd.value1);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackMute: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_mute((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackSolo: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_solo((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackTargetBus: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_target_bus(static_cast<int32_t>(cmd.secondary_id));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackSend: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_send(cmd.secondary_id, cmd.value1, (cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackConsoleType: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_console_type(static_cast<dsp::ConsoleType>(cmd.flags));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusGain: {
+                if (auto* bus = get_bus(cmd.target_id)) {
+                    bus->set_gain(cmd.value1);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusConsoleType: {
+                if (auto* bus = get_bus(cmd.target_id)) {
+                    bus->set_console_type(static_cast<dsp::ConsoleType>(cmd.flags));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetMasterGain: {
+                m_master_bus.set_gain(cmd.value1);
+                break;
+            }
+            case protocol::MixerCommandType::SetMasterLimiter: {
+                set_master_limiter_enabled((cmd.flags & 1) != 0);
+                break;
+            }
+            case protocol::MixerCommandType::ResetMeters: {
+                for (auto& trk : m_tracks) {
+                    trk->reset_meters();
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
 private:
     uint32_t m_buffer_frames;
+    std::atomic<uint64_t> m_render_cycle{0};
     std::atomic<bool> m_limiter_enabled{true};
+    RingBuffer<protocol::MixerCommand> m_command_queue{512};
     std::vector<std::unique_ptr<Track>> m_tracks;
     std::vector<std::unique_ptr<AudioBus>> m_buses;
     AudioBus m_master_bus;
