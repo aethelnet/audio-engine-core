@@ -31,6 +31,8 @@
 #include "audio_core/analysis/measurement_engine.hpp"
 #include "audio_core/dsp/liquid_ode.hpp"
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
+#include "audio_core/network/aes67_ptp_engine.hpp"
+#include "audio_core/dsp/speaker_calibration_matrix.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -3636,6 +3638,171 @@ void test_multihead_ode_compressor_and_transient_accuracy() {
     std::cout << "  -> Solo / Mute & Routing Integrity: PASSED (Muted Sub RMS=" << sub_mute_rms << " < 0.02)" << std::endl;
 }
 
+void test_aes67_ptp_and_speaker_calibration_matrix() {
+    std::cout << "[TEST] Running AES67 / PTPv2 Network Framing & Speaker Calibration Matrix Test..." << std::endl;
+    using namespace audio_core::network;
+    using namespace audio_core::dsp;
+
+    // 1. AES67 RTP Packet Serialization & PTPv2 Epoch Synchronization
+    {
+        Aes67StreamConfig cfg;
+        cfg.sample_rate = 48000;
+        cfg.num_channels = 8;
+        cfg.packet_frames = 48; // 1 ms packet
+        cfg.encoding = Aes67PayloadEncoding::L24;
+        cfg.payload_type = 96;
+        cfg.ssrc = 0x44414E54; // 'DANT'
+
+        Aes67PacketSerializer serializer(cfg);
+        Aes67PacketDeserializer deserializer(cfg);
+
+        // Synthesize 8 distinct channels
+        std::vector<std::vector<float>> tx_data(8, std::vector<float>(48));
+        std::vector<const float*> tx_ptrs(8);
+        for (uint16_t c = 0; c < 8; ++c) {
+            for (uint32_t f = 0; f < 48; ++f) {
+                float t = static_cast<float>(f) / 48000.0f;
+                tx_data[c][f] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * (200.0f * (c + 1)) * t);
+            }
+            tx_ptrs[c] = tx_data[c].data();
+        }
+
+        // PTP timestamp: TAI epoch 1700000000 seconds, 250000000 nanoseconds
+        PtpTimestamp ptp_tx{ .seconds = 1700000000ULL, .nanoseconds = 250000000U };
+        uint32_t expected_rtp_ts = ptp_tx.to_rtp_timestamp(cfg.sample_rate);
+
+        std::vector<uint8_t> packet_buf(1500, 0);
+        size_t written = serializer.serialize_packet(tx_ptrs.data(), 48, ptp_tx, packet_buf.data(), packet_buf.size());
+
+        // Expected size: 12 (RTP header) + 8 channels * 48 frames * 3 bytes (L24) = 12 + 1152 = 1164 bytes
+        TEST_CHECK(written == 1164);
+
+        // Verify standard RFC 3550 RTP header
+        const auto* rtp_hdr = reinterpret_cast<const RtpHeader*>(packet_buf.data());
+        TEST_CHECK(rtp_hdr->flags == 0x80); // V=2, P=0, X=0, CC=0
+        TEST_CHECK(rtp_hdr->payload_type == 96);
+        TEST_CHECK(net_to_host16(rtp_hdr->sequence_number) == 0);
+        TEST_CHECK(net_to_host32(rtp_hdr->timestamp) == expected_rtp_ts);
+        TEST_CHECK(net_to_host32(rtp_hdr->ssrc) == 0x44414E54);
+
+        // Deserialize / depacketize back into planar float buffers
+        std::vector<std::vector<float>> rx_data(8, std::vector<float>(48, 0.0f));
+        std::vector<float*> rx_ptrs(8);
+        for (uint16_t c = 0; c < 8; ++c) rx_ptrs[c] = rx_data[c].data();
+
+        uint16_t rx_seq = 0;
+        uint32_t rx_rtp_ts = 0;
+        uint32_t extracted_frames = deserializer.deserialize_packet(packet_buf.data(), written,
+                                                                   rx_ptrs.data(), 8, 48,
+                                                                   rx_seq, rx_rtp_ts);
+        TEST_CHECK(extracted_frames == 48);
+        TEST_CHECK(rx_seq == 0);
+        TEST_CHECK(rx_rtp_ts == expected_rtp_ts);
+
+        // Bit-exact L24 24-bit roundtrip precision: error must be strictly bounded by 24-bit quantization (< 2e-7)
+        float max_err = 0.0f;
+        for (uint16_t c = 0; c < 8; ++c) {
+            for (uint32_t f = 0; f < 48; ++f) {
+                float err = std::abs(rx_data[c][f] - tx_data[c][f]);
+                if (err > max_err) max_err = err;
+            }
+        }
+        TEST_CHECK(max_err < 2e-7f);
+
+        // Packet loss detection: next packet arrives with sequence gap (seq=5 instead of seq=1)
+        written = serializer.serialize_packet(tx_ptrs.data(), 48, ptp_tx, packet_buf.data(), packet_buf.size());
+        auto* hdr_tamper = reinterpret_cast<RtpHeader*>(packet_buf.data());
+        hdr_tamper->sequence_number = host_to_net16(5); // Simulate missing packets 1, 2, 3, 4
+        deserializer.deserialize_packet(packet_buf.data(), written, rx_ptrs.data(), 8, 48, rx_seq, rx_rtp_ts);
+        TEST_CHECK(deserializer.packets_lost() == 4);
+
+        std::cout << "  -> AES67 / Dante RTP L24 Packaging & PTPv2 Sync: PASSED (1164 bytes/pkt, L24 err=" 
+                  << max_err << " < 2e-7, loss detection=4 pkts)" << std::endl;
+    }
+
+    // 2. Speaker Calibration Matrix: Time-of-Flight Delay Alignment & Room Mode Correction
+    {
+        SpeakerCalibrationMatrix calib(8, 48000);
+
+        // Scenario: Speaker 0 is 3.43 meters away (10.0 ms TOF), Speaker 1 is 1.71 meters away (5.0 ms TOF)
+        std::array<float, 2> tofs = {10.0f, 5.0f};
+        calib.calibrate_time_of_flight(tofs.data(), 2);
+
+        // Speaker 0 (furthest) should have 0 added delay
+        // Speaker 1 (closer) should have 5.0 ms added delay (240 samples at 48kHz)
+        TEST_CHECK(std::abs(calib.speaker(0).delay_ms() - 0.0f) < 0.01f);
+        TEST_CHECK(std::abs(calib.speaker(1).delay_ms() - 5.0f) < 0.01f);
+        TEST_CHECK(std::abs(calib.speaker(1).delay_samples() - 240.0f) < 0.1f);
+
+        // Test Time Alignment with Dirac impulse at sample 0 for both speakers
+        std::vector<float> spk0(512, 0.0f), spk1(512, 0.0f);
+        spk0[0] = 1.0f;
+        spk1[0] = 1.0f;
+
+        calib.speaker(0).process_block(spk0.data(), 512);
+        calib.speaker(1).process_block(spk1.data(), 512);
+
+        // Speaker 0 impulse passes immediately at sample 0
+        TEST_CHECK(std::abs(spk0[0] - 1.0f) < 1e-4f);
+        // Speaker 1 impulse is delayed by exactly 240 samples!
+        TEST_CHECK(std::abs(spk1[240] - 1.0f) < 1e-3f);
+        TEST_CHECK(std::abs(spk1[0]) < 1e-5f);
+
+        // Room Mode Notch Suppression Test:
+        // Inject resonant room mode (60 Hz) into Speaker 2 with 60 Hz Notch
+        calib.speaker(2).set_delay_samples(0.0f);
+        calib.speaker(2).add_notch(60.0f, 6.0f);
+
+        constexpr size_t kNotchFrames = 24000; // 500 ms (ensures narrow 60Hz filter reaches steady state)
+        std::vector<float> res_tone(kNotchFrames);
+        for (size_t i = 0; i < kNotchFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            res_tone[i] = std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+        }
+        calib.speaker(2).process_block(res_tone.data(), kNotchFrames);
+
+        // Measure remaining energy of 60 Hz in second half (after filter settling)
+        float notch_rms = 0.0f;
+        for (size_t i = 12000; i < kNotchFrames; ++i) {
+            notch_rms += res_tone[i] * res_tone[i];
+        }
+        notch_rms = std::sqrt(notch_rms / 12000.0f);
+        // Original RMS of 1.0 sine is 0.7071. Deep notch at steady state should attenuate by > 26 dB (< 0.035)
+        TEST_CHECK(notch_rms < 0.035f);
+
+        // Passband test (1000 Hz tone on Speaker 2 must be unaffected)
+        std::vector<float> pass_tone(kNotchFrames);
+        for (size_t i = 0; i < kNotchFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            pass_tone[i] = std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * t);
+        }
+        calib.speaker(2).process_block(pass_tone.data(), kNotchFrames);
+        float pass_rms = 0.0f;
+        for (size_t i = 12000; i < kNotchFrames; ++i) {
+            pass_rms += pass_tone[i] * pass_tone[i];
+        }
+        pass_rms = std::sqrt(pass_rms / (kNotchFrames - 12000));
+        TEST_CHECK(std::abs(pass_rms - 0.7071f) < 0.01f);
+
+        // Polarity and Mute verification
+        calib.speaker(3).set_invert_polarity(true);
+        std::vector<float> pol_test = {1.0f, 0.5f, -0.2f};
+        calib.speaker(3).process_block(pol_test.data(), 3);
+        TEST_CHECK(pol_test[0] == -1.0f);
+        TEST_CHECK(pol_test[1] == -0.5f);
+        TEST_CHECK(pol_test[2] == 0.2f);
+
+        calib.speaker(3).set_mute(true);
+        calib.speaker(3).process_block(pol_test.data(), 3);
+        TEST_CHECK(pol_test[0] == 0.0f);
+        TEST_CHECK(pol_test[1] == 0.0f);
+        TEST_CHECK(pol_test[2] == 0.0f);
+
+        std::cout << "  -> Speaker Calibration Matrix: PASSED (TOF 5ms delay aligned to sample 240, 60Hz room notch RMS=" 
+                  << notch_rms << " [>26dB cut], 1kHz passband transparent, Polarity/Mute verified)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -3673,6 +3840,7 @@ int main() {
     test_liquid_ode_trapezoidal_integration_filter_and_bus_summing();
     test_liquid_ode_noise_colors_sweeps_and_dynamic_denoising();
     test_multihead_ode_compressor_and_transient_accuracy();
+    test_aes67_ptp_and_speaker_calibration_matrix();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
