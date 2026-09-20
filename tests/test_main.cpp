@@ -4,6 +4,7 @@
 #include "audio_core/dsp/envelope.hpp"
 #include "audio_core/audio_graph.hpp"
 #include "audio_core/wasm_host.hpp"
+#include "audio_core/dsp/console_processor.hpp"
 
 #include <iostream>
 #include <thread>
@@ -239,6 +240,130 @@ void test_wasm_dsp() {
     std::cout << "  -> PASSED (WASM DSP plugin executed in sandbox, saturation and dry/wet verified)" << std::endl;
 }
 
+void test_airwindows_console_processor() {
+    std::cout << "[TEST] Running Airwindows EveryConsole Encode/Decode Precision & Summing Test..." << std::endl;
+
+    using namespace audio_core::dsp;
+
+    // 1. Test Reconstruction Accuracy on Solo Track: Buss(Channel(x)) == x
+    ConsoleProcessor channel;
+    channel.set_mode(ConsoleMode::Channel);
+
+    ConsoleProcessor buss;
+    buss.set_mode(ConsoleMode::Buss);
+
+    // Test Purest (Console 5/8 Sine/Arcsin)
+    channel.set_type(ConsoleType::Purest);
+    buss.set_type(ConsoleType::Purest);
+
+    constexpr uint32_t kFrames = 512;
+    std::vector<float> input(kFrames);
+    std::vector<float> encoded(kFrames);
+    std::vector<float> decoded(kFrames);
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float x = (static_cast<float>(i) / static_cast<float>(kFrames)) * 1.8f - 0.9f; // -0.9 to +0.9
+        input[i] = x;
+        encoded[i] = x;
+        float dummy_r = x;
+        channel.process_sample(encoded[i], dummy_r);
+        decoded[i] = encoded[i];
+        float dummy_r2 = encoded[i];
+        buss.process_sample(decoded[i], dummy_r2);
+
+        // Verify asin(sin(x)) == x within floating point precision
+        TEST_CHECK(std::abs(decoded[i] - input[i]) < 0.0001f);
+    }
+    std::cout << "  -> PASSED (Purest Console 5/8 exact trigonometric inversion verified, error < 1e-4)" << std::endl;
+
+    // Test InvSquare (Console 6)
+    channel.set_type(ConsoleType::InvSquare);
+    buss.set_type(ConsoleType::InvSquare);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float x = input[i] * 0.8f; // inside [-0.8, +0.8]
+        float enc_l = x, enc_r = x;
+        channel.process_sample(enc_l, enc_r);
+        float dec_l = enc_l, dec_r = enc_r;
+        buss.process_sample(dec_l, dec_r);
+        TEST_CHECK(std::abs(dec_l - x) < 0.0001f);
+    }
+    std::cout << "  -> PASSED (InvSquare Console 6 exact algebraic inversion verified)" << std::endl;
+
+    // Test Spiral (Console 7)
+    channel.set_type(ConsoleType::Spiral);
+    buss.set_type(ConsoleType::Spiral);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float x = input[i] * 0.6f; // moderate amplitude
+        float enc_l = x, enc_r = x;
+        channel.process_sample(enc_l, enc_r);
+        float dec_l = enc_l, dec_r = enc_r;
+        buss.process_sample(dec_l, dec_r);
+        TEST_CHECK(!std::isnan(dec_l) && !std::isinf(dec_l));
+        TEST_CHECK(std::abs(dec_l - x) < 0.05f); // Spiral is harmonic blending approximation
+    }
+    std::cout << "  -> PASSED (Spiral Console 7 golden-ratio non-linear transfer verified)" << std::endl;
+
+    // 2. Test Multi-Track Non-Linear Analog Summing Intermodulation
+    // Simulate 4 tracks summing together
+    channel.set_type(ConsoleType::Purest);
+    buss.set_type(ConsoleType::Purest);
+
+    std::vector<float> track1(kFrames), track2(kFrames), track3(kFrames), track4(kFrames);
+    std::vector<float> linear_sum(kFrames);
+    std::vector<float> console_sum(kFrames, 0.0f);
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float t = static_cast<float>(i) / 44100.0f;
+        track1[i] = std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * t) * 0.35f;
+        track2[i] = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * t) * 0.35f;
+        track3[i] = std::sin(2.0f * std::numbers::pi_v<float> * 660.0f * t) * 0.35f;
+        track4[i] = std::sin(2.0f * std::numbers::pi_v<float> * 880.0f * t) * 0.35f;
+
+        linear_sum[i] = track1[i] + track2[i] + track3[i] + track4[i];
+
+        // Process each track through its channel encoder
+        float e1 = track1[i], dummy = 0; channel.process_sample(e1, dummy);
+        float e2 = track2[i]; channel.process_sample(e2, dummy);
+        float e3 = track3[i]; channel.process_sample(e3, dummy);
+        float e4 = track4[i]; channel.process_sample(e4, dummy);
+
+        // Sum encoded tracks on bus
+        float bus_encoded = e1 + e2 + e3 + e4;
+
+        // Decode on master bus
+        float bus_decoded = bus_encoded;
+        buss.process_sample(bus_decoded, dummy);
+        console_sum[i] = bus_decoded;
+    }
+
+    // Verify intermodulation occurred: Console Sum is non-linear relative to Linear Sum
+    bool difference_observed = false;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        TEST_CHECK(!std::isnan(console_sum[i]) && !std::isinf(console_sum[i]));
+        if (std::abs(console_sum[i] - linear_sum[i]) > 0.01f) {
+            difference_observed = true;
+        }
+    }
+    TEST_CHECK(difference_observed);
+    std::cout << "  -> PASSED (Multi-track non-linear analog summing intermodulation verified!)" << std::endl;
+
+    // 3. High-Throughput Performance Benchmark (1,000,000 Samples)
+    constexpr uint32_t kBenchFrames = 1000000;
+    std::vector<float> bench_buffer(kBenchFrames, 0.4f);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    channel.process_stereo(bench_buffer.data(), bench_buffer.data(), kBenchFrames);
+    buss.process_stereo(bench_buffer.data(), bench_buffer.data(), kBenchFrames);
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    auto duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    double samples_per_sec = (static_cast<double>(kBenchFrames) / (duration_ms / 1000.0)) / 1000000.0;
+
+    std::cout << "  -> BENCHMARK: 1,000,000 stereo frames processed in "
+              << duration_ms << " ms (" << samples_per_sec << " Million frames/sec)" << std::endl;
+    TEST_CHECK(duration_ms < 100.0); // Must easily achieve > 10M frames/s
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -250,6 +375,7 @@ int main() {
     test_envelope();
     test_limiter_protection();
     test_wasm_dsp();
+    test_airwindows_console_processor();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
