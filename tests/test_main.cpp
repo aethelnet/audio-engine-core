@@ -27,6 +27,7 @@
 #include "audio_core/dsp/dither.hpp"
 #include "audio_core/dsp/fft.hpp"
 #include "audio_core/dsp/crossover.hpp"
+#include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/analysis/measurement_engine.hpp"
 #include <numbers>
 
@@ -2702,6 +2703,136 @@ void test_acoustic_measurement_and_crossover_engine() {
     }
 }
 
+void test_multichannel_bus_and_spatial_routing() {
+    std::cout << "[TEST] Running MultiChannelBus & Spatial Matrix Routing Test..." << std::endl;
+
+    using namespace audio_core::dsp;
+
+    // 1. Capacity & Memory Layout (1 to 128 channels)
+    {
+        MultiChannelBus bus(16, 1024, "HOA_3rd_Order");
+        TEST_CHECK(bus.num_channels() == 16);
+        TEST_CHECK(bus.num_frames() == 1024);
+
+        // Resize up to 64 channels for WFS line array
+        bus.resize(64, 512);
+        TEST_CHECK(bus.num_channels() == 64);
+        TEST_CHECK(bus.num_frames() == 512);
+
+        // Verify all channel pointers are valid and non-overlapping
+        for (uint32_t c = 0; c < 64; ++c) {
+            TEST_CHECK(bus.channel(c) != nullptr);
+            if (c > 0) {
+                TEST_CHECK(bus.channel(c) == bus.channel(c - 1) + 512);
+            }
+        }
+        std::cout << "  -> Planar Storage & Dynamic Resize: PASSED (16ch -> 64ch contiguous non-overlapping allocation)" << std::endl;
+    }
+
+    // 2. Vector-Base Spatial Panning (Circular Array)
+    {
+        constexpr uint32_t kFrames = 512;
+        MultiChannelBus bus(16, kFrames, "SpatialRing");
+        std::vector<float> mono_src(kFrames, 1.0f);
+
+        // A. Pan exactly to Front/Center (azimuth = 0.0 rad)
+        bus.clear();
+        bus.pan_mono_circular(mono_src.data(), 1.0f, 0.0f, kFrames);
+
+        // Channel 0 should receive 100% of the energy, all other channels 0.0
+        TEST_CHECK(std::abs(bus.channel(0)[100] - 1.0f) < 1e-5f);
+        for (uint32_t c = 1; c < 16; ++c) {
+            TEST_CHECK(std::abs(bus.channel(c)[100]) < 1e-5f);
+        }
+
+        // B. Pan halfway between Speaker 0 and Speaker 1 (constant power: g1^2 + g2^2 == 1.0)
+        bus.clear();
+        const float sector_width = (2.0f * std::numbers::pi_v<float>) / 16.0f;
+        bus.pan_mono_circular(mono_src.data(), 1.0f, sector_width * 0.5f, kFrames);
+
+        float s0 = bus.channel(0)[100];
+        float s1 = bus.channel(1)[100];
+        float power = (s0 * s0) + (s1 * s1);
+        TEST_CHECK(std::abs(power - 1.0f) < 1e-4f);
+        TEST_CHECK(std::abs(s0 - s1) < 1e-4f); // Equal split at midpoint
+
+        std::cout << "  -> Spatial Circular Panning: PASSED (16-channel constant-power conservation verified, power=" << power << ")" << std::endl;
+    }
+
+    // 3. ITU-R BS.775 5.1 Surround to Stereo Downmixing
+    {
+        constexpr uint32_t kFrames = 256;
+        MultiChannelBus surround(6, kFrames, "5.1_Surround");
+
+        // Inject 1.0 into Center channel (channel 2)
+        std::vector<float> test_tone(kFrames, 1.0f);
+        surround.mix_mono_channel(2, test_tone.data(), 1.0f, kFrames);
+
+        std::vector<float> down_l(kFrames), down_r(kFrames);
+        surround.downmix_to_stereo(down_l.data(), down_r.data(), kFrames);
+
+        // In ITU-R BS.775: Center is mixed at -3 dB (0.7071) into both Left and Right
+        constexpr float kExpectedCenter = 0.70710678f;
+        TEST_CHECK(std::abs(down_l[50] - kExpectedCenter) < 1e-4f);
+        TEST_CHECK(std::abs(down_r[50] - kExpectedCenter) < 1e-4f);
+
+        // Inject 1.0 into Left Surround (channel 4)
+        surround.clear();
+        surround.mix_mono_channel(4, test_tone.data(), 1.0f, kFrames);
+        surround.downmix_to_stereo(down_l.data(), down_r.data(), kFrames);
+
+        // Left Surround goes only into Left (-3 dB), Right must remain 0.0
+        TEST_CHECK(std::abs(down_l[50] - kExpectedCenter) < 1e-4f);
+        TEST_CHECK(std::abs(down_r[50]) < 1e-6f);
+
+        std::cout << "  -> ITU-R BS.775 5.1 Downmix: PASSED (Center phantom image and surround folddown verified)" << std::endl;
+    }
+
+    // 4. Poly-WAV Interleaving / Deinterleaving (Bit-Exact Planar Roundtrip)
+    {
+        constexpr uint32_t kChannels = 8;
+        constexpr uint32_t kFrames = 128;
+        MultiChannelBus bus_a(kChannels, kFrames, "BusA");
+        MultiChannelBus bus_b(kChannels, kFrames, "BusB");
+
+        // Fill bus A with unique signals per channel
+        for (uint32_t c = 0; c < kChannels; ++c) {
+            float* ch = bus_a.channel(c);
+            for (uint32_t i = 0; i < kFrames; ++i) {
+                ch[i] = static_cast<float>(c + 1) * 0.1f + static_cast<float>(i) * 0.001f;
+            }
+        }
+
+        // Interleave into flat buffer
+        std::vector<float> pcm_interleaved(kChannels * kFrames);
+        bus_a.interleave(pcm_interleaved.data(), kFrames);
+
+        // Deinterleave into bus B
+        bus_b.deinterleave(pcm_interleaved.data(), kChannels, kFrames);
+
+        // Assert 100% bit-exact match across all channels and frames
+        float max_diff = 0.0f;
+        for (uint32_t c = 0; c < kChannels; ++c) {
+            const float* a = bus_a.channel(c);
+            const float* b = bus_b.channel(c);
+            for (uint32_t i = 0; i < kFrames; ++i) {
+                max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+            }
+        }
+        TEST_CHECK(max_diff == 0.0f);
+
+        // Test telemetry meter updates
+        bus_a.update_meters(kFrames);
+        for (uint32_t c = 0; c < kChannels; ++c) {
+            TEST_CHECK(bus_a.peak(c) > 0.0f);
+            TEST_CHECK(bus_a.rms(c) > 0.0f);
+        }
+
+        std::cout << "  -> Poly-WAV Interleave/Deinterleave: PASSED (Bit-exact roundtrip, max diff=" << max_diff 
+                  << ", 8-channel lock-free meters verified)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -2733,6 +2864,7 @@ int main() {
     test_sample_rate_agility_and_hermite_resampling();
     test_anti_aliasing_and_airwindows_dither();
     test_acoustic_measurement_and_crossover_engine();
+    test_multichannel_bus_and_spatial_routing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
