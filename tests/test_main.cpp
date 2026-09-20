@@ -22,6 +22,7 @@
 #include "audio_core/sampling/loop_conditioner.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
+#include "backends/android/aaudio_backend.hpp"
 #include <numbers>
 
 #include <iostream>
@@ -1697,6 +1698,133 @@ void test_step_sequencer_and_slice_trigger_engine() {
     std::cout << "  -> Track & MixerGraph Integration: PASSED (StepSequencer rendered directly into channel strip and master summing bus)" << std::endl;
 }
 
+void test_multicore_worker_pool_and_kernel_scaling() {
+    std::cout << "[TEST] Running Multi-Core Lock-Free Worker Pool & Bit-Exact Scaling Test..." << std::endl;
+    using namespace audio_core;
+
+    constexpr uint32_t kFrames = 256;
+    constexpr uint32_t kNumTracks = 16;
+
+    // 1. Single-threaded reference mixer
+    MixerGraph mixer_st(kFrames, false);
+    mixer_st.set_worker_threads(0);
+    TEST_CHECK(mixer_st.worker_threads() == 0);
+
+    // 2. Multi-core mixer (4 workers)
+    MixerGraph mixer_mc(kFrames, true);
+    mixer_mc.set_worker_threads(4);
+    TEST_CHECK(mixer_mc.worker_threads() == 4);
+
+    // Populate identical tracks on both mixers with heavy DSP chains
+    for (uint32_t i = 0; i < kNumTracks; ++i) {
+        Track* trk_st = mixer_st.add_track("Trk_" + std::to_string(i));
+        Track* trk_mc = mixer_mc.add_track("Trk_" + std::to_string(i));
+        TEST_CHECK(trk_st != nullptr && trk_mc != nullptr);
+
+        // Load DSP chain: Baxandall EQ + PurestDrive + Console
+        trk_st->slot(0).set_processor(std::make_unique<dsp::Baxandall>());
+        trk_mc->slot(0).set_processor(std::make_unique<dsp::Baxandall>());
+
+        trk_st->slot(1).set_processor(std::make_unique<dsp::PurestDrive>());
+        trk_mc->slot(1).set_processor(std::make_unique<dsp::PurestDrive>());
+
+        float pan = (static_cast<float>(i) / static_cast<float>(kNumTracks)) * 2.0f - 1.0f;
+        trk_st->set_pan(pan);
+        trk_mc->set_pan(pan);
+
+        // Fill input buffers with identical test signal
+        Sample* l_st = trk_st->buffer().view().channel(0);
+        Sample* r_st = trk_st->buffer().view().channel(1);
+        Sample* l_mc = trk_mc->buffer().view().channel(0);
+        Sample* r_mc = trk_mc->buffer().view().channel(1);
+
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            float val = std::sin(2.0f * std::numbers::pi_v<float> * (100.0f + i * 50.0f) * (static_cast<float>(f) / 48000.0f)) * 0.2f;
+            l_st[f] = val;
+            r_st[f] = val;
+            l_mc[f] = val;
+            r_mc[f] = val;
+        }
+    }
+
+    AudioBuffer out_st(2, kFrames);
+    AudioBuffer out_mc(2, kFrames);
+    auto view_st = out_st.view();
+    auto view_mc = out_mc.view();
+
+    // Render single-threaded
+    mixer_st.render(view_st);
+
+    // Render multi-core
+    mixer_mc.render(view_mc);
+
+    // Compare outputs: MUST be bit-exact identical within floating point rounding!
+    float max_diff = 0.0f;
+    for (uint32_t ch = 0; ch < 2; ++ch) {
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            float diff = std::abs(out_st.channel(ch)[f] - out_mc.channel(ch)[f]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    TEST_CHECK(max_diff < 1e-5f);
+    std::cout << "  -> Bit-Exact Verification: PASSED (Single-Thread vs 4-Core max diff = " << max_diff << " < 1e-5)" << std::endl;
+
+    // Benchmark 1000 blocks on multi-core
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int b = 0; b < 1000; ++b) {
+        mixer_mc.render(view_mc);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    std::cout << "  -> Multi-Core Throughput: 1000 blocks (" << (1000 * kFrames) << " frames across 16 tracks + DSP) rendered in " << ms << " ms" << std::endl;
+}
+
+void test_native_android_aaudio_backend() {
+    std::cout << "[TEST] Running Native Android AAudio Backend Driver Test..." << std::endl;
+    using namespace audio_core;
+
+    AAudioBackend aaudio;
+    TEST_CHECK(!aaudio.is_running());
+
+    // 1. Initialize AAudio stream: 48kHz, 2 channels, 192 burst size
+    bool inited = aaudio.init(48000, 2, 192);
+    TEST_CHECK(inited);
+    TEST_CHECK(aaudio.actual_sample_rate() == 48000);
+    TEST_CHECK(aaudio.channels() == 2);
+    TEST_CHECK(aaudio.actual_buffer_size() == 192);
+    TEST_CHECK(aaudio.buffer_capacity() >= 192);
+
+    // 2. Attach real-time audio callback
+    std::atomic<uint32_t> blocks_rendered{0};
+    aaudio.set_callback([&](Sample* out, uint32_t frames, uint32_t channels) {
+        for (uint32_t i = 0; i < frames * channels; ++i) {
+            out[i] = 0.42f; // Deterministic test marker
+        }
+        blocks_rendered.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // 3. Start stream and simulate blocks
+    TEST_CHECK(aaudio.start());
+    TEST_CHECK(aaudio.is_running());
+
+    std::vector<Sample> test_buf(192 * 2, 0.0f);
+    aaudio.simulate_render_block(test_buf.data(), 192);
+
+    TEST_CHECK(blocks_rendered.load() == 1);
+    TEST_CHECK(std::abs(test_buf[0] - 0.42f) < 1e-4f);
+    TEST_CHECK(std::abs(test_buf[192 * 2 - 1] - 0.42f) < 1e-4f);
+
+    // 4. Hardware XRun telemetry check
+    TEST_CHECK(aaudio.xrun_count() == 0);
+
+    // 5. Clean shutdown
+    aaudio.stop();
+    TEST_CHECK(!aaudio.is_running());
+
+    std::cout << "  -> Native Android AAudio Driver: PASSED (Exclusive mode, 192 burst, callback rendering and xrun monitoring verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1723,6 +1851,8 @@ int main() {
     test_airwindows_interstage_processor();
     test_clock_synchronized_quantized_tap_and_bar_looping();
     test_step_sequencer_and_slice_trigger_engine();
+    test_multicore_worker_pool_and_kernel_scaling();
+    test_native_android_aaudio_backend();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

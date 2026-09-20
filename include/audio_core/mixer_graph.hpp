@@ -10,6 +10,7 @@
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
+#include "audio_core/threading/audio_worker_pool.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -412,8 +413,9 @@ public:
     static constexpr size_t kMaxBuses = 16;
     static constexpr size_t kMaxSampleTaps = 4;
 
-    explicit MixerGraph(uint32_t buffer_frames = 1024)
-        : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames) {
+    explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true)
+        : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames),
+          m_worker_pool(enable_multithreading ? threading::AudioWorkerPool::kAutoDetect : 0) {
         m_master_bus.set_active(true);
         for (size_t i = 0; i < kMaxTracks; ++i) {
             m_tracks[i] = std::make_unique<Track>(static_cast<uint32_t>(i + 1), "Track " + std::to_string(i + 1), buffer_frames);
@@ -425,6 +427,14 @@ public:
             m_taps[i] = std::make_unique<sampling::SampleTap>(48000, 10.0f);
         }
         recompute_bus_order();
+    }
+
+    void set_worker_threads(uint32_t num_threads) {
+        m_worker_pool.init(num_threads);
+    }
+
+    [[nodiscard]] uint32_t worker_threads() const noexcept {
+        return m_worker_pool.num_workers();
     }
 
     [[nodiscard]] sampling::SampleTap* tap(size_t index) noexcept {
@@ -669,47 +679,73 @@ public:
             }
         }
 
-        // 3. Process each Active Track and Route/Accumulate
-        for (auto& track : m_tracks) {
-            if (!track->is_active()) {
-                continue;
-            }
-            if (track->is_muted() || (any_solo && !track->is_solo())) {
+        // 3. Parallel Track Processing (Inserts, Console Encode, Meters, Taps)
+        struct TrackRenderCtx {
+            MixerGraph* self;
+            uint32_t frames;
+            const clock::TimelineClock* clock;
+            const clock::BlockBoundaryEvents* events;
+            bool any_solo;
+        };
+
+        TrackRenderCtx trk_ctx{
+            .self = this,
+            .frames = frames,
+            .clock = &m_clock,
+            .events = &boundary_events,
+            .any_solo = any_solo
+        };
+
+        m_worker_pool.parallel_for(kMaxTracks, &trk_ctx, [](void* context, uint32_t track_idx) noexcept {
+            auto* ctx = static_cast<TrackRenderCtx*>(context);
+            auto* track = ctx->self->m_tracks[track_idx].get();
+            if (!track->is_active()) return;
+
+            if (track->is_muted() || (ctx->any_solo && !track->is_solo())) {
                 track->reset_meters();
-                continue;
+                return;
             }
 
-            // Fill from active clip or step-sequencer if present
-            track->render_input(frames, m_clock, boundary_events);
+            // Fill from active clip or step-sequencer
+            track->render_input(ctx->frames, *ctx->clock, *ctx->events);
 
             const Sample* raw_l = track->buffer().view().channel(0);
             const Sample* raw_r = track->buffer().view().channel(1);
 
-            // Tap Pre-FX track input (raw network stream / local app capture)
-            for (auto& tap : m_taps) {
+            // Pre-FX Tap
+            for (auto& tap : ctx->self->m_taps) {
                 if (tap && tap->is_active()) {
                     auto src = tap->source();
                     if (src.type == sampling::TapSourceType::TrackInput && src.source_id == track->id()) {
-                        tap->record(raw_l, raw_r, frames, &boundary_events);
+                        tap->record(raw_l, raw_r, ctx->frames, ctx->events);
                     }
                 }
             }
 
             // In-line Channel Strip processing (Inserts + Console)
-            track->process_channel_strip(frames);
+            track->process_channel_strip(ctx->frames);
 
             const Sample* trk_l = track->buffer().view().channel(0);
             const Sample* trk_r = track->buffer().view().channel(1);
 
-            // Tap Post-FX track output (inserts + console effects applied live!)
-            for (auto& tap : m_taps) {
+            // Post-FX Tap
+            for (auto& tap : ctx->self->m_taps) {
                 if (tap && tap->is_active()) {
                     auto src = tap->source();
                     if (src.type == sampling::TapSourceType::TrackOutput && src.source_id == track->id()) {
-                        tap->record(trk_l, trk_r, frames, &boundary_events);
+                        tap->record(trk_l, trk_r, ctx->frames, ctx->events);
                     }
                 }
             }
+        });
+
+        // 3b. Vectorized Bus & Master Accumulation (SIMD linear reduction)
+        for (auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            if (track->is_muted() || (any_solo && !track->is_solo())) continue;
+
+            const Sample* trk_l = track->buffer().view().channel(0);
+            const Sample* trk_r = track->buffer().view().channel(1);
 
             const float gain = track->gain();
             const auto [pan_l, pan_r] = calculate_pan_gains(track->pan());
@@ -724,6 +760,9 @@ public:
             Sample* dst_l = target_bus->buffer().view().channel(0);
             Sample* dst_r = target_bus->buffer().view().channel(1);
 
+            #if defined(__GNUC__) || defined(__clang__)
+            #pragma GCC ivdep
+            #endif
             for (uint32_t i = 0; i < frames; ++i) {
                 dst_l[i] += trk_l[i] * left_gain;
                 dst_r[i] += trk_r[i] * right_gain;
@@ -737,6 +776,9 @@ public:
                     Sample* s_l = send_bus->buffer().view().channel(0);
                     Sample* s_r = send_bus->buffer().view().channel(1);
                     float s_gain = send.pre_fader ? send.amount : (gain * send.amount);
+                    #if defined(__GNUC__) || defined(__clang__)
+                    #pragma GCC ivdep
+                    #endif
                     for (uint32_t i = 0; i < frames; ++i) {
                         s_l[i] += trk_l[i] * s_gain * pan_l;
                         s_r[i] += trk_r[i] * s_gain * pan_r;
@@ -959,6 +1001,7 @@ private:
     size_t m_bus_render_order_count{0};
     std::array<std::unique_ptr<sampling::SampleTap>, kMaxSampleTaps> m_taps;
     clock::TimelineClock m_clock{48000, 120.0};
+    threading::AudioWorkerPool m_worker_pool;
 };
 
 } // namespace audio_core

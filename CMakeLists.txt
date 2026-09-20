@@ -51,6 +51,7 @@ add_library(audio_core STATIC
     src/wasm_host.cpp
     backends/desktop/desktop_backend.cpp
     backends/pipewire/pipewire_backend.cpp
+    backends/android/aaudio_backend.cpp
 )
 
 target_include_directories(audio_core PUBLIC
@@ -79,6 +80,10 @@ target_link_libraries(audio_core PUBLIC
     ${PIPEWIRE_LIB}
     m
 )
+
+if (ANDROID)
+    target_link_libraries(audio_core PUBLIC aaudio)
+endif()
 
 # Test Suite Executable & Automated Verification Harness
 enable_testing()
