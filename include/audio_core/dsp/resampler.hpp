@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_core/types.hpp"
+#include "audio_core/dsp/anti_aliasing_filter.hpp"
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -68,11 +69,15 @@ namespace audio_core::dsp {
 // ============================================================================
 // StreamResampler: Arbitrary Ratio Real-Time Stereo Stream Resampler
 // Bridges differing clock domains (e.g. 44.1kHz Android vs 48kHz / 96kHz / 192kHz Engine)
+// Includes cascaded minimum-phase ultrasonic decimation filter to eliminate alias foldback
 // ============================================================================
 class StreamResampler {
 public:
-    StreamResampler(uint32_t in_rate = 48000, uint32_t out_rate = 48000)
-        : m_in_rate(in_rate), m_out_rate(out_rate) {
+    static constexpr size_t kMaxFilterBlock = 4096;
+
+    StreamResampler(uint32_t in_rate = 48000, uint32_t out_rate = 48000, bool anti_aliasing = false)
+        : m_in_rate(in_rate), m_out_rate(out_rate), m_filter(in_rate, out_rate) {
+        m_filter.set_enabled(anti_aliasing);
         update_ratio();
     }
 
@@ -81,17 +86,26 @@ public:
             m_in_rate = in_rate;
             m_out_rate = out_rate;
             update_ratio();
+            m_filter.set_rates(in_rate, out_rate);
         }
     }
 
+    void set_anti_aliasing(bool enable) noexcept {
+        m_filter.set_enabled(enable);
+    }
+
+    [[nodiscard]] bool anti_aliasing() const noexcept { return m_filter.is_enabled(); }
     [[nodiscard]] uint32_t input_rate() const noexcept { return m_in_rate; }
     [[nodiscard]] uint32_t output_rate() const noexcept { return m_out_rate; }
     [[nodiscard]] double ratio() const noexcept { return m_ratio; }
+    [[nodiscard]] const UltrasonicAntiAliasingFilter& filter() const noexcept { return m_filter; }
+    [[nodiscard]] UltrasonicAntiAliasingFilter& filter() noexcept { return m_filter; }
 
     void reset() noexcept {
         m_history_l.fill(0.0f);
         m_history_r.fill(0.0f);
         m_phase = 0.0;
+        m_filter.reset();
     }
 
     // Resample block from in_buf to out_buf
@@ -108,6 +122,17 @@ public:
             return out_frames;
         }
 
+        const float* src_l = in_l;
+        const float* src_r = in_r;
+
+        // Apply ultrasonic decimation filter prior to downsampling if active
+        if (m_filter.is_active()) {
+            uint32_t filter_frames = std::min<uint32_t>(in_frames, static_cast<uint32_t>(kMaxFilterBlock));
+            m_filter.process_stereo(in_l, in_r, m_filter_buf_l.data(), m_filter_buf_r.data(), filter_frames);
+            src_l = m_filter_buf_l.data();
+            src_r = m_filter_buf_r.data();
+        }
+
         const int64_t max_in = static_cast<int64_t>(in_frames);
 
         for (uint32_t i = 0; i < out_frames; ++i) {
@@ -115,17 +140,17 @@ public:
             float frac = static_cast<float>(m_phase - static_cast<double>(idx));
 
             // Fetch 4 points for Left
-            float y0_l = get_sample(in_l, idx - 1, max_in, 0);
-            float y1_l = get_sample(in_l, idx,     max_in, 0);
-            float y2_l = get_sample(in_l, idx + 1, max_in, 0);
-            float y3_l = get_sample(in_l, idx + 2, max_in, 0);
+            float y0_l = get_sample(src_l, idx - 1, max_in, 0);
+            float y1_l = get_sample(src_l, idx,     max_in, 0);
+            float y2_l = get_sample(src_l, idx + 1, max_in, 0);
+            float y3_l = get_sample(src_l, idx + 2, max_in, 0);
             out_l[i] = hermite_interpolate(y0_l, y1_l, y2_l, y3_l, frac);
 
             // Fetch 4 points for Right
-            float y0_r = get_sample(in_r, idx - 1, max_in, 1);
-            float y1_r = get_sample(in_r, idx,     max_in, 1);
-            float y2_r = get_sample(in_r, idx + 1, max_in, 1);
-            float y3_r = get_sample(in_r, idx + 2, max_in, 1);
+            float y0_r = get_sample(src_r, idx - 1, max_in, 1);
+            float y1_r = get_sample(src_r, idx,     max_in, 1);
+            float y2_r = get_sample(src_r, idx + 1, max_in, 1);
+            float y3_r = get_sample(src_r, idx + 2, max_in, 1);
             out_r[i] = hermite_interpolate(y0_r, y1_r, y2_r, y3_r, frac);
 
             m_phase += m_ratio;
@@ -134,11 +159,11 @@ public:
         // Maintain phase continuity across blocks
         if (m_phase >= static_cast<double>(in_frames)) {
             m_phase -= static_cast<double>(in_frames);
-            // Save last 3 samples into history
+            // Save last 3 samples into history from filtered source
             for (int k = 0; k < 3; ++k) {
                 int64_t src_idx = static_cast<int64_t>(in_frames) - 3 + k;
-                m_history_l[k] = (src_idx >= 0) ? in_l[src_idx] : 0.0f;
-                m_history_r[k] = (src_idx >= 0) ? in_r[src_idx] : 0.0f;
+                m_history_l[k] = (src_idx >= 0) ? src_l[src_idx] : 0.0f;
+                m_history_r[k] = (src_idx >= 0) ? src_r[src_idx] : 0.0f;
             }
         }
 
@@ -169,6 +194,10 @@ private:
     double m_ratio{1.0};
     double m_phase{0.0};
 
+    UltrasonicAntiAliasingFilter m_filter{48000, 48000};
+    std::array<float, kMaxFilterBlock> m_filter_buf_l{};
+    std::array<float, kMaxFilterBlock> m_filter_buf_r{};
+
     std::array<float, 3> m_history_l{0.0f, 0.0f, 0.0f};
     std::array<float, 3> m_history_r{0.0f, 0.0f, 0.0f};
 };
@@ -177,13 +206,15 @@ private:
 // BufferedResampler: Lock-Free Push-Pull Ring Buffer Resampler
 // Bridges differing clock domains & buffer sizes (e.g. 48kHz / 256 frames engine -> 44.1kHz / 192 frames AAudio)
 // Zero allocations in audio thread, ring buffer of 8192 stereo frames
+// Incorporates minimum-phase ultrasonic decimation filter to eliminate alias foldback
 // ============================================================================
 class BufferedResampler {
 public:
     static constexpr size_t kCapacity = 8192; // Stereo frames capacity (~170ms @ 48kHz)
 
-    BufferedResampler(uint32_t in_rate = 48000, uint32_t out_rate = 48000)
-        : m_in_rate(in_rate), m_out_rate(out_rate) {
+    BufferedResampler(uint32_t in_rate = 48000, uint32_t out_rate = 48000, bool anti_aliasing = false)
+        : m_in_rate(in_rate), m_out_rate(out_rate), m_filter(in_rate, out_rate) {
+        m_filter.set_enabled(anti_aliasing);
         update_ratio();
         reset();
     }
@@ -193,12 +224,20 @@ public:
             m_in_rate = in_rate;
             m_out_rate = out_rate;
             update_ratio();
+            m_filter.set_rates(in_rate, out_rate);
         }
     }
 
+    void set_anti_aliasing(bool enable) noexcept {
+        m_filter.set_enabled(enable);
+    }
+
+    [[nodiscard]] bool anti_aliasing() const noexcept { return m_filter.is_enabled(); }
     [[nodiscard]] uint32_t input_rate() const noexcept { return m_in_rate; }
     [[nodiscard]] uint32_t output_rate() const noexcept { return m_out_rate; }
     [[nodiscard]] double ratio() const noexcept { return m_ratio; }
+    [[nodiscard]] const UltrasonicAntiAliasingFilter& filter() const noexcept { return m_filter; }
+    [[nodiscard]] UltrasonicAntiAliasingFilter& filter() noexcept { return m_filter; }
 
     void reset() noexcept {
         m_write_head = 0;
@@ -206,17 +245,28 @@ public:
         m_fifo_l.fill(0.0f);
         m_fifo_r.fill(0.0f);
         m_available_frames = 0;
+        m_filter.reset();
     }
 
-    // Push input audio frames into FIFO
+    // Push input audio frames into FIFO (with ultrasonic anti-aliasing decimation filter if downsampling)
     uint32_t push_stereo(const float* in_l, const float* in_r, uint32_t frames) noexcept {
         if (!in_l || !in_r || frames == 0) return 0;
         uint32_t to_write = std::min<uint32_t>(frames, static_cast<uint32_t>(kCapacity - m_available_frames));
 
-        for (uint32_t i = 0; i < to_write; ++i) {
-            size_t idx = (m_write_head + i) % kCapacity;
-            m_fifo_l[idx] = in_l[i];
-            m_fifo_r[idx] = in_r[i];
+        if (m_filter.is_active()) {
+            for (uint32_t i = 0; i < to_write; ++i) {
+                size_t idx = (m_write_head + i) % kCapacity;
+                float fl = 0.0f, fr = 0.0f;
+                m_filter.process_sample(in_l[i], in_r[i], fl, fr);
+                m_fifo_l[idx] = fl;
+                m_fifo_r[idx] = fr;
+            }
+        } else {
+            for (uint32_t i = 0; i < to_write; ++i) {
+                size_t idx = (m_write_head + i) % kCapacity;
+                m_fifo_l[idx] = in_l[i];
+                m_fifo_r[idx] = in_r[i];
+            }
         }
 
         m_write_head = (m_write_head + to_write) % kCapacity;
@@ -275,6 +325,7 @@ private:
     double m_read_phase{0.0};
     uint32_t m_available_frames{0};
 
+    UltrasonicAntiAliasingFilter m_filter{48000, 48000};
     std::array<float, kCapacity> m_fifo_l{};
     std::array<float, kCapacity> m_fifo_r{};
 };

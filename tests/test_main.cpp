@@ -23,6 +23,8 @@
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 #include "backends/android/aaudio_backend.hpp"
+#include "audio_core/dsp/anti_aliasing_filter.hpp"
+#include "audio_core/dsp/dither.hpp"
 #include <numbers>
 
 #include <iostream>
@@ -2049,6 +2051,225 @@ void test_sample_rate_agility_and_hermite_resampling() {
     }
 }
 
+void test_anti_aliasing_and_airwindows_dither() {
+    std::cout << "[TEST] Running Anti-Aliasing Decimation Filter & Airwindows Dither Test..." << std::endl;
+
+    using namespace audio_core::dsp;
+
+    // 1. UltrasonicAntiAliasingFilter Minimum-Phase Impulse Response (Zero Pre-Ringing)
+    {
+        UltrasonicAntiAliasingFilter filter(96000, 48000);
+        TEST_CHECK(filter.is_active());
+
+        // Feed 100 samples with an impulse at sample 40
+        std::vector<float> impulse(100, 0.0f);
+        impulse[40] = 1.0f;
+        std::vector<float> out_l(100, 0.0f);
+        std::vector<float> out_r(100, 0.0f);
+
+        filter.process_stereo(impulse.data(), impulse.data(), out_l.data(), out_r.data(), 100);
+
+        // Verify strictly 0.000 ms pre-ringing (causal minimum-phase behavior)
+        for (int i = 0; i < 40; ++i) {
+            TEST_CHECK(out_l[i] == 0.0f);
+            TEST_CHECK(out_r[i] == 0.0f);
+        }
+        // Impulse response begins at t = 40 with positive peak
+        TEST_CHECK(out_l[40] > 0.0f);
+
+        std::cout << "  -> Minimum-Phase Causal Response: PASSED (0.000 ms pre-ringing, impulse attack preserved)" << std::endl;
+    }
+
+    // 2. Ultrasonic Stopband Attenuation vs Audible Passband Transparency
+    {
+        UltrasonicAntiAliasingFilter filter(96000, 48000);
+        constexpr uint32_t kFrames = 2048;
+
+        // Audible 1 kHz test tone at 96 kHz
+        std::vector<float> audio_1k(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            audio_1k[i] = std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * static_cast<float>(i) / 96000.0f);
+        }
+        std::vector<float> out_1k(kFrames);
+        filter.process_stereo(audio_1k.data(), audio_1k.data(), out_1k.data(), out_1k.data(), kFrames);
+
+        // Measure passband amplitude after filter settles (samples 500..2048)
+        float max_1k = 0.0f;
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            max_1k = std::max(max_1k, std::abs(out_1k[i]));
+        }
+        TEST_CHECK(std::abs(max_1k - 1.0f) < 0.02f); // Passband is transparent (<0.2 dB loss)
+
+        // Ultrasonic 35 kHz tone at 96 kHz (would alias to 13 kHz upon decimation to 48 kHz)
+        filter.reset();
+        std::vector<float> audio_35k(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            audio_35k[i] = std::sin(2.0f * std::numbers::pi_v<float> * 35000.0f * static_cast<float>(i) / 96000.0f);
+        }
+        std::vector<float> out_35k(kFrames);
+        filter.process_stereo(audio_35k.data(), audio_35k.data(), out_35k.data(), out_35k.data(), kFrames);
+
+        float max_35k = 0.0f;
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            max_35k = std::max(max_35k, std::abs(out_35k[i]));
+        }
+        // 10th order filter attenuates 35 kHz (> 30 dB down -> peak < 0.0316)
+        TEST_CHECK(max_35k < 0.0316f);
+
+        std::cout << "  -> Ultrasonic Stopband Rejection: PASSED (1kHz passed at " << max_1k 
+                  << ", 35kHz suppressed to " << max_35k << " (>30dB attenuation))" << std::endl;
+    }
+
+    // 3. Resampler Alias Suppression: 96kHz -> 48kHz Decimation
+    {
+        // Compare StreamResampler with and without anti-aliasing filter
+        StreamResampler resampler_raw(96000, 48000, false);
+        StreamResampler resampler_filtered(96000, 48000, true);
+
+        constexpr uint32_t in_frames = 2048;
+        constexpr uint32_t out_frames = 1024;
+        std::vector<float> in_35k(in_frames);
+        for (uint32_t i = 0; i < in_frames; ++i) {
+            in_35k[i] = std::sin(2.0f * std::numbers::pi_v<float> * 35000.0f * static_cast<float>(i) / 96000.0f);
+        }
+
+        std::vector<float> out_raw_l(out_frames), out_raw_r(out_frames);
+        std::vector<float> out_filt_l(out_frames), out_filt_r(out_frames);
+
+        resampler_raw.process_stereo(in_35k.data(), in_35k.data(), in_frames, out_raw_l.data(), out_raw_r.data(), out_frames);
+        resampler_filtered.process_stereo(in_35k.data(), in_35k.data(), in_frames, out_filt_l.data(), out_filt_r.data(), out_frames);
+
+        float max_raw = 0.0f;
+        float max_filt = 0.0f;
+        for (uint32_t i = 200; i < out_frames; ++i) {
+            max_raw = std::max(max_raw, std::abs(out_raw_l[i]));
+            max_filt = std::max(max_filt, std::abs(out_filt_l[i]));
+        }
+
+        // Without filter, 35 kHz aliases into audible spectrum with high amplitude
+        TEST_CHECK(max_raw > 0.3f);
+        // With ultrasonic decimation filter, the alias is suppressed by > 30 dB
+        TEST_CHECK(max_filt < 0.0316f);
+
+        std::cout << "  -> Decimation Anti-Aliasing: PASSED (Raw alias=" << max_raw 
+                  << " vs Filtered alias=" << max_filt << ")" << std::endl;
+    }
+
+    // 4. Airwindows NJAD Silence Gating (Zero-Noise Floor on Digital Silence)
+    {
+        DitherEngine dither_njad(DitherType::NJAD);
+        DitherEngine dither_tpdf(DitherType::TPDF);
+
+        constexpr uint32_t kFrames = 1024;
+        std::vector<float> silence(kFrames, 0.0f);
+        std::vector<int16_t> out_njad_l(kFrames), out_njad_r(kFrames);
+        std::vector<int16_t> out_tpdf_l(kFrames), out_tpdf_r(kFrames);
+
+        dither_njad.process_stereo_16(silence.data(), silence.data(), out_njad_l.data(), out_njad_r.data(), kFrames);
+        dither_tpdf.process_stereo_16(silence.data(), silence.data(), out_tpdf_l.data(), out_tpdf_r.data(), kFrames);
+
+        // NJAD must output strictly 0 on silence (silence clamp)
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(out_njad_l[i] == 0);
+            TEST_CHECK(out_njad_r[i] == 0);
+        }
+
+        // TPDF constantly dither-noises between -1 and +1 LSB
+        bool tpdf_has_noise = false;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            if (out_tpdf_l[i] != 0) {
+                tpdf_has_noise = true;
+                break;
+            }
+        }
+        TEST_CHECK(tpdf_has_noise);
+
+        std::cout << "  -> Airwindows NJAD Silence Clamp: PASSED (Absolute digital zero on silence verified)" << std::endl;
+    }
+
+    // 5. Low-Level Sub-LSB Signal Linearization (Elimination of Truncation Distortion)
+    {
+        // Generate a 0.25 LSB sine wave (peak amplitude 0.25 / 32768.0f)
+        constexpr uint32_t kFrames = 16384;
+        const float sub_lsb_amp = 0.25f / 32768.0f;
+        std::vector<float> sub_lsb(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            sub_lsb[i] = sub_lsb_amp * std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * static_cast<float>(i) / 48000.0f);
+        }
+
+        // Mode None: hard truncation
+        DitherEngine dither_none(DitherType::None);
+        std::vector<int16_t> out_none_l(kFrames), out_none_r(kFrames);
+        dither_none.process_stereo_16(sub_lsb.data(), sub_lsb.data(), out_none_l.data(), out_none_r.data(), kFrames);
+
+        // All samples truncated to 0!
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(out_none_l[i] == 0);
+        }
+
+        // Mode TPDF: preserves low-level signal via probability modulation
+        DitherEngine dither_tpdf(DitherType::TPDF);
+        std::vector<int16_t> out_tpdf_l(kFrames), out_tpdf_r(kFrames);
+        dither_tpdf.process_stereo_16(sub_lsb.data(), sub_lsb.data(), out_tpdf_l.data(), out_tpdf_r.data(), kFrames);
+
+        // Correlate with the 1 kHz probe tone:
+        double correlation = 0.0;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            double probe = std::sin(2.0 * std::numbers::pi_v<double> * 1000.0 * static_cast<double>(i) / 48000.0);
+            correlation += static_cast<double>(out_tpdf_l[i]) * probe;
+        }
+        // Correlation is statistically significant and positive, confirming sub-LSB signal preservation!
+        TEST_CHECK(correlation > 50.0);
+
+        std::cout << "  -> Sub-LSB Signal Linearization: PASSED (Truncation deadband eliminated, correlation=" 
+                  << correlation << " > 50)" << std::endl;
+    }
+
+    // 6. PaulDither vs Dark Noise Shaping Spectral Tilting
+    {
+        DitherEngine dither_paul(DitherType::PaulDither);
+        DitherEngine dither_dark(DitherType::Dark);
+
+        constexpr uint32_t kFrames = 8192;
+        std::vector<float> silence(kFrames, 0.0001f); // Tiny offset to keep dither active
+        std::vector<float> out_paul_l(kFrames), out_paul_r(kFrames);
+        std::vector<float> out_dark_l(kFrames), out_dark_r(kFrames);
+
+        dither_paul.process_stereo_float(silence.data(), silence.data(), out_paul_l.data(), out_paul_r.data(), kFrames);
+        dither_dark.process_stereo_float(silence.data(), silence.data(), out_dark_l.data(), out_dark_r.data(), kFrames);
+
+        // High frequency energy measured via 1st difference (high-pass metric |x[n] - x[n-1]|^2)
+        double hf_paul = 0.0;
+        double hf_dark = 0.0;
+        for (uint32_t i = 1; i < kFrames; ++i) {
+            double diff_p = out_paul_l[i] - out_paul_l[i - 1];
+            double diff_d = out_dark_l[i] - out_dark_l[i - 1];
+            hf_paul += diff_p * diff_p;
+            hf_dark += diff_d * diff_d;
+        }
+
+        // PaulDither has highpass noise shaping (1 - z^-1), whereas Dark has lowpass smoothing (1 + z^-1)
+        // High frequency power of PaulDither must be substantially higher than Dark
+        TEST_CHECK(hf_paul > hf_dark * 1.5);
+
+        std::cout << "  -> Airwindows Dither Voicing: PASSED (PaulDither HF=" << hf_paul 
+                  << " vs Dark HF=" << hf_dark << " (velvet highpass vs warm lowpass verified))" << std::endl;
+    }
+
+    // 7. 24-Bit Studio Mastering Wordlength Reduction
+    {
+        DitherEngine dither24(DitherType::TPDF);
+        int32_t out24_l = 0, out24_r = 0;
+        dither24.process_sample_24(0.5f, -0.5f, out24_l, out24_r);
+
+        // 24-bit 0.5f is around 4194304 (+/- 4 LSB dither)
+        TEST_CHECK(std::abs(out24_l - 4194304) <= 4);
+        TEST_CHECK(std::abs(out24_r - (-4194304)) <= 4);
+
+        std::cout << "  -> 24-Bit Studio Master Dither: PASSED (24-bit wordlength scaling verified)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -2078,6 +2299,7 @@ int main() {
     test_multicore_worker_pool_and_kernel_scaling();
     test_native_android_aaudio_backend();
     test_sample_rate_agility_and_hermite_resampling();
+    test_anti_aliasing_and_airwindows_dither();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
