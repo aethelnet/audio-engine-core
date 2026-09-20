@@ -9,6 +9,12 @@
 #include "audio_core/protocol/command_packet.hpp"
 #include "audio_core/protocol/aoip_packet.hpp"
 #include "audio_core/protocol/telemetry_packet.hpp"
+#include "audio_core/insert_slot.hpp"
+#include "audio_core/dsp/purest_drive.hpp"
+#include "audio_core/dsp/buttercomp2.hpp"
+#include "audio_core/dsp/baxandall.hpp"
+#include "audio_core/dsp/clip_only2.hpp"
+#include "audio_core/dsp/wasm_processor.hpp"
 
 #include <iostream>
 #include <thread>
@@ -710,6 +716,240 @@ void test_binary_protocol_and_command_queue() {
     }
 }
 
+void test_channel_strip_insert_slots() {
+    std::cout << "[TEST] Running Modular Insert Slots & Airwindows DSP Suite Test..." << std::endl;
+    using namespace audio_core;
+
+    constexpr uint32_t kFrames = 256;
+    constexpr uint32_t kSampleRate = 48000;
+
+    // 1. PurestDrive Test (Harmonic saturation)
+    {
+        audio_core::dsp::PurestDrive drive;
+        drive.init(kSampleRate);
+        TEST_CHECK(std::string_view(drive.name()).find("PurestDrive") != std::string_view::npos);
+
+        std::vector<float> left(kFrames), right(kFrames);
+        std::vector<float> orig_left(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * i / kSampleRate) * 0.8f;
+            left[i] = right[i] = orig_left[i] = s;
+        }
+
+        drive.set_parameter(0, 0.9f); // Drive = 0.9
+        drive.set_parameter(1, 1.0f); // Wet = 1.0
+        drive.process_stereo(left.data(), right.data(), kFrames);
+
+        float diff_sum = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(!std::isnan(left[i]));
+            TEST_CHECK(!std::isinf(left[i]));
+            diff_sum += std::abs(left[i] - orig_left[i]);
+        }
+        TEST_CHECK(diff_sum > 0.1f);
+        std::cout << "  -> PurestDrive: PASSED (Nonlinear harmonic enrichment verified, diff=" << diff_sum << ")" << std::endl;
+    }
+
+    // 2. ButterComp2 Test (Quad-interleaved bipolar-RMS compressor)
+    {
+        audio_core::dsp::ButterComp2 comp;
+        comp.init(kSampleRate);
+        TEST_CHECK(std::string_view(comp.name()).find("ButterComp2") != std::string_view::npos);
+
+        constexpr uint32_t kCompFrames = 4800; // 100ms for RMS integrator to settle
+        std::vector<float> left(kCompFrames), right(kCompFrames);
+        for (uint32_t i = 0; i < kCompFrames; ++i) {
+            left[i] = right[i] = 1.2f; // Hot step input
+        }
+
+        comp.set_parameter(0, 0.8f); // Compress = 0.8
+        comp.set_parameter(1, 1.0f); // Makeup = 1.0
+        comp.set_parameter(2, 1.0f); // Wet = 1.0
+        comp.process_stereo(left.data(), right.data(), kCompFrames);
+
+        TEST_CHECK(!std::isnan(left[kCompFrames - 1]));
+        TEST_CHECK(left[kCompFrames - 1] < 1.2f);
+        std::cout << "  -> ButterComp2: PASSED (Buttery RMS dynamic leveling verified, out=" << left[kCompFrames - 1] << " < 1.2)" << std::endl;
+    }
+
+    // 3. Baxandall EQ Test (Low/High shelving in Console carrier wave)
+    {
+        audio_core::dsp::Baxandall eq;
+        eq.init(kSampleRate);
+
+        eq.set_parameter(0, 12.0f); // Bass +12dB
+        eq.set_parameter(1, 0.0f);  // Treble 0dB
+
+        std::vector<float> left(kFrames), right(kFrames);
+        float in_energy = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = std::sin(2.0f * std::numbers::pi_v<float> * 80.0f * i / kSampleRate) * 0.2f;
+            left[i] = right[i] = s;
+            in_energy += s * s;
+        }
+
+        eq.process_stereo(left.data(), right.data(), kFrames);
+
+        float out_energy = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(!std::isnan(left[i]));
+            out_energy += left[i] * left[i];
+        }
+        TEST_CHECK(out_energy > in_energy * 2.0f);
+        std::cout << "  -> Baxandall EQ: PASSED (+12dB Low-shelf amplified 80Hz energy from " << in_energy << " to " << out_energy << ")" << std::endl;
+    }
+
+    // 4. ClipOnly2 Test (Zero-latency transient slew rounder)
+    {
+        audio_core::dsp::ClipOnly2 clipper;
+        clipper.init(kSampleRate);
+
+        std::vector<float> left = {0.5f, 0.96f, 1.2f, 1.5f, -1.3f, 0.2f};
+        std::vector<float> right = left;
+
+        clipper.process_stereo(left.data(), right.data(), static_cast<uint32_t>(left.size()));
+
+        for (size_t i = 0; i < left.size(); ++i) {
+            TEST_CHECK(left[i] <= 1.0f && left[i] >= -1.0f);
+            TEST_CHECK(right[i] <= 1.0f && right[i] >= -1.0f);
+        }
+        std::cout << "  -> ClipOnly2: PASSED (Intercepted 1.5f spike and bounded to <= 1.0f with 0 latency)" << std::endl;
+    }
+
+    // 5. Integration into MixerGraph Track Channel Strip with WASM & Airwindows
+    {
+        MixerGraph mixer(kFrames);
+        Track* track = mixer.allocate_track("Synth Lead");
+        TEST_CHECK(track != nullptr);
+
+        auto bax = std::make_shared<audio_core::dsp::Baxandall>();
+        bax->init(kSampleRate);
+        track->slot(0).set_processor(bax);
+
+        auto comp = std::make_shared<audio_core::dsp::ButterComp2>();
+        comp->init(kSampleRate);
+        track->slot(1).set_processor(comp);
+
+        auto drive = std::make_shared<audio_core::dsp::PurestDrive>();
+        drive->init(kSampleRate);
+        track->slot(2).set_processor(drive);
+
+        // Slot 3: Sandboxed WASM Saturator Plugin
+        auto wasm = std::make_unique<audio_core::WasmDspPlugin>();
+        bool loaded = wasm->load_from_file("plugins/saturator/saturator.wasm");
+        TEST_CHECK(loaded);
+        auto wasm_proc = std::make_shared<audio_core::dsp::WasmProcessor>(std::move(wasm), "WASM Saturator");
+        wasm_proc->init(kSampleRate);
+        track->slot(3).set_processor(wasm_proc);
+
+        // Feed sine wave into track
+        Sample* trk_l = track->buffer().view().channel(0);
+        Sample* trk_r = track->buffer().view().channel(1);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk_l[i] = trk_r[i] = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * i / kSampleRate) * 0.5f;
+        }
+
+        AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+        mixer.render(view);
+
+        auto meter = track->meter();
+        TEST_CHECK(meter.peak_l > 0.1f);
+        TEST_CHECK(meter.rms_l > 0.05f);
+
+        // Test lock-free command queue slot bypass
+        protocol::MixerCommand cmd_bypass;
+        cmd_bypass.type = protocol::MixerCommandType::SetTrackSlotBypass;
+        cmd_bypass.target_id = track->id();
+        cmd_bypass.secondary_id = 0; // Slot 0 (Baxandall)
+        cmd_bypass.flags = 1; // Bypass = true
+        mixer.post_command(cmd_bypass);
+
+        mixer.render(view);
+        TEST_CHECK(track->slot(0).is_bypassed());
+
+        // Test lock-free command queue parameter update on WASM slot
+        protocol::MixerCommand cmd_param;
+        cmd_param.type = protocol::MixerCommandType::SetTrackSlotParam;
+        cmd_param.target_id = track->id();
+        cmd_param.secondary_id = 3; // Slot 3 (WASM)
+        cmd_param.flags = 1;        // Param 1 (Drive)
+        cmd_param.value1 = 8.5f;
+        mixer.post_command(cmd_param);
+
+        mixer.render(view);
+        TEST_CHECK(std::abs(track->slot(3).processor()->get_parameter(1) - 8.5f) < 0.01f);
+
+        std::cout << "  -> Channel Strip Modular Inserts: PASSED (Airwindows + WASM chain executed, bypass & params automated via lock-free queue)" << std::endl;
+    }
+}
+
+void test_nested_bus_topological_routing() {
+    std::cout << "[TEST] Running Nested Bus Topological Routing (DAG) & Cycle Detection Test..." << std::endl;
+    using namespace audio_core;
+
+    constexpr uint32_t kFrames = 256;
+    MixerGraph mixer(kFrames);
+
+    // Allocate 3 submix buses:
+    // Bus 1 = "Snare Submix"
+    // Bus 2 = "Drum Submix"
+    // Bus 3 = "Pre-Master"
+    AudioBus* bus1 = mixer.allocate_submix_bus("Snare Submix");
+    AudioBus* bus2 = mixer.allocate_submix_bus("Drum Submix");
+    AudioBus* bus3 = mixer.allocate_submix_bus("Pre-Master");
+
+    TEST_CHECK(bus1 != nullptr && bus1->id() == 1);
+    TEST_CHECK(bus2 != nullptr && bus2->id() == 2);
+    TEST_CHECK(bus3 != nullptr && bus3->id() == 3);
+
+    // Setup DAG routing:
+    // Bus 1 -> Bus 2 -> Bus 3 -> Master (-1)
+    TEST_CHECK(mixer.set_bus_target_bus(1, 2));
+    TEST_CHECK(mixer.set_bus_target_bus(2, 3));
+    TEST_CHECK(mixer.set_bus_target_bus(3, -1)); // Master
+
+    // Allocate a track routed to Bus 1
+    Track* snare_trk = mixer.allocate_track("Snare Top");
+    TEST_CHECK(snare_trk != nullptr);
+    snare_trk->set_target_bus(1); // Routes to Bus 1
+
+    // Fill track with known impulse (0.5f at sample 0)
+    snare_trk->buffer().view().channel(0)[0] = 0.5f;
+    snare_trk->buffer().view().channel(1)[0] = 0.5f;
+
+    // Use PurestConsole (exact linear/sine)
+    snare_trk->set_console_type(audio_core::dsp::ConsoleType::Purest);
+    bus1->set_console_type(audio_core::dsp::ConsoleType::Purest);
+    bus2->set_console_type(audio_core::dsp::ConsoleType::Purest);
+    bus3->set_console_type(audio_core::dsp::ConsoleType::Purest);
+    mixer.master_bus().set_console_type(audio_core::dsp::ConsoleType::Purest);
+
+    AudioBuffer out_buf(2, kFrames);
+    auto view = out_buf.view();
+    mixer.render(view);
+
+    // Verify audio arrived at master within the single buffer cycle
+    TEST_CHECK(view.channel(0)[0] > 0.1f);
+    TEST_CHECK(view.channel(1)[0] > 0.1f);
+    std::cout << "  -> Nested Bus Routing: PASSED (Track -> Bus 1 -> Bus 2 -> Bus 3 -> Master routed in single block)" << std::endl;
+
+    // Cycle Detection Tests:
+    // 1. Direct Self-Loop: Bus 1 -> Bus 1
+    TEST_CHECK(!mixer.set_bus_target_bus(1, 1));
+    TEST_CHECK(bus1->target_bus() == 2); // Preserved
+
+    // 2. Circular Loop: Bus 3 -> Bus 1 (Creates: 1 -> 2 -> 3 -> 1)
+    TEST_CHECK(!mixer.set_bus_target_bus(3, 1));
+    TEST_CHECK(bus3->target_bus() == -1); // Preserved
+
+    // 3. 2-Node Mutual Loop: Bus 2 -> Bus 1 (Creates: 1 -> 2 -> 1)
+    TEST_CHECK(!mixer.set_bus_target_bus(2, 1));
+    TEST_CHECK(bus2->target_bus() == 3); // Preserved
+
+    std::cout << "  -> Cycle Detection (Kahn's Algorithm): PASSED (Self-loops and multi-node cycles rejected, DAG integrity preserved)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -724,6 +964,8 @@ int main() {
     test_airwindows_console_processor();
     test_mixer_graph_routing();
     test_binary_protocol_and_command_queue();
+    test_channel_strip_insert_slots();
+    test_nested_bus_topological_routing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

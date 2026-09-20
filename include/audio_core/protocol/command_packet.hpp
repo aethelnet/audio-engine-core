@@ -15,9 +15,14 @@ enum class MixerCommandType : uint16_t {
     SetTrackSend,
     SetTrackConsoleType,
     SetBusGain,
+    SetBusTargetBus,
     SetBusConsoleType,
     SetMasterGain,
     SetMasterLimiter,
+    SetTrackSlotBypass,
+    SetTrackSlotParam,
+    SetBusSlotBypass,
+    SetBusSlotParam,
     ResetMeters,
 };
 

@@ -1,0 +1,59 @@
+#pragma once
+
+#include "audio_core/insert_slot.hpp"
+#include "audio_core/wasm_host.hpp"
+#include <memory>
+#include <string>
+
+namespace audio_core::dsp {
+
+// ============================================================================
+// WasmProcessor: Adapter wrapping WasmDspPlugin inside IProcessor
+// Enables sandboxed WASM plugins to sit directly inside Track & Bus Insert Slots
+// ============================================================================
+class WasmProcessor : public IProcessor {
+public:
+    explicit WasmProcessor(std::unique_ptr<WasmDspPlugin> plugin, std::string name = "WASM Plugin")
+        : m_plugin(std::move(plugin)), m_name(std::move(name)) {}
+
+    void init(uint32_t sample_rate) noexcept override {
+        if (m_plugin) {
+            m_plugin->init(sample_rate);
+        }
+    }
+
+    void reset() noexcept override {}
+
+    [[nodiscard]] const char* name() const noexcept override {
+        return m_name.c_str();
+    }
+
+    void set_parameter(uint32_t index, float value) noexcept override {
+        if (m_plugin) {
+            m_plugin->set_parameter(index, value);
+        }
+    }
+
+    [[nodiscard]] float get_parameter(uint32_t index) const noexcept override {
+        if (m_plugin) {
+            return m_plugin->get_parameter(index);
+        }
+        return 0.0f;
+    }
+
+    void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
+        if (m_plugin && m_plugin->is_loaded()) {
+            m_plugin->process_stereo(left, right, left, right, frames);
+        }
+    }
+
+    [[nodiscard]] WasmDspPlugin* plugin() noexcept {
+        return m_plugin.get();
+    }
+
+private:
+    std::unique_ptr<WasmDspPlugin> m_plugin;
+    std::string m_name;
+};
+
+} // namespace audio_core::dsp

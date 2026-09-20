@@ -2,11 +2,13 @@
 
 #include "audio_core/types.hpp"
 #include "audio_core/ring_buffer.hpp"
+#include "audio_core/insert_slot.hpp"
 #include "audio_core/dsp/console_processor.hpp"
 #include "audio_core/protocol/command_packet.hpp"
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include <string>
 #include <vector>
+#include <array>
 #include <memory>
 #include <cmath>
 #include <numbers>
@@ -24,6 +26,7 @@ struct MeterLevels {
 
 // ============================================================================
 // Track: A single audio/instrument channel in the Mixer Graph
+// Pre-allocated in fixed pool; zero allocations during playback
 // ============================================================================
 class Track {
 public:
@@ -34,6 +37,35 @@ public:
 
     [[nodiscard]] uint32_t id() const noexcept { return m_id; }
     [[nodiscard]] const std::string& name() const noexcept { return m_name; }
+    void set_name(std::string name) noexcept { m_name = std::move(name); }
+
+    [[nodiscard]] bool is_active() const noexcept { return m_active.load(std::memory_order_relaxed); }
+    void set_active(bool active) noexcept { m_active.store(active, std::memory_order_relaxed); }
+
+    void activate(uint32_t id, std::string name) noexcept {
+        m_id = id;
+        m_name = std::move(name);
+        m_gain.store(1.0f, std::memory_order_relaxed);
+        m_pan.store(0.0f, std::memory_order_relaxed);
+        m_mute.store(false, std::memory_order_relaxed);
+        m_solo.store(false, std::memory_order_relaxed);
+        m_target_bus.store(-1, std::memory_order_relaxed);
+        for (auto& s : m_sends) {
+            s.active = false;
+        }
+        m_buffer.clear();
+        reset_meters();
+        m_active.store(true, std::memory_order_release);
+    }
+
+    void deactivate() noexcept {
+        m_active.store(false, std::memory_order_release);
+        for (auto& s : m_sends) {
+            s.active = false;
+        }
+        m_buffer.clear();
+        reset_meters();
+    }
 
     void set_gain(float gain) noexcept { m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
@@ -52,13 +84,27 @@ public:
 
     void set_send(uint32_t bus_id, float amount, bool pre_fader = false) noexcept {
         for (auto& s : m_sends) {
-            if (s.bus_id == bus_id) {
-                s.amount = std::clamp(amount, 0.0f, 2.0f);
-                s.pre_fader = pre_fader;
+            if (s.active && s.bus_id == bus_id) {
+                if (amount <= 0.0001f) {
+                    s.active = false;
+                } else {
+                    s.amount = std::clamp(amount, 0.0f, 2.0f);
+                    s.pre_fader = pre_fader;
+                }
                 return;
             }
         }
-        m_sends.push_back({bus_id, std::clamp(amount, 0.0f, 2.0f), pre_fader});
+        if (amount > 0.0001f) {
+            for (auto& s : m_sends) {
+                if (!s.active) {
+                    s.bus_id = bus_id;
+                    s.amount = std::clamp(amount, 0.0f, 2.0f);
+                    s.pre_fader = pre_fader;
+                    s.active = true;
+                    return;
+                }
+            }
+        }
     }
 
     void reset_meters() noexcept {
@@ -74,6 +120,10 @@ public:
     [[nodiscard]] dsp::ConsoleType console_type() const noexcept {
         return m_console.type();
     }
+
+    // Insert Slots (Pre-Console EQ, Dynamics, Saturation, Wasm)
+    [[nodiscard]] InsertSlot& slot(size_t index) noexcept { return m_slots[index]; }
+    [[nodiscard]] const InsertSlot& slot(size_t index) const noexcept { return m_slots[index]; }
 
     [[nodiscard]] AudioBuffer& buffer() noexcept { return m_buffer; }
     [[nodiscard]] const AudioBuffer& buffer() const noexcept { return m_buffer; }
@@ -92,10 +142,15 @@ public:
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
 
-        // 1. In-line Console Encode (Airwindows EveryConsole)
+        // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, PurestDrive, WASM)
+        for (auto& slot : m_slots) {
+            slot.process_stereo(left, right, frames);
+        }
+
+        // 2. In-line Console Encode (Airwindows EveryConsole)
         m_console.process_stereo(left, right, frames);
 
-        // 2. Measure Telemetry (Peak & RMS)
+        // 3. Measure Telemetry (Peak & RMS)
         float peak_l = 0.0f, peak_r = 0.0f;
         float sum_sq_l = 0.0f, sum_sq_r = 0.0f;
 
@@ -117,25 +172,29 @@ public:
         m_meter_rms_r.store(rms_r, std::memory_order_relaxed);
     }
 
+    static constexpr size_t kMaxTrackSends = 4;
     struct SendInfo {
-        uint32_t bus_id;
-        float amount;
+        uint32_t bus_id{0};
+        float amount{0.0f};
         bool pre_fader{false};
+        bool active{false};
     };
-    [[nodiscard]] const std::vector<SendInfo>& sends() const noexcept { return m_sends; }
+    [[nodiscard]] const std::array<SendInfo, kMaxTrackSends>& sends() const noexcept { return m_sends; }
 
 private:
     uint32_t m_id;
     std::string m_name;
     AudioBuffer m_buffer;
 
+    std::atomic<bool> m_active{false};
     std::atomic<float> m_gain{1.0f};
     std::atomic<float> m_pan{0.0f};
     std::atomic<bool> m_mute{false};
     std::atomic<bool> m_solo{false};
     std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master
 
-    std::vector<SendInfo> m_sends;
+    std::array<InsertSlot, kMaxTrackInsertSlots> m_slots;
+    std::array<SendInfo, kMaxTrackSends> m_sends{};
     dsp::ConsoleProcessor m_console;
 
     std::atomic<float> m_meter_peak_l{0.0f};
@@ -156,9 +215,33 @@ public:
 
     [[nodiscard]] uint32_t id() const noexcept { return m_id; }
     [[nodiscard]] const std::string& name() const noexcept { return m_name; }
+    void set_name(std::string name) noexcept { m_name = std::move(name); }
+
+    [[nodiscard]] bool is_active() const noexcept { return m_active.load(std::memory_order_relaxed); }
+    void set_active(bool active) noexcept { m_active.store(active, std::memory_order_relaxed); }
+
+    void activate(uint32_t id, std::string name) noexcept {
+        m_id = id;
+        m_name = std::move(name);
+        m_gain.store(1.0f, std::memory_order_relaxed);
+        m_target_bus.store(-1, std::memory_order_relaxed);
+        m_buffer.clear();
+        reset_meters();
+        m_active.store(true, std::memory_order_release);
+    }
+
+    void deactivate() noexcept {
+        m_active.store(false, std::memory_order_release);
+        m_target_bus.store(-1, std::memory_order_relaxed);
+        m_buffer.clear();
+        reset_meters();
+    }
 
     void set_gain(float gain) noexcept { m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
+
+    void set_target_bus(int32_t bus_id) noexcept { m_target_bus.store(bus_id, std::memory_order_relaxed); }
+    [[nodiscard]] int32_t target_bus() const noexcept { return m_target_bus.load(std::memory_order_relaxed); }
 
     void set_console_type(dsp::ConsoleType type) noexcept {
         m_console.set_type(type);
@@ -166,6 +249,10 @@ public:
     [[nodiscard]] dsp::ConsoleType console_type() const noexcept {
         return m_console.type();
     }
+
+    // Insert Slots (Bus Glue Compressor, Master Limiter, Reverb)
+    [[nodiscard]] InsertSlot& slot(size_t index) noexcept { return m_slots[index]; }
+    [[nodiscard]] const InsertSlot& slot(size_t index) const noexcept { return m_slots[index]; }
 
     [[nodiscard]] AudioBuffer& buffer() noexcept { return m_buffer; }
     [[nodiscard]] const AudioBuffer& buffer() const noexcept { return m_buffer; }
@@ -179,6 +266,13 @@ public:
         };
     }
 
+    void reset_meters() noexcept {
+        m_meter_peak_l.store(0.0f, std::memory_order_relaxed);
+        m_meter_peak_r.store(0.0f, std::memory_order_relaxed);
+        m_meter_rms_l.store(0.0f, std::memory_order_relaxed);
+        m_meter_rms_r.store(0.0f, std::memory_order_relaxed);
+    }
+
     void clear() noexcept {
         m_buffer.clear();
     }
@@ -190,7 +284,12 @@ public:
         // 1. In-line Console Decode (Reciprocal Airwindows expansion)
         m_console.process_stereo(left, right, frames);
 
-        // 2. Telemetry
+        // 2. Process Bus Insert Slots (Bus Glue Comp, Master EQ, etc.)
+        for (auto& slot : m_slots) {
+            slot.process_stereo(left, right, frames);
+        }
+
+        // 3. Telemetry
         float peak_l = 0.0f, peak_r = 0.0f;
         float sum_sq_l = 0.0f, sum_sq_r = 0.0f;
 
@@ -214,7 +313,10 @@ private:
     std::string m_name;
     AudioBuffer m_buffer;
 
+    std::atomic<bool> m_active{false};
     std::atomic<float> m_gain{1.0f};
+    std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master, or target submix bus ID
+    std::array<InsertSlot, kMaxBusInsertSlots> m_slots;
     dsp::ConsoleProcessor m_console;
 
     std::atomic<float> m_meter_peak_l{0.0f};
@@ -228,39 +330,176 @@ private:
 // ============================================================================
 class MixerGraph {
 public:
-    explicit MixerGraph(uint32_t buffer_frames = 1024)
-        : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames) {}
+    static constexpr size_t kMaxTracks = 32;
+    static constexpr size_t kMaxBuses = 16;
 
+    explicit MixerGraph(uint32_t buffer_frames = 1024)
+        : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames) {
+        m_master_bus.set_active(true);
+        for (size_t i = 0; i < kMaxTracks; ++i) {
+            m_tracks[i] = std::make_unique<Track>(static_cast<uint32_t>(i + 1), "Track " + std::to_string(i + 1), buffer_frames);
+        }
+        for (size_t i = 0; i < kMaxBuses; ++i) {
+            m_buses[i] = std::make_unique<AudioBus>(static_cast<uint32_t>(i + 1), "Bus " + std::to_string(i + 1), buffer_frames);
+        }
+        recompute_bus_order();
+    }
+
+    Track* allocate_track(const std::string& name) {
+        for (size_t i = 0; i < kMaxTracks; ++i) {
+            if (!m_tracks[i]->is_active()) {
+                m_tracks[i]->activate(static_cast<uint32_t>(i + 1), name);
+                return m_tracks[i].get();
+            }
+        }
+        return nullptr; // Preallocated capacity reached
+    }
+
+    AudioBus* allocate_submix_bus(const std::string& name) {
+        for (size_t i = 0; i < kMaxBuses; ++i) {
+            if (!m_buses[i]->is_active()) {
+                m_buses[i]->activate(static_cast<uint32_t>(i + 1), name);
+                recompute_bus_order();
+                return m_buses[i].get();
+            }
+        }
+        return nullptr; // Preallocated capacity reached
+    }
+
+    // Backwards-compatible aliases
     Track* add_track(const std::string& name) {
-        uint32_t new_id = static_cast<uint32_t>(m_tracks.size() + 1);
-        m_tracks.push_back(std::make_unique<Track>(new_id, name, m_buffer_frames));
-        return m_tracks.back().get();
+        return allocate_track(name);
     }
 
     AudioBus* add_submix_bus(const std::string& name) {
-        uint32_t new_id = static_cast<uint32_t>(m_buses.size() + 1);
-        m_buses.push_back(std::make_unique<AudioBus>(new_id, name, m_buffer_frames));
-        return m_buses.back().get();
+        return allocate_submix_bus(name);
+    }
+
+    void release_track(uint32_t id) noexcept {
+        if (id >= 1 && id <= kMaxTracks) {
+            m_tracks[id - 1]->deactivate();
+        }
+    }
+
+    void release_bus(uint32_t id) noexcept {
+        if (id >= 1 && id <= kMaxBuses) {
+            m_buses[id - 1]->deactivate();
+            recompute_bus_order();
+        }
+    }
+
+    bool set_bus_target_bus(uint32_t bus_id, int32_t target_bus_id) noexcept {
+        if (bus_id < 1 || bus_id > kMaxBuses) return false;
+        if (target_bus_id == static_cast<int32_t>(bus_id)) return false; // Self-loop cycle
+
+        int32_t old_target = m_buses[bus_id - 1]->target_bus();
+        m_buses[bus_id - 1]->set_target_bus(target_bus_id);
+
+        if (!recompute_bus_order()) {
+            // Cycle detected! Rollback
+            m_buses[bus_id - 1]->set_target_bus(old_target);
+            recompute_bus_order();
+            return false;
+        }
+        return true;
+    }
+
+    bool recompute_bus_order() noexcept {
+        std::array<int, kMaxBuses> in_degree{};
+        std::array<bool, kMaxBuses> is_act{};
+        size_t active_count = 0;
+
+        for (size_t i = 0; i < kMaxBuses; ++i) {
+            is_act[i] = m_buses[i]->is_active();
+            if (is_act[i]) {
+                active_count++;
+            }
+        }
+
+        // Count in-degrees: if Bus i targets Bus j (1..16), Bus j has an incoming edge
+        for (size_t i = 0; i < kMaxBuses; ++i) {
+            if (!is_act[i]) continue;
+            int32_t tgt = m_buses[i]->target_bus();
+            if (tgt >= 1 && tgt <= static_cast<int32_t>(kMaxBuses)) {
+                size_t tgt_idx = static_cast<size_t>(tgt - 1);
+                if (is_act[tgt_idx]) {
+                    in_degree[tgt_idx]++;
+                }
+            }
+        }
+
+        // Kahn's algorithm: queue nodes with in_degree == 0
+        std::array<size_t, kMaxBuses> queue{};
+        size_t q_head = 0;
+        size_t q_tail = 0;
+
+        for (size_t i = 0; i < kMaxBuses; ++i) {
+            if (is_act[i] && in_degree[i] == 0) {
+                queue[q_tail++] = i;
+            }
+        }
+
+        std::array<size_t, kMaxBuses> order{};
+        size_t sorted_count = 0;
+
+        while (q_head < q_tail) {
+            size_t u = queue[q_head++];
+            order[sorted_count++] = u;
+
+            int32_t tgt = m_buses[u]->target_bus();
+            if (tgt >= 1 && tgt <= static_cast<int32_t>(kMaxBuses)) {
+                size_t tgt_idx = static_cast<size_t>(tgt - 1);
+                if (is_act[tgt_idx]) {
+                    if (--in_degree[tgt_idx] == 0) {
+                        queue[q_tail++] = tgt_idx;
+                    }
+                }
+            }
+        }
+
+        if (sorted_count != active_count) {
+            return false; // Cycle detected!
+        }
+
+        m_bus_render_order = order;
+        m_bus_render_order_count = sorted_count;
+        return true;
     }
 
     [[nodiscard]] Track* get_track(uint32_t id) noexcept {
-        for (auto& t : m_tracks) {
-            if (t->id() == id) return t.get();
+        if (id >= 1 && id <= kMaxTracks) {
+            auto* t = m_tracks[id - 1].get();
+            return t->is_active() ? t : nullptr;
         }
         return nullptr;
     }
 
     [[nodiscard]] AudioBus* get_bus(uint32_t id) noexcept {
-        for (auto& b : m_buses) {
-            if (b->id() == id) return b.get();
+        if (id >= 1 && id <= kMaxBuses) {
+            auto* b = m_buses[id - 1].get();
+            return b->is_active() ? b : nullptr;
         }
         return nullptr;
     }
 
     [[nodiscard]] AudioBus& master_bus() noexcept { return m_master_bus; }
     [[nodiscard]] const AudioBus& master_bus() const noexcept { return m_master_bus; }
-    [[nodiscard]] size_t track_count() const noexcept { return m_tracks.size(); }
-    [[nodiscard]] size_t bus_count() const noexcept { return m_buses.size(); }
+
+    [[nodiscard]] size_t track_count() const noexcept {
+        size_t count = 0;
+        for (const auto& t : m_tracks) {
+            if (t && t->is_active()) ++count;
+        }
+        return count;
+    }
+
+    [[nodiscard]] size_t bus_count() const noexcept {
+        size_t count = 0;
+        for (const auto& b : m_buses) {
+            if (b && b->is_active()) ++count;
+        }
+        return count;
+    }
 
     // Constant-power panning law
     static inline std::pair<float, float> calculate_pan_gains(float pan) noexcept {
@@ -284,15 +523,18 @@ public:
     // Lock-free telemetry capture: UI copies 60Hz state snapshot without blocking audio thread
     void capture_telemetry_snapshot(protocol::MixerTelemetryFrame& out_frame) const noexcept {
         out_frame.render_cycle = m_render_cycle.load(std::memory_order_relaxed);
-        out_frame.active_tracks = static_cast<uint32_t>(std::min(m_tracks.size(), protocol::kMaxTelemetryTracks));
-        out_frame.active_buses = static_cast<uint32_t>(m_buses.size());
+        out_frame.active_tracks = static_cast<uint32_t>(track_count());
+        out_frame.active_buses = static_cast<uint32_t>(bus_count());
 
         auto mm = m_master_bus.meter();
         out_frame.master_meter = {mm.peak_l, mm.peak_r, mm.rms_l, mm.rms_r};
 
-        for (size_t i = 0; i < out_frame.active_tracks; ++i) {
-            auto tm = m_tracks[i]->meter();
-            out_frame.track_meters[i] = {tm.peak_l, tm.peak_r, tm.rms_l, tm.rms_r};
+        size_t active_idx = 0;
+        for (size_t i = 0; i < kMaxTracks && active_idx < protocol::kMaxTelemetryTracks; ++i) {
+            if (m_tracks[i]->is_active()) {
+                auto tm = m_tracks[i]->meter();
+                out_frame.track_meters[active_idx++] = {tm.peak_l, tm.peak_r, tm.rms_l, tm.rms_r};
+            }
         }
     }
 
@@ -304,29 +546,34 @@ public:
         drain_commands();
         m_render_cycle.fetch_add(1, std::memory_order_relaxed);
 
-        // 1. Clear Master and Submix Buses
+        // 1. Clear Master and Active Submix Buses
         m_master_bus.clear();
         for (auto& bus : m_buses) {
-            bus->clear();
+            if (bus->is_active()) {
+                bus->clear();
+            }
         }
 
-        // 2. Evaluate Solo state
+        // 2. Evaluate Solo state across active tracks
         bool any_solo = false;
         for (const auto& track : m_tracks) {
-            if (track->is_solo()) {
+            if (track->is_active() && track->is_solo()) {
                 any_solo = true;
                 break;
             }
         }
 
-        // 3. Process each Track and Route/Accumulate
+        // 3. Process each Active Track and Route/Accumulate
         for (auto& track : m_tracks) {
+            if (!track->is_active()) {
+                continue;
+            }
             if (track->is_muted() || (any_solo && !track->is_solo())) {
                 track->reset_meters();
                 continue;
             }
 
-            // In-line Channel Strip processing
+            // In-line Channel Strip processing (Inserts + Console)
             track->process_channel_strip(frames);
 
             const float gain = track->gain();
@@ -352,8 +599,9 @@ public:
 
             // Auxiliary Sends (e.g. Reverb / Delay Busses)
             for (const auto& send : track->sends()) {
+                if (!send.active || send.amount <= 0.0f) continue;
                 AudioBus* send_bus = get_bus(send.bus_id);
-                if (send_bus && send.amount > 0.0f) {
+                if (send_bus) {
                     Sample* s_l = send_bus->buffer().view().channel(0);
                     Sample* s_r = send_bus->buffer().view().channel(1);
                     float s_gain = send.pre_fader ? send.amount : (gain * send.amount);
@@ -365,24 +613,35 @@ public:
             }
         }
 
-        // 4. Process Submix Buses and Accumulate into Master
-        for (auto& bus : m_buses) {
+        // 4. Process Active Submix Buses in Topological DAG Order
+        for (size_t k = 0; k < m_bus_render_order_count; ++k) {
+            size_t idx = m_bus_render_order[k];
+            auto& bus = m_buses[idx];
+            if (!bus->is_active()) {
+                continue;
+            }
             bus->process_buss_strip(frames);
 
             const float bus_gain = bus->gain();
             const Sample* b_l = bus->buffer().view().channel(0);
             const Sample* b_r = bus->buffer().view().channel(1);
 
-            Sample* m_l = m_master_bus.buffer().view().channel(0);
-            Sample* m_r = m_master_bus.buffer().view().channel(1);
+            int32_t tgt_id = bus->target_bus();
+            AudioBus* target = (tgt_id >= 1 && tgt_id <= static_cast<int32_t>(kMaxBuses))
+                               ? get_bus(static_cast<uint32_t>(tgt_id))
+                               : &m_master_bus;
+            if (!target) target = &m_master_bus;
+
+            Sample* dst_l = target->buffer().view().channel(0);
+            Sample* dst_r = target->buffer().view().channel(1);
 
             for (uint32_t i = 0; i < frames; ++i) {
-                m_l[i] += b_l[i] * bus_gain;
-                m_r[i] += b_r[i] * bus_gain;
+                dst_l[i] += b_l[i] * bus_gain;
+                dst_r[i] += b_r[i] * bus_gain;
             }
         }
 
-        // 5. Process Master Bus Strip (Console Decode + Final Peak Safety)
+        // 5. Process Master Bus Strip (Console Decode + Master Inserts + Peak Safety)
         m_master_bus.process_buss_strip(frames);
 
         const float master_gain = m_master_bus.gain();
@@ -472,6 +731,10 @@ public:
                 }
                 break;
             }
+            case protocol::MixerCommandType::SetBusTargetBus: {
+                set_bus_target_bus(cmd.target_id, static_cast<int32_t>(cmd.secondary_id));
+                break;
+            }
             case protocol::MixerCommandType::SetBusConsoleType: {
                 if (auto* bus = get_bus(cmd.target_id)) {
                     bus->set_console_type(static_cast<dsp::ConsoleType>(cmd.flags));
@@ -486,9 +749,43 @@ public:
                 set_master_limiter_enabled((cmd.flags & 1) != 0);
                 break;
             }
+            case protocol::MixerCommandType::SetTrackSlotBypass: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    if (cmd.secondary_id < kMaxTrackInsertSlots) {
+                        trk->slot(cmd.secondary_id).set_bypass((cmd.flags & 1) != 0);
+                    }
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackSlotParam: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    if (cmd.secondary_id < kMaxTrackInsertSlots) {
+                        if (auto* proc = trk->slot(cmd.secondary_id).processor()) {
+                            proc->set_parameter(cmd.flags, cmd.value1);
+                        }
+                    }
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusSlotBypass: {
+                AudioBus* bus = (cmd.target_id == 0) ? &m_master_bus : get_bus(cmd.target_id);
+                if (bus && cmd.secondary_id < kMaxBusInsertSlots) {
+                    bus->slot(cmd.secondary_id).set_bypass((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetBusSlotParam: {
+                AudioBus* bus = (cmd.target_id == 0) ? &m_master_bus : get_bus(cmd.target_id);
+                if (bus && cmd.secondary_id < kMaxBusInsertSlots) {
+                    if (auto* proc = bus->slot(cmd.secondary_id).processor()) {
+                        proc->set_parameter(cmd.flags, cmd.value1);
+                    }
+                }
+                break;
+            }
             case protocol::MixerCommandType::ResetMeters: {
                 for (auto& trk : m_tracks) {
-                    trk->reset_meters();
+                    if (trk->is_active()) trk->reset_meters();
                 }
                 break;
             }
@@ -502,9 +799,12 @@ private:
     std::atomic<uint64_t> m_render_cycle{0};
     std::atomic<bool> m_limiter_enabled{true};
     RingBuffer<protocol::MixerCommand> m_command_queue{512};
-    std::vector<std::unique_ptr<Track>> m_tracks;
-    std::vector<std::unique_ptr<AudioBus>> m_buses;
+    std::array<std::unique_ptr<Track>, kMaxTracks> m_tracks;
+    std::array<std::unique_ptr<AudioBus>, kMaxBuses> m_buses;
     AudioBus m_master_bus;
+
+    std::array<size_t, kMaxBuses> m_bus_render_order{};
+    size_t m_bus_render_order_count{0};
 };
 
 } // namespace audio_core
