@@ -1480,6 +1480,82 @@ void test_airwindows_interstage_processor() {
     std::cout << "  -> Airwindows Interstage: PASSED (Analog transformer coupling, slew-rate limiting, and Nyquist softening verified)" << std::endl;
 }
 
+void test_clock_synchronized_quantized_tap_and_bar_looping() {
+    std::cout << "[TEST] Running Clock-Synchronized Quantized Tap & Bar-Looping Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    MixerGraph mixer(256);
+    mixer.clock().set_bpm(120.0); // 48000 Hz, 120 BPM: 24000 samples/beat, 96000 samples/bar
+    mixer.clock().set_playing(true);
+
+    // Position clock at sample 48000 (middle of bar 0, beat 2.0)
+    mixer.clock().set_sample_position(48000);
+
+    // Allocate Track 1 with test audio
+    Track* trk = mixer.add_track("SynthTrack");
+    TEST_CHECK(trk != nullptr);
+
+    // Configure Tap 0 on MasterOutput
+    SampleTap* tap = mixer.tap(0);
+    TEST_CHECK(tap != nullptr);
+    tap->set_source(TapSourceType::MasterOutput, 0);
+
+    // Arm 1-bar quantized bounce (BarSync mode)
+    tap->arm_bar_bounce(mixer.clock(), 1, "QuantizedBar1", true);
+
+    TEST_CHECK(tap->record_state() == RecordState::Armed);
+    TEST_CHECK(tap->sync_mode() == QuantizeSyncMode::BarSync);
+
+    constexpr uint32_t kBlockFrames = 256;
+    AudioBuffer out_master(2, kBlockFrames);
+    auto master_view = out_master.view();
+
+    // 1. Render blocks before the downbeat (from 48000 up to 95744)
+    // 47744 samples / 256 = 186.5 blocks
+    for (int i = 0; i < 186; ++i) {
+        mixer.render(master_view);
+    }
+
+    // Verify tap is STILL Armed and has NOT recorded anything yet (waiting for bar 1.0 downbeat)
+    TEST_CHECK(tap->record_state() == RecordState::Armed);
+    TEST_CHECK(tap->get_quantized_clip() == nullptr);
+
+    // 2. Render the block that crosses sample 96000 (downbeat of bar 1)
+    // Current sample_pos: 48000 + 186 * 256 = 95616
+    // Next block: 95616 .. 95872
+    mixer.render(master_view);
+    // Next block: 95872 .. 96128 (crosses 96000 at sample offset 96000 - 95872 = 128!)
+    mixer.render(master_view);
+
+    // Tap MUST have triggered on the sub-block downbeat and transitioned to Recording!
+    TEST_CHECK(tap->record_state() == RecordState::Recording);
+
+    // 3. Render remaining blocks to capture the full 96000 frames of bar 1
+    // Total frames needed: 96000.
+    while (tap->record_state() == RecordState::Recording) {
+        mixer.render(master_view);
+    }
+
+    // Verify recording is Complete!
+    TEST_CHECK(tap->record_state() == RecordState::Complete);
+
+    // 4. Retrieve the conditioned clip
+    auto clip = tap->get_quantized_clip();
+    TEST_CHECK(clip != nullptr);
+    TEST_CHECK(clip->num_frames() == 96000); // Exactly 1 musical bar!
+    TEST_CHECK(clip->num_channels() == 2);
+
+    // 5. Verify Resampling loop handoff: Assign clip to Track 2 and verify loop playback
+    Track* trk2 = mixer.add_track("LoopedBounceTrack");
+    TEST_CHECK(trk2 != nullptr);
+    trk2->set_clip(clip, true); // Looped playback
+
+    TEST_CHECK(trk2->is_active());
+
+    std::cout << "  -> Clock-Synchronized Quantized Tap: PASSED (Bar-aligned arming, sub-block downbeat trigger, 96000 frames captured & looped)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1504,6 +1580,7 @@ int main() {
     test_seamless_loop_equal_power_conditioning();
     test_insert_slot_safety_hardening_and_circuit_breaker();
     test_airwindows_interstage_processor();
+    test_clock_synchronized_quantized_tap_and_bar_looping();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

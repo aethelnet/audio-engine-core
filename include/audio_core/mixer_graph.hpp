@@ -657,7 +657,7 @@ public:
                 if (tap && tap->is_active()) {
                     auto src = tap->source();
                     if (src.type == sampling::TapSourceType::TrackInput && src.source_id == track->id()) {
-                        tap->record(raw_l, raw_r, frames);
+                        tap->record(raw_l, raw_r, frames, &boundary_events);
                     }
                 }
             }
@@ -673,7 +673,7 @@ public:
                 if (tap && tap->is_active()) {
                     auto src = tap->source();
                     if (src.type == sampling::TapSourceType::TrackOutput && src.source_id == track->id()) {
-                        tap->record(trk_l, trk_r, frames);
+                        tap->record(trk_l, trk_r, frames, &boundary_events);
                     }
                 }
             }
@@ -730,7 +730,7 @@ public:
                 if (tap && tap->is_active()) {
                     auto src = tap->source();
                     if (src.type == sampling::TapSourceType::BusOutput && src.source_id == bus->id()) {
-                        tap->record(b_l, b_r, frames);
+                        tap->record(b_l, b_r, frames, &boundary_events);
                     }
                 }
             }
@@ -762,7 +762,7 @@ public:
             if (tap && tap->is_active()) {
                 auto src = tap->source();
                 if (src.type == sampling::TapSourceType::MasterOutput) {
-                    tap->record(final_l, final_r, frames);
+                    tap->record(final_l, final_r, frames, &boundary_events);
                 }
             }
         }

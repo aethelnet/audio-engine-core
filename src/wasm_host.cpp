@@ -83,6 +83,8 @@ bool WasmDspPlugin::load_from_memory(std::span<const uint8_t> wasm_bytes) {
         std::cerr << "[WasmHost] Failed to allocate WASM runtime" << std::endl;
         return false;
     }
+    // Arm runtime for gas metering before compiling module
+    m3_SetGasLimit(m_impl->runtime, 10000000.0);
 
     M3Result res = m3_ParseModule(m_impl->env, &m_impl->module, m_impl->wasm_bytecode.data(), static_cast<uint32_t>(m_impl->wasm_bytecode.size()));
     if (res) {
@@ -172,8 +174,18 @@ void WasmDspPlugin::process_stereo(const Sample* in_left, const Sample* in_right
     std::memcpy(wasm_in, in_left, frames * sizeof(Sample));
     std::memcpy(wasm_in + kMaxPluginFrames, in_right, frames * sizeof(Sample));
 
-    // Execute sandboxed DSP
-    m3_CallV(m_impl->fn_process, frames);
+    // Arm gas limit watchdog: budget 25,000 gas units per frame to prevent infinite loops / freezes
+    m3_SetGasLimit(m_impl->runtime, static_cast<double>(frames) * 25000.0);
+
+    // Execute sandboxed DSP with gas watchdog
+    M3Result res = m3_CallV(m_impl->fn_process, frames);
+    if (res != m3Err_none) {
+        // Trap occurred (e.g. trapOutOfGas from while(true), memory fault, div-by-zero)
+        // Fail-safe: zero out output to protect downstream signal path
+        std::memset(out_left, 0, frames * sizeof(Sample));
+        std::memset(out_right, 0, frames * sizeof(Sample));
+        return;
+    }
 
     // Copy processed samples back
     std::memcpy(out_left, wasm_out, frames * sizeof(Sample));
