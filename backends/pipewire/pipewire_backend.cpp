@@ -78,7 +78,7 @@ struct PipeWireBackend::Impl {
         }
 
         // 2. Execute Real-Time Channel Strips, Inserts, DAG Submixes & Master Summing
-        auto master_view = self->master_buffer.view();
+        auto master_view = self->master_buffer.view_frames(n_samples);
         self->mixer.render(master_view);
 
         // 3. Push Master Output to PipeWire Master Out Ports
