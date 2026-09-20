@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_core/types.hpp"
+#include "audio_core/insert_slot.hpp"
 #include "audio_core/dsp/crossover.hpp"
 #include "audio_core/dsp/liquid_ode.hpp"
 #include <cmath>
@@ -85,6 +86,7 @@ public:
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
         update_all_ballistics();
     }
+    [[nodiscard]] uint32_t num_heads() const noexcept { return m_num_heads; }
 
     void set_lookahead_frames(uint32_t frames) noexcept {
         m_lookahead_frames = std::clamp(frames, 0u, static_cast<uint32_t>(kMaxLookahead - 1));
@@ -323,6 +325,71 @@ private:
     std::array<std::array<float, kMaxLookahead>, kMaxHeads> m_delay_ring_l{};
     std::array<std::array<float, kMaxLookahead>, kMaxHeads> m_delay_ring_r{};
     size_t m_delay_pos{0};
+};
+
+// ============================================================================
+// MultiHeadOdeProcessor: IProcessor Adapter for Channel Strip / Master Inserts
+// ============================================================================
+class MultiHeadOdeProcessor : public IProcessor {
+public:
+    explicit MultiHeadOdeProcessor(uint32_t sample_rate = 48000, uint32_t num_heads = 4)
+        : m_comp(sample_rate, num_heads) {}
+
+    void init(uint32_t sample_rate) noexcept override {
+        m_comp.set_sample_rate(sample_rate);
+        m_comp.reset();
+    }
+
+    void reset() noexcept override {
+        m_comp.reset();
+    }
+
+    void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
+        m_comp.process_stereo(left, right, frames);
+    }
+
+    void set_parameter(uint32_t index, float value) noexcept override {
+        uint32_t head = index / 6;
+        uint32_t param = index % 6;
+        if (head >= m_comp.num_heads()) return;
+        auto p = m_comp.head_parameters(head);
+        switch (param) {
+            case 0: p.threshold_db = value; break;
+            case 1: p.ratio = value; break;
+            case 2: p.attack_ms = value; break;
+            case 3: p.release_ms = value; break;
+            case 4: p.makeup_gain_db = value; break;
+            case 5: p.mix = value; break;
+            default: break;
+        }
+        m_comp.set_head_parameters(head, p);
+    }
+
+    [[nodiscard]] float get_parameter(uint32_t index) const noexcept override {
+        uint32_t head = index / 6;
+        uint32_t param = index % 6;
+        if (head >= m_comp.num_heads()) return 0.0f;
+        const auto& p = m_comp.head_parameters(head);
+        switch (param) {
+            case 0: return p.threshold_db;
+            case 1: return p.ratio;
+            case 2: return p.attack_ms;
+            case 3: return p.release_ms;
+            case 4: return p.makeup_gain_db;
+            case 5: return p.mix;
+            default: return 0.0f;
+        }
+    }
+
+    [[nodiscard]] const char* name() const noexcept override {
+        return "MultiHeadOdeCompressor";
+    }
+
+    [[nodiscard]] MultiHeadOdeCompressor& compressor() noexcept { return m_comp; }
+    [[nodiscard]] const MultiHeadOdeCompressor& compressor() const noexcept { return m_comp; }
+
+private:
+    MultiHeadOdeCompressor m_comp;
 };
 
 } // namespace audio_core::dsp

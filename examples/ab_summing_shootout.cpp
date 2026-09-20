@@ -1,5 +1,6 @@
 #include "audio_core/dsp/liquid_ode.hpp"
 #include "audio_core/dsp/console_processor.hpp"
+#include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -316,12 +317,51 @@ int main() {
         diff_r[i] = (liquid_r[i] - linear_r[i]) * 4.0f;
     }
 
-    // Save all 4 files
+    // --- Version E: Multi-Head ODE Compressor (Mastered Bus) ---
+    std::cout << "[5/5] Rendering Version 5: Multi-Head ODE Compressor (Linkwitz-Riley LR4 + Lookahead)..." << std::endl;
+    std::vector<float> multihead_l = liquid_l;
+    std::vector<float> multihead_r = liquid_r;
+    audio_core::dsp::MultiHeadOdeCompressor multihead_comp(sample_rate, 4);
+    multihead_comp.set_crossover_mode(audio_core::dsp::MultibandCrossoverMode::LinkwitzRileyPhaseCompensated);
+    multihead_comp.set_lookahead_frames(32); // 32 samples = 0.667 ms @ 48kHz
+
+    // Head 0: Sub Bass (<120Hz) - Solid punch, controlled sub excursion
+    multihead_comp.head_parameters(0).threshold_db = -12.0f;
+    multihead_comp.head_parameters(0).ratio = 3.5f;
+    multihead_comp.head_parameters(0).attack_ms = 25.0f;
+    multihead_comp.head_parameters(0).release_ms = 140.0f;
+    multihead_comp.head_parameters(0).makeup_gain_db = 0.5f;
+
+    // Head 1: Low-Mid (120-1.2k) - Snare body and bass fundamental tightness
+    multihead_comp.head_parameters(1).threshold_db = -14.0f;
+    multihead_comp.head_parameters(1).ratio = 2.5f;
+    multihead_comp.head_parameters(1).attack_ms = 15.0f;
+    multihead_comp.head_parameters(1).release_ms = 100.0f;
+    multihead_comp.head_parameters(1).makeup_gain_db = 0.3f;
+
+    // Head 2: High-Mid (1.2k-6k) - Stick click, transient clarity, no harshness
+    multihead_comp.head_parameters(2).threshold_db = -16.0f;
+    multihead_comp.head_parameters(2).ratio = 3.0f;
+    multihead_comp.head_parameters(2).attack_ms = 8.0f;
+    multihead_comp.head_parameters(2).release_ms = 70.0f;
+    multihead_comp.head_parameters(2).makeup_gain_db = 0.4f;
+
+    // Head 3: Air (>6k) - Silky cymbal shimmer and breath
+    multihead_comp.head_parameters(3).threshold_db = -18.0f;
+    multihead_comp.head_parameters(3).ratio = 4.0f;
+    multihead_comp.head_parameters(3).attack_ms = 3.0f;
+    multihead_comp.head_parameters(3).release_ms = 50.0f;
+    multihead_comp.head_parameters(3).makeup_gain_db = 0.6f;
+
+    multihead_comp.process_stereo(multihead_l.data(), multihead_r.data(), total_frames);
+
+    // Save all files
     const std::string out_dir = "renders/";
     write_wav_24bit(out_dir + "sum_01_linear_digital.wav", linear_l.data(), linear_r.data(), total_frames, sample_rate);
     write_wav_24bit(out_dir + "sum_02_airwindows_console.wav", airwin_l.data(), airwin_r.data(), total_frames, sample_rate);
     write_wav_24bit(out_dir + "sum_03_liquid_bus_glue.wav", liquid_l.data(), liquid_r.data(), total_frames, sample_rate);
     write_wav_24bit(out_dir + "sum_04_difference_delta_glue.wav", diff_l.data(), diff_r.data(), total_frames, sample_rate);
+    write_wav_24bit(out_dir + "sum_05_multihead_ode_mastered.wav", multihead_l.data(), multihead_r.data(), total_frames, sample_rate);
 
     // Measure statistics
     auto get_stats = [](const std::vector<float>& l, const std::vector<float>& r) {
@@ -345,23 +385,27 @@ int main() {
     auto [lin_peak, lin_rms, lin_crest] = get_stats(linear_l, linear_r);
     auto [aw_peak, aw_rms, aw_crest] = get_stats(airwin_l, airwin_r);
     auto [liq_peak, liq_rms, liq_crest] = get_stats(liquid_l, liquid_r);
+    auto [mho_peak, mho_rms, mho_crest] = get_stats(multihead_l, multihead_r);
 
     std::cout << "\n=========================================================" << std::endl;
     std::cout << "                  SHOOTOUT TELEMETRY                     " << std::endl;
     std::cout << "=========================================================" << std::endl;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  1. Linear Digital:     Peak = " << lin_peak << " dBFS | RMS = " << lin_rms << " dBFS | Crest = " << lin_crest << " dB" << std::endl;
-    std::cout << "  2. Airwindows Console: Peak = " << aw_peak << " dBFS | RMS = " << aw_rms << " dBFS | Crest = " << aw_crest << " dB" << std::endl;
-    std::cout << "  3. Liquid Bus Glue:    Peak = " << liq_peak << " dBFS | RMS = " << liq_rms << " dBFS | Crest = " << liq_crest << " dB" << std::endl;
+    std::cout << "  1. Linear Digital:       Peak = " << lin_peak << " dBFS | RMS = " << lin_rms << " dBFS | Crest = " << lin_crest << " dB" << std::endl;
+    std::cout << "  2. Airwindows Console:   Peak = " << aw_peak << " dBFS | RMS = " << aw_rms << " dBFS | Crest = " << aw_crest << " dB" << std::endl;
+    std::cout << "  3. Liquid Bus Glue:      Peak = " << liq_peak << " dBFS | RMS = " << liq_rms << " dBFS | Crest = " << liq_crest << " dB" << std::endl;
+    std::cout << "  4. MultiHead ODE Master: Peak = " << mho_peak << " dBFS | RMS = " << mho_rms << " dBFS | Crest = " << mho_crest << " dB" << std::endl;
     std::cout << "---------------------------------------------------------" << std::endl;
-    std::cout << "  -> Peak Taming (Liquid vs Linear): " << (lin_peak - liq_peak) << " dB of natural transient rounding" << std::endl;
-    std::cout << "  -> Density/RMS Preservation:       " << (liq_rms - lin_rms) << " dB change in overall loudness" << std::endl;
+    std::cout << "  -> Peak Taming (Liquid vs Linear):    " << (lin_peak - liq_peak) << " dB of natural transient rounding" << std::endl;
+    std::cout << "  -> MultiHead Density Boost (RMS):    +" << (mho_rms - lin_rms) << " dB RMS energy increase" << std::endl;
+    std::cout << "  -> MultiHead Crest Factor Control:    " << lin_crest << " dB -> " << mho_crest << " dB" << std::endl;
     std::cout << "=========================================================" << std::endl;
     std::cout << "\n[Audio Files Successfully Written to renders/]:" << std::endl;
     std::cout << "  -> renders/sum_01_linear_digital.wav" << std::endl;
     std::cout << "  -> renders/sum_02_airwindows_console.wav" << std::endl;
     std::cout << "  -> renders/sum_03_liquid_bus_glue.wav" << std::endl;
     std::cout << "  -> renders/sum_04_difference_delta_glue.wav" << std::endl;
+    std::cout << "  -> renders/sum_05_multihead_ode_mastered.wav" << std::endl;
     std::cout << "=========================================================" << std::endl;
 
     return 0;
