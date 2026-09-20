@@ -30,27 +30,40 @@ add_library(wasm3_core STATIC ${WASM3_SOURCES})
 target_include_directories(wasm3_core PUBLIC third_party/wasm3/source)
 target_compile_options(wasm3_core PRIVATE -w) # Suppress warnings in vendored C library
 
+# PipeWire Integration
+set(PIPEWIRE_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2
+)
+set(PIPEWIRE_LIB
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/lib64/libpipewire-0.3.so
+)
+
 # Core Audio Engine Library
 add_library(audio_core STATIC
     src/engine.cpp
     src/wasm_host.cpp
     backends/desktop/desktop_backend.cpp
+    backends/pipewire/pipewire_backend.cpp
 )
 
 target_include_directories(audio_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2>
     $<INSTALL_INTERFACE:include>
 )
 
 find_package(Threads REQUIRED)
 
-# Dependencies (threads, math, dl, wasm3)
+# Dependencies (threads, math, dl, wasm3, pipewire)
 target_link_libraries(audio_core PUBLIC
     wasm3_core
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${PIPEWIRE_LIB}
     m
 )
 

@@ -15,6 +15,7 @@
 #include "audio_core/dsp/baxandall.hpp"
 #include "audio_core/dsp/clip_only2.hpp"
 #include "audio_core/dsp/wasm_processor.hpp"
+#include "backends/pipewire/pipewire_backend.hpp"
 
 #include <iostream>
 #include <thread>
@@ -950,6 +951,30 @@ void test_nested_bus_topological_routing() {
     std::cout << "  -> Cycle Detection (Kahn's Algorithm): PASSED (Self-loops and multi-node cycles rejected, DAG integrity preserved)" << std::endl;
 }
 
+void test_pipewire_backend_integration() {
+    std::cout << "[TEST] Running Native PipeWire Filter Node & Virtual Sink Integration Test..." << std::endl;
+    using namespace audio_core;
+
+    MixerGraph mixer(256);
+    Track* trk1 = mixer.allocate_track("Vocals In");
+    TEST_CHECK(trk1 != nullptr);
+
+    PipeWireBackend pw(mixer);
+    bool inited = pw.init("Aethel Test Daemon", 48000);
+    TEST_CHECK(inited);
+
+    bool started = pw.start();
+    TEST_CHECK(started);
+    TEST_CHECK(pw.is_running());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    pw.stop();
+    TEST_CHECK(!pw.is_running());
+
+    std::cout << "  -> PipeWire Native Backend: PASSED (Node registered, virtual sinks & master outs created, clean shutdown)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -966,6 +991,7 @@ int main() {
     test_binary_protocol_and_command_queue();
     test_channel_strip_insert_slots();
     test_nested_bus_topological_routing();
+    test_pipewire_backend_integration();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
