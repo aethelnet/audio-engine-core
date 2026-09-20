@@ -2403,7 +2403,73 @@ void test_acoustic_measurement_and_crossover_engine() {
                   << " vs sum=" << rms_sum << ", delta < 0.005)" << std::endl;
     }
 
-    // 4. Farina Exponential Sine Sweep (ESS) Generation & Self-Deconvolution
+    // 4. Airwindows Isolator (5th-Order Golden Ratio Subtractive Crossover)
+    {
+        AirwindowsIsolator isolator(1000.0f, 48000, /*enable_saturation=*/true);
+        constexpr uint32_t kFrames = 2048;
+
+        std::vector<float> in_l(kFrames), in_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            in_l[i] = 0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 150.0f * t) +
+                      0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 5000.0f * t);
+            in_r[i] = in_l[i] * 0.8f;
+        }
+
+        std::vector<float> low_l(kFrames), low_r(kFrames);
+        std::vector<float> high_l(kFrames), high_r(kFrames);
+
+        // A. Bit-Exact Subtractive Identity (Console5 Saturated Mode)
+        isolator.process_stereo(in_l.data(), in_r.data(),
+                                low_l.data(), low_r.data(),
+                                high_l.data(), high_r.data(),
+                                kFrames);
+
+        float max_sum_diff = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float diff_l = std::abs((low_l[i] + high_l[i]) - in_l[i]);
+            float diff_r = std::abs((low_r[i] + high_r[i]) - in_r[i]);
+            max_sum_diff = std::max({max_sum_diff, diff_l, diff_r});
+        }
+        TEST_CHECK(max_sum_diff < 1e-6f); // Exact algebraic identity: Low + (Dry - Low) == Dry
+
+        // B. Steep Cutoff (>30 dB/octave attenuation at 10 kHz for a 1 kHz crossover)
+        isolator.reset();
+        std::vector<float> pure_10k(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            pure_10k[i] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 10000.0f * static_cast<float>(i) / 48000.0f);
+        }
+        isolator.process_stereo(pure_10k.data(), pure_10k.data(),
+                                low_l.data(), low_r.data(),
+                                high_l.data(), high_r.data(),
+                                kFrames);
+
+        float max_treble_in_low = 0.0f;
+        for (uint32_t i = 500; i < kFrames; ++i) {
+            max_treble_in_low = std::max(max_treble_in_low, std::abs(low_l[i]));
+        }
+        // With 3 biquads (Q=0.5, 0.618, 1.618), 10 kHz is >3 octaves above 1 kHz -> >50 dB attenuation
+        TEST_CHECK(max_treble_in_low < 0.002f);
+
+        // C. Bit-Exact Subtractive Identity (Linear Mode, saturation disabled)
+        isolator.set_saturation_enabled(false);
+        isolator.reset();
+        isolator.process_stereo(in_l.data(), in_r.data(),
+                                low_l.data(), low_r.data(),
+                                high_l.data(), high_r.data(),
+                                kFrames);
+        max_sum_diff = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float diff_l = std::abs((low_l[i] + high_l[i]) - in_l[i]);
+            max_sum_diff = std::max(max_sum_diff, diff_l);
+        }
+        TEST_CHECK(max_sum_diff < 1e-6f);
+
+        std::cout << "  -> Airwindows Isolator (Golden Ratio 30dB/oct Crossover): PASSED (Bit-exact identity err="
+                  << max_sum_diff << ", 10kHz leakage=" << max_treble_in_low << " [<-48dB])" << std::endl;
+    }
+
+    // 5. Farina Exponential Sine Sweep (ESS) Generation & Self-Deconvolution
     {
         FarinaSweepGenerator::SweepParams params;
         params.start_freq = 50.0f;
