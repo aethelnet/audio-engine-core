@@ -78,3 +78,9 @@ add_executable(cli_synth
     examples/cli_synth.cpp
 )
 target_link_libraries(cli_synth PRIVATE audio_core)
+
+# Standalone PipeWire Desk Daemon
+add_executable(pipewire_desk_daemon
+    examples/pipewire_desk_daemon.cpp
+)
+target_link_libraries(pipewire_desk_daemon PRIVATE audio_core)
