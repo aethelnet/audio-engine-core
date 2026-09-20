@@ -5,6 +5,7 @@
 #include "audio_core/audio_graph.hpp"
 #include "audio_core/wasm_host.hpp"
 #include "audio_core/dsp/console_processor.hpp"
+#include "audio_core/mixer_graph.hpp"
 
 #include <iostream>
 #include <thread>
@@ -364,6 +365,214 @@ void test_airwindows_console_processor() {
     TEST_CHECK(duration_ms < 100.0); // Must easily achieve > 10M frames/s
 }
 
+void test_mixer_graph_routing() {
+    std::cout << "[TEST] Running MixerGraph Routing, Panning, Mute/Solo & Bus Summing Test..." << std::endl;
+
+    using namespace audio_core;
+
+    // 1. Verify Constant-Power Pan Law
+    {
+        auto [l_hard_left, r_hard_left] = MixerGraph::calculate_pan_gains(-1.0f);
+        TEST_CHECK(std::abs(l_hard_left - 1.0f) < 1e-5f);
+        TEST_CHECK(std::abs(r_hard_left - 0.0f) < 1e-5f);
+
+        auto [l_hard_right, r_hard_right] = MixerGraph::calculate_pan_gains(1.0f);
+        TEST_CHECK(std::abs(l_hard_right - 0.0f) < 1e-5f);
+        TEST_CHECK(std::abs(r_hard_right - 1.0f) < 1e-5f);
+
+        auto [l_center, r_center] = MixerGraph::calculate_pan_gains(0.0f);
+        TEST_CHECK(std::abs(l_center - r_center) < 1e-5f);
+        TEST_CHECK(std::abs(l_center - 0.70710678f) < 1e-4f);
+
+        // Constant power property: cos^2 + sin^2 == 1 across arbitrary angles
+        for (float p = -1.0f; p <= 1.0f; p += 0.1f) {
+            auto [gl, gr] = MixerGraph::calculate_pan_gains(p);
+            float power = gl * gl + gr * gr;
+            TEST_CHECK(std::abs(power - 1.0f) < 1e-4f);
+        }
+        std::cout << "  -> Pan Law: 100% verified (Constant-power AES standard: L^2 + R^2 == 1.0)" << std::endl;
+    }
+
+    constexpr uint32_t kFrames = 256;
+
+    // 2. Test Channel Isolation with Panning
+    {
+        MixerGraph mixer(kFrames);
+        Track* trk = mixer.add_track("Synth Lead");
+        TEST_CHECK(trk != nullptr);
+        TEST_CHECK(trk->id() == 1);
+
+        // Populate track buffer with constant 0.4f
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 0.4f;
+            trk->buffer().channel(1)[i] = 0.4f;
+        }
+
+        // Hard Left Pan
+        trk->set_pan(-1.0f);
+        AudioBuffer master_out(2, kFrames);
+        auto master_view = master_out.view();
+        mixer.render(master_view);
+
+        // Verify: Left has signal, Right is strictly zero
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(master_view.channel(0)[i] > 0.35f);
+            TEST_CHECK(std::abs(master_view.channel(1)[i]) < 1e-5f);
+        }
+
+        // Hard Right Pan
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 0.4f;
+            trk->buffer().channel(1)[i] = 0.4f;
+        }
+        trk->set_pan(1.0f);
+        mixer.render(master_view);
+
+        // Verify: Left is strictly zero, Right has signal
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(std::abs(master_view.channel(0)[i]) < 1e-5f);
+            TEST_CHECK(master_view.channel(1)[i] > 0.35f);
+        }
+        std::cout << "  -> Pan Isolation: PASSED (Hard-left and Hard-right cleanly isolate channels)" << std::endl;
+    }
+
+    // 3. Test Mute & Solo Logic
+    {
+        MixerGraph mixer(kFrames);
+        Track* trk1 = mixer.add_track("Kick");
+        Track* trk2 = mixer.add_track("Snare");
+
+        trk1->set_pan(-1.0f); // Kick on Left
+        trk2->set_pan(1.0f);  // Snare on Right
+
+        auto refill = [&]() {
+            for (uint32_t i = 0; i < kFrames; ++i) {
+                trk1->buffer().channel(0)[i] = 0.5f;
+                trk1->buffer().channel(1)[i] = 0.5f;
+                trk2->buffer().channel(0)[i] = 0.5f;
+                trk2->buffer().channel(1)[i] = 0.5f;
+            }
+        };
+
+        AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+
+        // 3a. Both active
+        refill();
+        mixer.render(view);
+        TEST_CHECK(view.channel(0)[0] > 0.4f);
+        TEST_CHECK(view.channel(1)[0] > 0.4f);
+
+        // 3b. Mute Track 1 (Kick muted) -> Only Snare on Right
+        refill();
+        trk1->set_mute(true);
+        mixer.render(view);
+        TEST_CHECK(std::abs(view.channel(0)[0]) < 1e-5f); // Kick silent
+        TEST_CHECK(view.channel(1)[0] > 0.4f);            // Snare audible
+
+        // 3c. Unmute Track 1, Solo Track 1 -> Snare suppressed even though not muted
+        refill();
+        trk1->set_mute(false);
+        trk1->set_solo(true);
+        mixer.render(view);
+        TEST_CHECK(view.channel(0)[0] > 0.4f);            // Kick audible
+        TEST_CHECK(std::abs(view.channel(1)[0]) < 1e-5f); // Snare muted by solo-in-place
+
+        // 3d. Solo both -> Both audible
+        refill();
+        trk2->set_solo(true);
+        mixer.render(view);
+        TEST_CHECK(view.channel(0)[0] > 0.4f);
+        TEST_CHECK(view.channel(1)[0] > 0.4f);
+
+        std::cout << "  -> Mute/Solo Logic: PASSED (Solo-in-place and mute precedence verified)" << std::endl;
+    }
+
+    // 4. Test Submix Bus Routing (Track -> Drum Bus -> Master)
+    {
+        MixerGraph mixer(kFrames);
+        Track* kick = mixer.add_track("Kick");
+        Track* snare = mixer.add_track("Snare");
+        AudioBus* drum_bus = mixer.add_submix_bus("Drum Submix");
+
+        TEST_CHECK(drum_bus != nullptr);
+        TEST_CHECK(drum_bus->id() == 1);
+
+        // Route kick and snare to drum bus
+        kick->set_target_bus(static_cast<int32_t>(drum_bus->id()));
+        snare->set_target_bus(static_cast<int32_t>(drum_bus->id()));
+
+        // Center kick and snare
+        kick->set_pan(0.0f);
+        snare->set_pan(0.0f);
+
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            kick->buffer().channel(0)[i] = 0.2f;
+            kick->buffer().channel(1)[i] = 0.2f;
+            snare->buffer().channel(0)[i] = 0.2f;
+            snare->buffer().channel(1)[i] = 0.2f;
+        }
+
+        AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+        mixer.render(view);
+
+        // Both summed into drum bus, then drum bus into master
+        TEST_CHECK(view.channel(0)[0] > 0.2f);
+        TEST_CHECK(view.channel(1)[0] > 0.2f);
+
+        // Mute drum bus by setting gain to 0.0
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            kick->buffer().channel(0)[i] = 0.2f;
+            kick->buffer().channel(1)[i] = 0.2f;
+            snare->buffer().channel(0)[i] = 0.2f;
+            snare->buffer().channel(1)[i] = 0.2f;
+        }
+        drum_bus->set_gain(0.0f);
+        mixer.render(view);
+        TEST_CHECK(std::abs(view.channel(0)[0]) < 1e-5f);
+        TEST_CHECK(std::abs(view.channel(1)[0]) < 1e-5f);
+
+        std::cout << "  -> Submix Bus Routing: PASSED (Tracks -> Submix Bus -> Master verified)" << std::endl;
+    }
+
+    // 5. Test Aux Sends (Track -> Reverb Bus)
+    {
+        MixerGraph mixer(kFrames);
+        Track* vocal = mixer.add_track("Vocal");
+        AudioBus* reverb_bus = mixer.add_submix_bus("Reverb Bus");
+
+        // Vocal routes directly to master, but also sends 50% to reverb bus
+        vocal->set_target_bus(-1); // Master
+        vocal->set_send(reverb_bus->id(), 0.5f);
+        vocal->set_pan(0.0f);
+
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            vocal->buffer().channel(0)[i] = 0.4f;
+            vocal->buffer().channel(1)[i] = 0.4f;
+        }
+
+        AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+        mixer.render(view);
+
+        // Verify reverb bus received audio
+        const Sample* rev_l = reverb_bus->buffer().view().channel(0);
+        TEST_CHECK(std::abs(rev_l[0]) > 0.1f);
+
+        // Check telemetry metering
+        auto vocal_meter = vocal->meter();
+        TEST_CHECK(vocal_meter.peak_l > 0.1f);
+        TEST_CHECK(vocal_meter.rms_l > 0.1f);
+
+        auto master_meter = mixer.master_bus().meter();
+        TEST_CHECK(master_meter.peak_l > 0.1f);
+        TEST_CHECK(master_meter.rms_l > 0.1f);
+
+        std::cout << "  -> Aux Sends & Telemetry: PASSED (Sends route correctly, Peak/RMS meters active)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -376,6 +585,7 @@ int main() {
     test_limiter_protection();
     test_wasm_dsp();
     test_airwindows_console_processor();
+    test_mixer_graph_routing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
