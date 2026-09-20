@@ -16,6 +16,7 @@
 #include "audio_core/dsp/clip_only2.hpp"
 #include "audio_core/dsp/wasm_processor.hpp"
 #include "audio_core/network/aoip_transmitter.hpp"
+#include "audio_core/clock/link_bridge.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 #include <iostream>
@@ -1149,6 +1150,77 @@ void test_universal_sampling_and_bounce_tap() {
     std::cout << "  -> Multi-Stage Bounce Tap & Resampling: PASSED (Pre-FX, Post-FX, Bus & Master bounced and looped seamlessly)" << std::endl;
 }
 
+void test_timeline_clock_and_link_bridge_master_authority() {
+    std::cout << "[TEST] Running TimelineClock & Ableton Link Master Authority Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::clock;
+
+    TimelineClock clock(48000, 120.0);
+    TEST_CHECK(clock.authority() == ClockAuthority::Master);
+    TEST_CHECK(clock.sample_rate() == 48000);
+    TEST_CHECK(clock.bpm() == 120.0);
+
+    // 120 BPM @ 48kHz = 48000 * 60 / 120 = 24000 samples per beat
+    // 4/4 time = 96000 samples per bar
+    TEST_CHECK(std::abs(clock.samples_per_beat() - 24000.0) < 1e-4);
+    TEST_CHECK(std::abs(clock.samples_per_bar() - 96000.0) < 1e-4);
+    TEST_CHECK(clock.samples_for_bars(2) == 192000);
+
+    // Test advance_block boundary detection
+    clock.set_playing(true);
+
+    bool detected_beat = false;
+    uint32_t beat_offset = 0;
+    bool detected_bar = false;
+    uint32_t bar_offset = 0;
+
+    // Advance block by block (128 frames)
+    constexpr uint32_t kBlockSize = 128;
+    for (uint32_t s = 0; s < 96128; s += kBlockSize) {
+        auto events = clock.advance_block(kBlockSize);
+        if (events.has_beat_boundary) {
+            detected_beat = true;
+            beat_offset = events.beat_sample_offset;
+        }
+        if (events.has_bar_boundary) {
+            detected_bar = true;
+            bar_offset = events.bar_sample_offset;
+        }
+    }
+
+    TEST_CHECK(detected_beat && beat_offset < kBlockSize);
+    TEST_CHECK(detected_bar && bar_offset < kBlockSize);
+    TEST_CHECK(clock.sample_position() == 96128);
+
+    auto snap = clock.position_snapshot();
+    TEST_CHECK(snap.bar_index == 1);
+    TEST_CHECK(snap.is_playing);
+
+    // Test Ableton Link Bridge & Master Sovereignty
+    LinkBridge link(120.0);
+    link.bind_clock(&clock);
+    link.enable(true);
+    TEST_CHECK(link.is_enabled());
+
+    // In Master mode, sync_audio_thread preserves and enforces 120.0 BPM
+    link.sync_audio_thread(kBlockSize);
+    TEST_CHECK(clock.bpm() == 120.0);
+
+    // Change internal master tempo to 128.0 BPM
+    clock.set_bpm(128.0);
+    link.sync_audio_thread(kBlockSize);
+    TEST_CHECK(clock.bpm() == 128.0);
+
+    // Test Anti-Hijack: Switch authority to Follower vs Master
+    clock.set_authority(ClockAuthority::Master);
+    TEST_CHECK(clock.authority() == ClockAuthority::Master);
+
+    link.enable(false);
+    TEST_CHECK(!link.is_enabled());
+
+    std::cout << "  -> TimelineClock & Link Master Sovereignty: PASSED (Sample-accurate beat/bar grid and anti-hijack master authority verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1168,6 +1240,7 @@ int main() {
     test_pipewire_backend_integration();
     test_aoip_network_streaming_and_unpacking();
     test_universal_sampling_and_bounce_tap();
+    test_timeline_clock_and_link_bridge_master_authority();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

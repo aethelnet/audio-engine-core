@@ -39,6 +39,12 @@ set(PIPEWIRE_LIB
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/lib64/libpipewire-0.3.so
 )
 
+# Ableton Link Integration
+set(LINK_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/modules/asio-standalone/asio/include
+)
+
 # Core Audio Engine Library
 add_library(audio_core STATIC
     src/engine.cpp
@@ -53,8 +59,15 @@ target_include_directories(audio_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/modules/asio-standalone/asio/include>
     $<INSTALL_INTERFACE:include>
 )
+
+target_compile_definitions(audio_core PUBLIC LINK_PLATFORM_LINUX=1)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(audio_core PUBLIC -Wno-multichar)
+endif()
 
 find_package(Threads REQUIRED)
 

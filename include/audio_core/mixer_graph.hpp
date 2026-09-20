@@ -8,6 +8,7 @@
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/sampling/sample_tap.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
+#include "audio_core/clock/timeline_clock.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -401,6 +402,9 @@ public:
         return (index < kMaxSampleTaps) ? m_taps[index].get() : nullptr;
     }
 
+    [[nodiscard]] clock::TimelineClock& clock() noexcept { return m_clock; }
+    [[nodiscard]] const clock::TimelineClock& clock() const noexcept { return m_clock; }
+
     // Ingest incoming AoIP network frames into all mapped active tracks
     void ingest_aoip(network::AoipReceiver& receiver, uint32_t frames) noexcept {
         for (auto& track : m_tracks) {
@@ -612,6 +616,8 @@ public:
         // 0. Drain and execute queued binary commands (Zero allocation, sample-exact)
         drain_commands();
         m_render_cycle.fetch_add(1, std::memory_order_relaxed);
+        const auto boundary_events = m_clock.advance_block(frames);
+        (void)boundary_events;
 
         // 1. Clear Master and Active Submix Buses
         m_master_bus.clear();
@@ -919,6 +925,7 @@ private:
     std::array<size_t, kMaxBuses> m_bus_render_order{};
     size_t m_bus_render_order_count{0};
     std::array<std::unique_ptr<sampling::SampleTap>, kMaxSampleTaps> m_taps;
+    clock::TimelineClock m_clock{48000, 120.0};
 };
 
 } // namespace audio_core
