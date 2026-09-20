@@ -74,6 +74,11 @@ public:
     }
 
     [[nodiscard]] uint32_t sample_rate() const noexcept { return m_sample_rate; }
+    void set_sample_rate(uint32_t sample_rate) noexcept {
+        if (sample_rate > 0) {
+            m_sample_rate = sample_rate;
+        }
+    }
     [[nodiscard]] uint32_t capacity_frames() const noexcept { return m_capacity_frames; }
 
     // Arm a quantized bounce with explicit target frame length

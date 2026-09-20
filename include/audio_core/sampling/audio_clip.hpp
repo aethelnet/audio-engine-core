@@ -1,8 +1,10 @@
 #pragma once
 
+#include "audio_core/dsp/resampler.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cmath>
 #include <algorithm>
 #include <span>
 
@@ -182,6 +184,127 @@ public:
             dst_l[i] = src_l[global_idx] * gain;
             dst_r[i] = src_r[global_idx] * gain;
             slice_playhead++;
+            frames_rendered++;
+        }
+        return frames_rendered;
+    }
+
+    [[nodiscard]] double playback_ratio(uint32_t target_sample_rate, double pitch_ratio = 1.0) const noexcept {
+        return (target_sample_rate > 0)
+            ? (static_cast<double>(m_sample_rate) / static_cast<double>(target_sample_rate) * pitch_ratio)
+            : 1.0;
+    }
+
+    // Lock-free resampled read with continuous Hermite spline interpolation & zero pitch drift
+    uint32_t read_resampled(double& playhead, uint32_t target_sample_rate,
+                            float* dst_l, float* dst_r, uint32_t frames_to_read,
+                            bool loop = true, double pitch_ratio = 1.0) const noexcept {
+        if (m_frames == 0 || m_channels == 0 || !dst_l || !dst_r || frames_to_read == 0) {
+            if (dst_l && dst_r) {
+                for (uint32_t i = 0; i < frames_to_read; ++i) {
+                    dst_l[i] = 0.0f;
+                    dst_r[i] = 0.0f;
+                }
+            }
+            return 0;
+        }
+
+        const double ratio = playback_ratio(target_sample_rate, pitch_ratio);
+        const float* src_l = m_data[0].data();
+        const float* src_r = (m_channels > 1) ? m_data[1].data() : src_l;
+        const double max_f = static_cast<double>(m_frames);
+
+        uint32_t frames_rendered = 0;
+        for (uint32_t i = 0; i < frames_to_read; ++i) {
+            if (playhead >= max_f) {
+                if (loop) {
+                    playhead = std::fmod(playhead, max_f);
+                } else {
+                    for (uint32_t j = i; j < frames_to_read; ++j) {
+                        dst_l[j] = 0.0f;
+                        dst_r[j] = 0.0f;
+                    }
+                    return frames_rendered;
+                }
+            } else if (playhead < 0.0) {
+                if (loop) {
+                    playhead = std::fmod(playhead, max_f);
+                    if (playhead < 0.0) playhead += max_f;
+                } else {
+                    for (uint32_t j = i; j < frames_to_read; ++j) {
+                        dst_l[j] = 0.0f;
+                        dst_r[j] = 0.0f;
+                    }
+                    return frames_rendered;
+                }
+            }
+
+            dst_l[i] = loop ? dsp::sample_hermite_wrapped(src_l, playhead, m_frames)
+                            : dsp::sample_hermite(src_l, playhead, m_frames);
+            dst_r[i] = loop ? dsp::sample_hermite_wrapped(src_r, playhead, m_frames)
+                            : dsp::sample_hermite(src_r, playhead, m_frames);
+
+            playhead += ratio;
+            frames_rendered++;
+        }
+        return frames_rendered;
+    }
+
+    // Read a specific slice resampled with continuous Hermite spline interpolation
+    uint32_t read_slice_resampled(uint32_t slice_idx, double& slice_playhead,
+                                  uint32_t target_sample_rate, float* dst_l, float* dst_r,
+                                  uint32_t frames_to_read, bool loop = false,
+                                  double pitch_ratio = 1.0) const noexcept {
+        if (slice_idx >= m_slices.size() || m_channels == 0 || !dst_l || !dst_r || frames_to_read == 0) {
+            if (dst_l && dst_r) {
+                for (uint32_t i = 0; i < frames_to_read; ++i) {
+                    dst_l[i] = 0.0f;
+                    dst_r[i] = 0.0f;
+                }
+            }
+            return 0;
+        }
+
+        const auto& slice = m_slices[slice_idx];
+        const uint32_t slice_len = (slice.end_frame > slice.start_frame) ? (slice.end_frame - slice.start_frame) : 0;
+        if (slice_len == 0) return 0;
+
+        const double ratio = playback_ratio(target_sample_rate, pitch_ratio);
+        const float* src_l = m_data[0].data();
+        const float* src_r = (m_channels > 1) ? m_data[1].data() : src_l;
+        const float gain = slice.gain;
+        const double max_len = static_cast<double>(slice_len);
+
+        uint32_t frames_rendered = 0;
+        for (uint32_t i = 0; i < frames_to_read; ++i) {
+            if (slice_playhead >= max_len) {
+                if (loop) {
+                    slice_playhead = std::fmod(slice_playhead, max_len);
+                } else {
+                    for (uint32_t j = i; j < frames_to_read; ++j) {
+                        dst_l[j] = 0.0f;
+                        dst_r[j] = 0.0f;
+                    }
+                    return frames_rendered;
+                }
+            } else if (slice_playhead < 0.0) {
+                if (loop) {
+                    slice_playhead = std::fmod(slice_playhead, max_len);
+                    if (slice_playhead < 0.0) slice_playhead += max_len;
+                } else {
+                    for (uint32_t j = i; j < frames_to_read; ++j) {
+                        dst_l[j] = 0.0f;
+                        dst_r[j] = 0.0f;
+                    }
+                    return frames_rendered;
+                }
+            }
+
+            double global_pos = static_cast<double>(slice.start_frame) + slice_playhead;
+            dst_l[i] = dsp::sample_hermite(src_l, global_pos, m_frames) * gain;
+            dst_r[i] = dsp::sample_hermite(src_r, global_pos, m_frames) * gain;
+
+            slice_playhead += ratio;
             frames_rendered++;
         }
         return frames_rendered;

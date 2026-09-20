@@ -59,7 +59,7 @@ public:
             s.active = false;
         }
         m_clip.reset();
-        m_clip_playhead.store(0, std::memory_order_relaxed);
+        m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
         m_active.store(true, std::memory_order_release);
@@ -71,7 +71,7 @@ public:
             s.active = false;
         }
         m_clip.reset();
-        m_clip_playhead.store(0, std::memory_order_relaxed);
+        m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
     }
@@ -140,12 +140,12 @@ public:
     void set_clip(std::shared_ptr<sampling::AudioClip> clip, bool loop = true) noexcept {
         m_clip = std::move(clip);
         m_clip_loop.store(loop, std::memory_order_relaxed);
-        m_clip_playhead.store(0, std::memory_order_relaxed);
+        m_clip_playhead.store(0.0, std::memory_order_relaxed);
     }
 
     void clear_clip() noexcept {
         m_clip.reset();
-        m_clip_playhead.store(0, std::memory_order_relaxed);
+        m_clip_playhead.store(0.0, std::memory_order_relaxed);
     }
 
     [[nodiscard]] bool has_clip() const noexcept {
@@ -153,10 +153,14 @@ public:
     }
 
     [[nodiscard]] uint64_t clip_playhead() const noexcept {
+        return static_cast<uint64_t>(std::round(m_clip_playhead.load(std::memory_order_relaxed)));
+    }
+
+    [[nodiscard]] double clip_playhead_f() const noexcept {
         return m_clip_playhead.load(std::memory_order_relaxed);
     }
 
-    void set_clip_playhead(uint64_t playhead) noexcept {
+    void set_clip_playhead(double playhead) noexcept {
         m_clip_playhead.store(playhead, std::memory_order_relaxed);
     }
 
@@ -184,8 +188,8 @@ public:
         if (is_sequencer_enabled()) {
             m_sequencer->render(left, right, frames, clock, boundary_events);
         } else if (m_clip) {
-            uint64_t ph = m_clip_playhead.load(std::memory_order_relaxed);
-            m_clip->read(ph, left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
+            double ph = m_clip_playhead.load(std::memory_order_relaxed);
+            m_clip->read_resampled(ph, clock.sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
             m_clip_playhead.store(ph, std::memory_order_relaxed);
         }
     }
@@ -194,8 +198,8 @@ public:
         if (m_clip) {
             Sample* left = m_buffer.view().channel(0);
             Sample* right = m_buffer.view().channel(1);
-            uint64_t ph = m_clip_playhead.load(std::memory_order_relaxed);
-            m_clip->read(ph, left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
+            double ph = m_clip_playhead.load(std::memory_order_relaxed);
+            m_clip->read_resampled(ph, m_clip->sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
             m_clip_playhead.store(ph, std::memory_order_relaxed);
         }
     }
@@ -271,7 +275,7 @@ private:
 
     std::shared_ptr<sampling::AudioClip> m_clip{nullptr};
     std::atomic<bool> m_clip_loop{true};
-    std::atomic<uint64_t> m_clip_playhead{0};
+    std::atomic<double> m_clip_playhead{0.0};
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
@@ -413,8 +417,9 @@ public:
     static constexpr size_t kMaxBuses = 16;
     static constexpr size_t kMaxSampleTaps = 4;
 
-    explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true)
+    explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true, uint32_t sample_rate = 48000)
         : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames),
+          m_clock(sample_rate, 120.0),
           m_worker_pool(enable_multithreading ? threading::AudioWorkerPool::kAutoDetect : 0) {
         m_master_bus.set_active(true);
         for (size_t i = 0; i < kMaxTracks; ++i) {
@@ -424,9 +429,45 @@ public:
             m_buses[i] = std::make_unique<AudioBus>(static_cast<uint32_t>(i + 1), "Bus " + std::to_string(i + 1), buffer_frames);
         }
         for (size_t i = 0; i < kMaxSampleTaps; ++i) {
-            m_taps[i] = std::make_unique<sampling::SampleTap>(48000, 10.0f);
+            m_taps[i] = std::make_unique<sampling::SampleTap>(sample_rate, 10.0f);
         }
+        set_sample_rate(sample_rate);
         recompute_bus_order();
+    }
+
+    void set_sample_rate(uint32_t sample_rate) noexcept {
+        if (sample_rate == 0) return;
+        m_clock.set_sample_rate(sample_rate);
+
+        for (auto& track : m_tracks) {
+            if (track) {
+                for (size_t i = 0; i < kMaxTrackInsertSlots; ++i) {
+                    track->slot(i).init(sample_rate);
+                }
+            }
+        }
+
+        for (auto& bus : m_buses) {
+            if (bus) {
+                for (size_t i = 0; i < kMaxBusInsertSlots; ++i) {
+                    bus->slot(i).init(sample_rate);
+                }
+            }
+        }
+
+        for (size_t i = 0; i < kMaxBusInsertSlots; ++i) {
+            m_master_bus.slot(i).init(sample_rate);
+        }
+
+        for (auto& tap : m_taps) {
+            if (tap) {
+                tap->set_sample_rate(sample_rate);
+            }
+        }
+    }
+
+    [[nodiscard]] uint32_t sample_rate() const noexcept {
+        return m_clock.sample_rate();
     }
 
     void set_worker_threads(uint32_t num_threads) {
@@ -980,6 +1021,13 @@ public:
             case protocol::MixerCommandType::ResetMeters: {
                 for (auto& trk : m_tracks) {
                     if (trk->is_active()) trk->reset_meters();
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetSampleRate: {
+                uint32_t sr = (cmd.target_id > 0) ? cmd.target_id : cmd.flags;
+                if (sr > 0) {
+                    set_sample_rate(sr);
                 }
                 break;
             }

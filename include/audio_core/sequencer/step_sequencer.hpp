@@ -207,6 +207,10 @@ public:
         const uint64_t start_pos = (end_pos >= frames) ? (end_pos - frames) : 0;
         const bool clock_playing = clock.is_playing();
 
+        const uint32_t engine_sr = clock.sample_rate();
+        const uint32_t clip_sr = m_clip ? m_clip->sample_rate() : engine_sr;
+        const double rate_ratio = (engine_sr > 0) ? (static_cast<double>(clip_sr) / static_cast<double>(engine_sr)) : 1.0;
+
         // 3. Process frame-by-frame with sample-accurate step and pad triggers
         for (uint32_t i = 0; i < frames; ++i) {
             const uint64_t current_sample_pos = start_pos + i;
@@ -252,8 +256,8 @@ public:
                 }
             }
 
-            // Render active voices with micro-fade crossfade
-            render_sample(out_l[i], out_r[i]);
+            // Render active voices with micro-fade crossfade and sample rate agility
+            render_sample(out_l[i], out_r[i], rate_ratio);
         }
     }
 
@@ -322,48 +326,46 @@ private:
         m_primary_voice.is_fading_out = false;
     }
 
-    inline void render_voice_frame(SliceVoice& v, float fade_gain, float& out_l, float& out_r) noexcept {
+    inline void render_voice_frame(SliceVoice& v, float fade_gain, float& out_l, float& out_r, double rate_ratio = 1.0) noexcept {
         const uint32_t slice_len = (v.end_frame > v.start_frame) ? (v.end_frame - v.start_frame) : 0;
         if (slice_len == 0) {
             v.active = false;
             return;
         }
 
-        uint32_t p0 = static_cast<uint32_t>(v.playhead);
-        if (p0 >= slice_len) {
+        if (v.playhead < 0.0 || v.playhead >= static_cast<double>(slice_len)) {
             v.active = false;
             return;
         }
-        uint32_t p1 = (p0 + 1 < slice_len) ? (p0 + 1) : p0;
-        float frac = static_cast<float>(v.playhead - static_cast<double>(p0));
 
-        uint32_t g0 = v.start_frame + p0;
-        uint32_t g1 = v.start_frame + p1;
+        double global_pos = static_cast<double>(v.start_frame) + v.playhead;
 
         const float* src_l = m_clip->channel(0);
         const float* src_r = (m_clip->num_channels() > 1) ? m_clip->channel(1) : src_l;
 
-        float sample_l = (src_l[g0] * (1.0f - frac) + src_l[g1] * frac);
-        float sample_r = (src_r[g0] * (1.0f - frac) + src_r[g1] * frac);
+        float sample_l = dsp::sample_hermite(src_l, global_pos, m_clip->num_frames());
+        float sample_r = dsp::sample_hermite(src_r, global_pos, m_clip->num_frames());
 
         const float total_gain = v.velocity * v.slice_gain * fade_gain;
         out_l += sample_l * total_gain;
         out_r += sample_r * total_gain;
 
+        const double step_advance = rate_ratio * static_cast<double>(v.pitch_ratio);
+
         if (v.reverse) {
-            v.playhead -= v.pitch_ratio;
+            v.playhead -= step_advance;
             if (v.playhead < 0.0) {
                 v.active = false;
             }
         } else {
-            v.playhead += v.pitch_ratio;
+            v.playhead += step_advance;
             if (v.playhead >= static_cast<double>(slice_len)) {
                 v.active = false;
             }
         }
     }
 
-    inline void render_sample(float& out_l, float& out_r) noexcept {
+    inline void render_sample(float& out_l, float& out_r, double rate_ratio = 1.0) noexcept {
         // Render primary voice
         if (m_primary_voice.active) {
             float in_gain = 1.0f;
@@ -371,7 +373,7 @@ private:
                 in_gain = 1.0f - (static_cast<float>(m_primary_voice.fade_in_remaining) / static_cast<float>(m_primary_voice.fade_in_total));
                 m_primary_voice.fade_in_remaining--;
             }
-            render_voice_frame(m_primary_voice, in_gain, out_l, out_r);
+            render_voice_frame(m_primary_voice, in_gain, out_l, out_r, rate_ratio);
         }
 
         // Render choked voice (smooth fade out to 0)
@@ -379,7 +381,7 @@ private:
             if (m_choked_voice.is_fading_out && m_choked_voice.fade_out_remaining > 0) {
                 float out_gain = static_cast<float>(m_choked_voice.fade_out_remaining) / static_cast<float>(m_choked_voice.fade_out_total);
                 m_choked_voice.fade_out_remaining--;
-                render_voice_frame(m_choked_voice, out_gain, out_l, out_r);
+                render_voice_frame(m_choked_voice, out_gain, out_l, out_r, rate_ratio);
                 if (m_choked_voice.fade_out_remaining == 0) {
                     m_choked_voice.active = false;
                     m_choked_voice.is_fading_out = false;

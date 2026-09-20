@@ -24,6 +24,7 @@ enum class MixerCommandType : uint16_t {
     SetBusSlotBypass,
     SetBusSlotParam,
     ResetMeters,
+    SetSampleRate,
 };
 
 // ============================================================================
