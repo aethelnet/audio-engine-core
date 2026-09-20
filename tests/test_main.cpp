@@ -20,7 +20,9 @@
 #include "audio_core/clock/link_bridge.hpp"
 #include "audio_core/analysis/transient_detector.hpp"
 #include "audio_core/sampling/loop_conditioner.hpp"
+#include "audio_core/sequencer/step_sequencer.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
+#include <numbers>
 
 #include <iostream>
 #include <thread>
@@ -1558,6 +1560,143 @@ void test_clock_synchronized_quantized_tap_and_bar_looping() {
     std::cout << "  -> Clock-Synchronized Quantized Tap: PASSED (Bar-aligned arming, sub-block downbeat trigger, 96000 frames captured & looped)" << std::endl;
 }
 
+void test_step_sequencer_and_slice_trigger_engine() {
+    std::cout << "[TEST] Running Slice Step-Sequencer & Micro-Fade Choke Engine Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+
+    // 1. Synthesize a 4-slice audio clip (Total: 4000 samples @ 48kHz)
+    // Slice 0: Positive flat DC (1.0f) for 1000 samples (Simulates Kick)
+    // Slice 1: Negative flat DC (-1.0f) for 1000 samples (Simulates Snare)
+    // Slice 2: 440 Hz Sine tone for 1000 samples (Simulates HiHat)
+    // Slice 3: Alternating +0.5 / -0.5 for 1000 samples (Simulates Perc)
+    auto clip = std::make_shared<AudioClip>("DrumKit", 48000, 2, 4000);
+    clip->slices().push_back({0, 0, 1000, 1.0f});
+    clip->slices().push_back({1, 1000, 2000, 1.0f});
+    clip->slices().push_back({2, 2000, 3000, 1.0f});
+    clip->slices().push_back({3, 3000, 4000, 1.0f});
+
+    float* ch0 = clip->channel(0);
+    float* ch1 = clip->channel(1);
+    for (uint32_t i = 0; i < 1000; ++i) {
+        ch0[i] = 1.0f;
+        ch1[i] = 1.0f;
+    }
+    for (uint32_t i = 1000; i < 2000; ++i) {
+        ch0[i] = -1.0f;
+        ch1[i] = -1.0f;
+    }
+    for (uint32_t i = 2000; i < 3000; ++i) {
+        float val = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * (static_cast<float>(i - 2000) / 48000.0f));
+        ch0[i] = val;
+        ch1[i] = val;
+    }
+    for (uint32_t i = 3000; i < 4000; ++i) {
+        float val = ((i % 2) == 0) ? 0.5f : -0.5f;
+        ch0[i] = val;
+        ch1[i] = val;
+    }
+
+    auto seq = std::make_shared<StepSequencer>(clip);
+    TEST_CHECK(seq != nullptr);
+
+    // 2. Anti-Click Micro-Fade Choke Verification
+    // Trigger Slice 0 (+1.0f), render 100 samples, then trigger Slice 1 (-1.0f)
+    // Without micro-fade, jumping from +1.0 to -1.0 would cause an instantaneous discontinuity of 2.0 (massive pop).
+    // With 64-sample micro-fade, maximum delta between adjacent samples is bounded to < 0.06 per sample!
+    std::vector<Sample> out_l(256, 0.0f);
+    std::vector<Sample> out_r(256, 0.0f);
+    clock::TimelineClock clk(48000, 120.0);
+    clock::BlockBoundaryEvents no_events{};
+
+    seq->trigger_slice(0, 1.0f); // Kick (+1.0)
+    seq->render(out_l.data(), out_r.data(), 100, clk, no_events);
+    TEST_CHECK(std::abs(out_l[99] - 1.0f) < 0.01f);
+
+    // Choke with Slice 1 (-1.0f)
+    seq->trigger_slice(1, 1.0f);
+    seq->render(out_l.data(), out_r.data(), 128, clk, no_events);
+
+    // Check maximum step delta across the 64 micro-fade frames
+    float max_delta = 0.0f;
+    for (size_t i = 1; i < 64; ++i) {
+        float d = std::abs(out_l[i] - out_l[i - 1]);
+        if (d > max_delta) max_delta = d;
+    }
+    TEST_CHECK(max_delta < 0.06f);
+    // After micro-fade completes (>64 samples), output should reach -1.0f
+    TEST_CHECK(std::abs(out_l[100] - (-1.0f)) < 0.01f);
+
+    std::cout << "  -> Anti-Click Micro-Fade Choke: PASSED (Delta bounded to " << max_delta << " < 0.06 over 64-sample window, 0 click)" << std::endl;
+
+    // 3. Pattern Scheduling & Instant Switching Test
+    seq->stop();
+    seq->pattern(0).clear();
+    seq->pattern(0).set_step(0, 0, 1.0f); // Kick on step 0
+    seq->pattern(0).set_step(4, 1, 1.0f); // Snare on step 4
+
+    seq->pattern(1).clear();
+    seq->pattern(1).set_step(0, 2, 1.0f); // HiHat on step 0
+    seq->pattern(1).set_step(4, 3, 1.0f); // Perc on step 4
+
+    // Test Bar-Quantized Queuing:
+    seq->switch_pattern_immediate(0);
+    TEST_CHECK(seq->current_pattern_index() == 0);
+
+    seq->queue_pattern_switch(1, PatternSwitchMode::BarQuantized);
+    TEST_CHECK(seq->has_queued_pattern());
+    TEST_CHECK(seq->queued_pattern_index() == 1);
+
+    // Render a block with NO bar boundary -> should remain on Pattern 0
+    clock::BlockBoundaryEvents mid_bar_events{};
+    mid_bar_events.has_bar_boundary = false;
+    seq->render(out_l.data(), out_r.data(), 128, clk, mid_bar_events);
+    TEST_CHECK(seq->current_pattern_index() == 0);
+    TEST_CHECK(seq->has_queued_pattern());
+
+    // Render a block WITH bar boundary -> must trigger pattern switch!
+    clock::BlockBoundaryEvents bar_events{};
+    bar_events.has_bar_boundary = true;
+    bar_events.bar_sample_offset = 32;
+    seq->render(out_l.data(), out_r.data(), 128, clk, bar_events);
+    TEST_CHECK(seq->current_pattern_index() == 1);
+    TEST_CHECK(!seq->has_queued_pattern());
+
+    // Test Direct / Instant Switch:
+    seq->switch_pattern_immediate(0);
+    TEST_CHECK(seq->current_pattern_index() == 0);
+    TEST_CHECK(!seq->has_queued_pattern());
+
+    std::cout << "  -> Pattern Scheduling & Instant Switching: PASSED (Bar-quantized wait and instant override verified)" << std::endl;
+
+    // 4. MixerGraph & AudioTrack Integration Test
+    MixerGraph mixer(256);
+    mixer.clock().set_sample_rate(48000);
+    mixer.clock().set_bpm(120.0);
+    mixer.clock().set_playing(true);
+
+    Track* trk = mixer.add_track("BeatChopper");
+    TEST_CHECK(trk != nullptr);
+    trk->set_sequencer(seq);
+    TEST_CHECK(trk->is_sequencer_enabled());
+
+    AudioBuffer master_buf(2, 256);
+    auto master_view = master_buf.view();
+
+    // Render first block (crosses step 0 -> slice 0 triggers)
+    mixer.render(master_view);
+
+    // Verify energy reached master bus
+    float sum_l = 0.0f;
+    for (uint32_t i = 0; i < 256; ++i) {
+        sum_l += std::abs(master_buf.channel(0)[i]);
+    }
+    TEST_CHECK(sum_l > 0.0f);
+
+    std::cout << "  -> Track & MixerGraph Integration: PASSED (StepSequencer rendered directly into channel strip and master summing bus)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -1583,6 +1722,7 @@ int main() {
     test_insert_slot_safety_hardening_and_circuit_breaker();
     test_airwindows_interstage_processor();
     test_clock_synchronized_quantized_tap_and_bar_looping();
+    test_step_sequencer_and_slice_trigger_engine();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

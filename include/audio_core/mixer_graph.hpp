@@ -9,6 +9,7 @@
 #include "audio_core/sampling/sample_tap.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
+#include "audio_core/sequencer/step_sequencer.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -158,7 +159,36 @@ public:
         m_clip_playhead.store(playhead, std::memory_order_relaxed);
     }
 
+    void set_sequencer(std::shared_ptr<sequencer::StepSequencer> seq) noexcept {
+        m_sequencer = std::move(seq);
+        m_sequencer_enabled.store(m_sequencer != nullptr, std::memory_order_relaxed);
+    }
+
+    void enable_sequencer(bool enable) noexcept {
+        m_sequencer_enabled.store(enable, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] sequencer::StepSequencer* sequencer() noexcept { return m_sequencer.get(); }
+    [[nodiscard]] const sequencer::StepSequencer* sequencer() const noexcept { return m_sequencer.get(); }
+    [[nodiscard]] bool is_sequencer_enabled() const noexcept {
+        return m_sequencer_enabled.load(std::memory_order_relaxed) && (m_sequencer != nullptr);
+    }
+
     // Called inside RT render loop before channel strip processing
+    void render_input(uint32_t frames, const clock::TimelineClock& clock,
+                      const clock::BlockBoundaryEvents& boundary_events) noexcept {
+        Sample* left = m_buffer.view().channel(0);
+        Sample* right = m_buffer.view().channel(1);
+
+        if (is_sequencer_enabled()) {
+            m_sequencer->render(left, right, frames, clock, boundary_events);
+        } else if (m_clip) {
+            uint64_t ph = m_clip_playhead.load(std::memory_order_relaxed);
+            m_clip->read(ph, left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
+            m_clip_playhead.store(ph, std::memory_order_relaxed);
+        }
+    }
+
     void render_input(uint32_t frames) noexcept {
         if (m_clip) {
             Sample* left = m_buffer.view().channel(0);
@@ -241,6 +271,9 @@ private:
     std::shared_ptr<sampling::AudioClip> m_clip{nullptr};
     std::atomic<bool> m_clip_loop{true};
     std::atomic<uint64_t> m_clip_playhead{0};
+
+    std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
+    std::atomic<bool> m_sequencer_enabled{false};
 
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
@@ -646,8 +679,8 @@ public:
                 continue;
             }
 
-            // Fill from active clip if present
-            track->render_input(frames);
+            // Fill from active clip or step-sequencer if present
+            track->render_input(frames, m_clock, boundary_events);
 
             const Sample* raw_l = track->buffer().view().channel(0);
             const Sample* raw_r = track->buffer().view().channel(1);
