@@ -4282,6 +4282,101 @@ void test_wasm_sidechain_and_arbitrary_buffer_chunking() {
     std::cout << "  -> Channel Strip InsertSlot Sidechain: PASSED (Hosted inside InsertSlot, sanitized and ducked)" << std::endl;
 }
 
+void test_kinetic_hit_meter_and_submix_bus_telemetry() {
+    using namespace audio_core;
+    std::cout << "[TEST] Running Kinetic ODE Hit Record Meter & Submix Bus Telemetry Test..." << std::endl;
+
+    constexpr uint32_t kSampleRate = 48000;
+    dsp::KineticMeter meter(kSampleRate);
+
+    // 1. Sub-bass test: 50 Hz pure sine wave
+    constexpr uint32_t kFrames = 1024;
+    std::vector<float> sub_l(kFrames);
+    std::vector<float> sub_r(kFrames);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 50.0f * static_cast<float>(i) / kSampleRate);
+        sub_l[i] = s;
+        sub_r[i] = s;
+    }
+
+    meter.process_block(sub_l.data(), sub_r.data(), kFrames);
+
+    protocol::KineticTelemetryData sub_telemetry{};
+    meter.capture_telemetry(sub_telemetry);
+
+    TEST_CHECK(sub_telemetry.authority > 0.05f);
+    TEST_CHECK(sub_telemetry.authority > sub_telemetry.detail);
+    std::cout << "  -> Sub-Bass Authority Inertia: PASSED (Authority=" << sub_telemetry.authority
+              << " >> Detail=" << sub_telemetry.detail << ")" << std::endl;
+
+    // 2. High Slew test: Alternating high-frequency transients
+    std::vector<float> slew_l(kFrames);
+    std::vector<float> slew_r(kFrames);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float s = (i % 4 < 2) ? 0.9f : -0.9f;
+        slew_l[i] = s;
+        slew_r[i] = s;
+    }
+
+    meter.process_block(slew_l.data(), slew_r.data(), kFrames);
+
+    protocol::KineticTelemetryData slew_telemetry{};
+    meter.capture_telemetry(slew_telemetry);
+
+    TEST_CHECK(slew_telemetry.detail > 0.30f);
+    std::cout << "  -> Transient Slew Detection: PASSED (Detail=" << slew_telemetry.detail << ")" << std::endl;
+
+    // 3. Poincaré Phase-Space Boundedness
+    bool non_zero_phase = false;
+    for (size_t i = 0; i < protocol::KineticTelemetryData::kPhasePoints; ++i) {
+        TEST_CHECK(std::abs(slew_telemetry.phase_x[i]) <= 1.0f);
+        TEST_CHECK(std::abs(slew_telemetry.phase_y[i]) <= 1.0f);
+        if (std::abs(slew_telemetry.phase_x[i]) > 0.01f || std::abs(slew_telemetry.phase_y[i]) > 0.01f) {
+            non_zero_phase = true;
+        }
+    }
+    TEST_CHECK(non_zero_phase);
+    std::cout << "  -> Poincaré Phase-Space Orbits: PASSED (256 points bounded within [-1.0, 1.0])" << std::endl;
+
+    // 4. MixerGraph Submix Bus & Kinetic Meter Telemetry Integration
+    MixerGraph mixer(kFrames);
+    auto* trk_kick = mixer.allocate_track("Kick");
+    auto* trk_lead = mixer.allocate_track("Lead");
+    auto* bus_drum = mixer.allocate_submix_bus("Bus Drum");
+    auto* bus_music = mixer.allocate_submix_bus("Bus Music");
+
+    TEST_CHECK(bus_drum != nullptr);
+    TEST_CHECK(bus_music != nullptr);
+
+    trk_kick->set_target_bus(bus_drum->id());
+    trk_lead->set_target_bus(bus_music->id());
+
+    // Populate track buffers
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        trk_kick->buffer().view().channel(0)[i] = sub_l[i];
+        trk_kick->buffer().view().channel(1)[i] = sub_r[i];
+        trk_lead->buffer().view().channel(0)[i] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / kSampleRate);
+        trk_lead->buffer().view().channel(1)[i] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / kSampleRate);
+    }
+
+    AudioBuffer master_buf(2, kFrames);
+    auto master_view = master_buf.view();
+    mixer.render(master_view);
+
+    protocol::MixerTelemetryFrame snapshot{};
+    mixer.capture_telemetry_snapshot(snapshot);
+
+    TEST_CHECK(snapshot.active_tracks == 2);
+    TEST_CHECK(snapshot.active_buses == 2);
+    TEST_CHECK(snapshot.bus_meters[0].peak_l > 0.20f);
+    TEST_CHECK(snapshot.bus_meters[1].peak_l > 0.10f);
+    TEST_CHECK(snapshot.master_meter.peak_l > 0.30f);
+    TEST_CHECK(snapshot.kinetic_meter.authority > 0.05f);
+
+    std::cout << "  -> Submix Bus Telemetry: PASSED (Bus0 Peak=" << snapshot.bus_meters[0].peak_l
+              << " | Bus1 Peak=" << snapshot.bus_meters[1].peak_l << " | Master=" << snapshot.master_meter.peak_l << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4323,6 +4418,7 @@ int main() {
     test_universal_routing_matrix_and_bitwig_converter_elimination();
     test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi();
     test_wasm_sidechain_and_arbitrary_buffer_chunking();
+    test_kinetic_hit_meter_and_submix_bus_telemetry();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

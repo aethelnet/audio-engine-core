@@ -12,6 +12,7 @@
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/dsp/multichannel_bus.hpp"
+#include "audio_core/dsp/kinetic_meter.hpp"
 #include "audio_core/routing/universal_routing_matrix.hpp"
 #include <string>
 #include <vector>
@@ -582,6 +583,7 @@ public:
             }
         }
         m_routing_matrix.set_sample_rate(sample_rate);
+        m_kinetic_meter.set_sample_rate(sample_rate);
     }
 
     [[nodiscard]] uint32_t sample_rate() const noexcept {
@@ -941,6 +943,16 @@ public:
                 out_frame.track_meters[active_idx++] = {tm.peak_l, tm.peak_r, tm.rms_l, tm.rms_r};
             }
         }
+
+        size_t active_b_idx = 0;
+        for (size_t i = 0; i < kMaxBuses && active_b_idx < protocol::kMaxTelemetryBuses; ++i) {
+            if (m_buses[i]->is_active()) {
+                auto bm = m_buses[i]->meter();
+                out_frame.bus_meters[active_b_idx++] = {bm.peak_l, bm.peak_r, bm.rms_l, bm.rms_r};
+            }
+        }
+
+        m_kinetic_meter.capture_telemetry(out_frame.kinetic_meter);
     }
 
     // Multichannel spatial rendering (Planar / Poly-WAV destination with optional stereo monitor output)
@@ -1283,6 +1295,9 @@ public:
                 out_r[i] = val_r;
             }
         }
+
+        // Update Kinetic ODE & Airwindows Hit Record Meter on Master Output
+        m_kinetic_meter.process_block(out_l, (out_master.num_channels() > 1 ? out_r : out_l), frames);
     }
 
     void drain_commands() noexcept {
@@ -1499,6 +1514,7 @@ private:
     clock::TimelineClock m_clock{48000, 120.0};
     threading::AudioWorkerPool m_worker_pool;
     routing::UniversalRoutingMatrix m_routing_matrix;
+    dsp::KineticMeter m_kinetic_meter{48000};
 };
 
 } // namespace audio_core

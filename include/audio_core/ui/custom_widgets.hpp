@@ -2,6 +2,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"
+#include "audio_core/protocol/telemetry_packet.hpp"
 #include <cmath>
 #include <vector>
 #include <string>
@@ -344,6 +345,140 @@ inline void DrawGasMeter(ImDrawList* draw_list, ImVec2 pos, ImVec2 size,
     ImVec2 txt_sz = ImGui::CalcTextSize(text);
     draw_list->AddText(ImVec2(x + (w - txt_sz.x) * 0.5f, y + (h - txt_sz.y) * 0.5f),
                        is_tripped ? ImColor(255, 255, 255, 255) : ImColor(30, 35, 45, 255), text);
+}
+
+// ============================================================================
+// Orderly Architect's Desk: Kinetic ODE & Airwindows Hit Record Meter
+// - Upper: 2D Poincaré Phase-Space Plot (x vs dx/dt) with Blueprint Cobalt Attractor
+// - Lower: Tri-Color Airwindows Bars (Green Authority, Blue Power, Red Detail)
+// - Dynamic Hit Profile Diagnostic Ribbon
+// ============================================================================
+inline void DrawKineticHitMeter(ImDrawList* draw_list, ImVec2 pos, ImVec2 size,
+                                const protocol::KineticTelemetryData& data) {
+    const float x = pos.x;
+    const float y = pos.y;
+    const float w = size.x;
+    const float h = size.y;
+
+    // 1. Drafting Vellum Background Canvas
+    draw_list->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(252, 253, 254, 255), 3.0f);
+    draw_list->AddRect(pos, ImVec2(x + w, y + h), ImColor(199, 204, 214, 255), 3.0f, 0, 1.0f);
+
+    // Layout Split: Upper Phase Attractor (h - 76px), Lower Tri-Color Bars (76px)
+    const float split_y = y + h - 74.0f;
+    const float plot_cx = x + w * 0.5f;
+    const float plot_cy = y + (split_y - y) * 0.5f;
+    const float plot_radius = std::max(20.0f, std::min(w * 0.5f - 16.0f, (split_y - y) * 0.5f - 10.0f));
+
+    // Millimeter Grid in Upper Plot
+    const ImU32 col_axis = ImColor(210, 215, 224, 255);
+
+    // Crosshairs
+    draw_list->AddLine(ImVec2(plot_cx - plot_radius, plot_cy), ImVec2(plot_cx + plot_radius, plot_cy), col_axis, 1.0f);
+    draw_list->AddLine(ImVec2(plot_cx, plot_cy - plot_radius), ImVec2(plot_cx, plot_cy + plot_radius), col_axis, 1.0f);
+
+    // Reference Target Circles: Golden Ratio Hit Zone (0.65) and 0dBFS boundary (0.95)
+    draw_list->AddCircle(ImVec2(plot_cx, plot_cy), plot_radius * 0.65f, ImColor(31, 97, 217, 45), 32, 1.0f);
+    draw_list->AddCircle(ImVec2(plot_cx, plot_cy), plot_radius * 0.95f, ImColor(217, 46, 56, 40), 32, 1.0f);
+
+    // 2. Render 2D Phase Space Point Cloud (x vs dx/dt)
+    for (size_t i = 0; i < protocol::KineticTelemetryData::kPhasePoints; ++i) {
+        float px = data.phase_x[i];
+        float py = data.phase_y[i];
+
+        if (std::abs(px) < 0.0001f && std::abs(py) < 0.0001f) continue;
+
+        float screen_x = plot_cx + px * plot_radius;
+        float screen_y = plot_cy - py * plot_radius;
+
+        // Fading Blueprint dot: Recent points are solid, older points decay
+        float alpha = 0.25f + 0.75f * (static_cast<float>(i) / static_cast<float>(protocol::KineticTelemetryData::kPhasePoints));
+        
+        // Edge clipping indicator
+        bool is_edge = (std::abs(px) >= 0.92f || std::abs(py) >= 0.92f);
+        ImU32 pt_col = is_edge ? ImColor(217, 46, 56, static_cast<int>(alpha * 255.0f))
+                               : ImColor(31, 97, 217, static_cast<int>(alpha * 220.0f));
+
+        draw_list->AddCircleFilled(ImVec2(screen_x, screen_y), is_edge ? 2.5f : 1.8f, pt_col);
+    }
+
+    // Axis Legend
+    draw_list->AddText(ImVec2(plot_cx + plot_radius - 20.0f, plot_cy + 2.0f), ImColor(160, 168, 180, 255), "+X");
+    draw_list->AddText(ImVec2(plot_cx + 4.0f, plot_cy - plot_radius), ImColor(160, 168, 180, 255), "+dX");
+
+    // Divider Line between Plot and Meters
+    draw_list->AddLine(ImVec2(x + 8.0f, split_y), ImVec2(x + w - 8.0f, split_y), ImColor(218, 222, 230, 255), 1.0f);
+
+    // 3. Lower Section: Airwindows Tri-Color Horizontal Meters
+    const float meter_start_y = split_y + 8.0f;
+    const float bar_h = 10.0f;
+    const float label_w = 80.0f;
+    const float bar_w = std::max(40.0f, w - label_w - 24.0f);
+
+    auto draw_meter_row = [&](int row, const char* name, float val, ImU32 bar_color) {
+        float row_y = meter_start_y + row * 18.0f;
+        draw_list->AddText(ImVec2(x + 10.0f, row_y - 1.0f), ImColor(80, 90, 105, 255), name);
+
+        // Recessed slot
+        float bx = x + label_w + 10.0f;
+        draw_list->AddRectFilled(ImVec2(bx, row_y), ImVec2(bx + bar_w, row_y + bar_h), ImColor(235, 238, 244, 255), 2.0f);
+        draw_list->AddRect(ImVec2(bx, row_y), ImVec2(bx + bar_w, row_y + bar_h), ImColor(205, 210, 220, 255), 2.0f);
+
+        // Fill
+        float fill_w = bar_w * std::clamp(val, 0.0f, 1.0f);
+        if (fill_w > 1.0f) {
+            draw_list->AddRectFilled(ImVec2(bx + 1.0f, row_y + 1.0f), ImVec2(bx + fill_w, row_y + bar_h - 1.0f), bar_color, 1.0f);
+        }
+    };
+
+    draw_meter_row(0, "AUTHORITY", data.authority, ImColor(34, 197, 94, 220)); // Emerald Green
+    draw_meter_row(1, "POWER",     data.power,     ImColor(31, 97, 217, 220)); // Blueprint Cobalt
+    draw_meter_row(2, "DETAIL",    data.detail,    ImColor(217, 46, 56, 220)); // Crimson Red
+
+    // 4. Dynamic Diagnostic Pill / Badge
+    const char* diag_text = "IDLE // WAITING FOR SIGNAL";
+    ImVec4 diag_bg = ImVec4(0.92f, 0.94f, 0.96f, 1.0f);
+    ImVec4 diag_fg = ImVec4(0.35f, 0.40f, 0.48f, 1.0f);
+
+    switch (data.diagnostic_id) {
+        case 1:
+            diag_text = "HIT PROFILE: BALANCED SONORITY (BLUE CLOUD OPTIMAL)";
+            diag_bg = ImVec4(0.88f, 0.94f, 1.00f, 1.0f);
+            diag_fg = ImVec4(0.12f, 0.38f, 0.85f, 1.0f); // Blueprint Cobalt
+            break;
+        case 2:
+            diag_text = "WARNING: EXCESS SLEW / HARSH (REDUCE RED HIGHS)";
+            diag_bg = ImVec4(1.00f, 0.90f, 0.90f, 1.0f);
+            diag_fg = ImVec4(0.85f, 0.18f, 0.22f, 1.0f); // Crimson
+            break;
+        case 3:
+            diag_text = "WARNING: LACKS AUTHORITY (SUB-BASS TOO THIN)";
+            diag_bg = ImVec4(1.00f, 0.95f, 0.85f, 1.0f);
+            diag_fg = ImVec4(0.85f, 0.48f, 0.05f, 1.0f); // Ruler Ochre
+            break;
+        case 4:
+            diag_text = "WARNING: EXCESS ZERO-CROSS (MUDDY / OVERBOOSTED SUB)";
+            diag_bg = ImVec4(0.90f, 0.97f, 0.92f, 1.0f);
+            diag_fg = ImVec4(0.13f, 0.65f, 0.35f, 1.0f); // Forest Green
+            break;
+        case 5:
+            diag_text = "CRITICAL: BRICKWALL CLIPPED (COLLAPSED ORBIT)";
+            diag_bg = ImVec4(1.00f, 0.85f, 0.85f, 1.0f);
+            diag_fg = ImVec4(0.85f, 0.10f, 0.15f, 1.0f); // Bright Red
+            break;
+        default:
+            break;
+    }
+
+    // Render Pill Banner at top of the widget
+    ImVec2 txt_sz = ImGui::CalcTextSize(diag_text);
+    float pill_w = txt_sz.x + 16.0f;
+    float pill_h = txt_sz.y + 6.0f;
+    ImVec2 pill_pos(x + 10.0f, y + 8.0f);
+
+    draw_list->AddRectFilled(pill_pos, ImVec2(pill_pos.x + pill_w, pill_pos.y + pill_h), ImColor(diag_bg), 3.0f);
+    draw_list->AddRect(pill_pos, ImVec2(pill_pos.x + pill_w, pill_pos.y + pill_h), ImColor(diag_fg.x, diag_fg.y, diag_fg.z, 0.35f), 3.0f);
+    draw_list->AddText(ImVec2(pill_pos.x + 8.0f, pill_pos.y + 3.0f), ImColor(diag_fg), diag_text);
 }
 
 } // namespace audio_core::ui
