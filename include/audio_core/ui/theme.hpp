@@ -5,13 +5,14 @@
 namespace audio_core::ui {
 
 // ============================================================================
-// Cyberpunk / Brutalist High-Contrast Audio Workstation Theme
-// Matte Carbon Charcoal Backgrounds, Electric Cyan, Warm Amber, Signal Red
+// Orderly Architect's Drafting Desk Theme
+// Warm Alabaster Drafting Table, Crisp Vellum Cards, Technical Graphite Lines,
+// Blueprint Cobalt Accents, Drafting Amber, and Architectural Precision.
 // ============================================================================
-inline void apply_brutalist_theme() {
+inline void apply_architect_desk_theme() {
     ImGuiStyle& style = ImGui::GetStyle();
 
-    // Geometric, razor-sharp brutalism: low roundings, crisp borders
+    // Architectural Drafting Precision: crisp edges, subtle 2px rounding
     style.WindowRounding    = 2.0f;
     style.ChildRounding     = 2.0f;
     style.FrameRounding     = 2.0f;
@@ -27,7 +28,7 @@ inline void apply_brutalist_theme() {
     style.TabBorderSize     = 1.0f;
 
     style.WindowPadding     = ImVec2(10.0f, 10.0f);
-    style.FramePadding      = ImVec2(6.0f, 4.0f);
+    style.FramePadding      = ImVec2(6.0f, 5.0f);
     style.ItemSpacing       = ImVec2(8.0f, 6.0f);
     style.ItemInnerSpacing  = ImVec2(6.0f, 4.0f);
     style.ScrollbarSize     = 10.0f;
@@ -35,83 +36,87 @@ inline void apply_brutalist_theme() {
 
     ImVec4* colors = style.Colors;
 
-    // Palette Definition
-    const ImVec4 kBgDeepBlack      = ImVec4(0.04f, 0.05f, 0.07f, 1.00f); // #0A0D12
-    const ImVec4 kBgPanel          = ImVec4(0.08f, 0.09f, 0.12f, 1.00f); // #14171F
-    const ImVec4 kBgElement        = ImVec4(0.12f, 0.14f, 0.18f, 1.00f); // #1F242E
-    const ImVec4 kBgHovered        = ImVec4(0.17f, 0.20f, 0.26f, 1.00f);
-    const ImVec4 kBgActive         = ImVec4(0.22f, 0.26f, 0.33f, 1.00f);
+    // 1. Drafting Table Palette
+    const ImVec4 kDeskSurface       = ImVec4(0.94f, 0.95f, 0.96f, 1.00f); // #F0F2F5 (Drafting mat)
+    const ImVec4 kVellumWhite       = ImVec4(0.99f, 0.99f, 1.00f, 1.00f); // #FCFDFE (Vellum paper card)
+    const ImVec4 kElementRecessed   = ImVec4(0.91f, 0.92f, 0.94f, 1.00f); // #E8EBEE (Recessed slot)
+    const ImVec4 kElementHovered    = ImVec4(0.85f, 0.88f, 0.92f, 1.00f); // #D9E0EB
+    const ImVec4 kElementActive     = ImVec4(0.78f, 0.82f, 0.88f, 1.00f); // #C7D1E0
 
-    const ImVec4 kBorderMuted      = ImVec4(0.20f, 0.23f, 0.29f, 1.00f); // Crisp panel edges
-    const ImVec4 kBorderAccent     = ImVec4(0.00f, 0.90f, 1.00f, 0.80f); // Neon Cyan border
-    (void)kBorderAccent;
+    // 2. Graphite Pencil & Technical Line Borders
+    const ImVec4 kBorderGraphite    = ImVec4(0.78f, 0.80f, 0.84f, 1.00f); // #C7CCD6 (Pencil line)
+    const ImVec4 kBorderSubtle      = ImVec4(0.86f, 0.88f, 0.90f, 1.00f); // #DCE0E6
 
-    const ImVec4 kCyanAccent       = ImVec4(0.00f, 0.90f, 1.00f, 1.00f); // #00E5FF
-    const ImVec4 kCyanDimmed       = ImVec4(0.00f, 0.55f, 0.65f, 1.00f);
-    const ImVec4 kAmberAccent      = ImVec4(1.00f, 0.70f, 0.00f, 1.00f); // #FFB300
-    const ImVec4 kRedSignal        = ImVec4(1.00f, 0.20f, 0.35f, 1.00f); // #FF3359
+    // 3. Technical Ink & Drafting Pens
+    const ImVec4 kDraftingInkDark   = ImVec4(0.10f, 0.12f, 0.16f, 1.00f); // #1A1E28 (Deep drafting ink)
+    const ImVec4 kDraftingInkMuted  = ImVec4(0.42f, 0.46f, 0.52f, 1.00f); // #6B7584 (Technical notation)
+    const ImVec4 kBlueprintCobalt   = ImVec4(0.12f, 0.38f, 0.85f, 1.00f); // #1F61D9 (Classic blueprint blue)
+    const ImVec4 kBlueprintLight    = ImVec4(0.24f, 0.50f, 0.95f, 1.00f);
+    const ImVec4 kDraftingAmber     = ImVec4(0.85f, 0.48f, 0.05f, 1.00f); // #D97B0D (Ruler ochre)
+    const ImVec4 kDraftingCrimson   = ImVec4(0.85f, 0.18f, 0.22f, 1.00f); // #D92E38 (Red pen)
+    (void)kDraftingAmber;
+    (void)kDraftingCrimson;
 
-    const ImVec4 kTextPrimary      = ImVec4(0.92f, 0.94f, 0.96f, 1.00f);
-    const ImVec4 kTextMuted        = ImVec4(0.50f, 0.55f, 0.62f, 1.00f);
-
-    colors[ImGuiCol_Text]                  = kTextPrimary;
-    colors[ImGuiCol_TextDisabled]          = kTextMuted;
-    colors[ImGuiCol_WindowBg]              = kBgDeepBlack;
-    colors[ImGuiCol_ChildBg]               = kBgPanel;
-    colors[ImGuiCol_PopupBg]               = kBgPanel;
-    colors[ImGuiCol_Border]                = kBorderMuted;
+    // Assign to ImGui Colors
+    colors[ImGuiCol_Text]                  = kDraftingInkDark;
+    colors[ImGuiCol_TextDisabled]          = kDraftingInkMuted;
+    colors[ImGuiCol_WindowBg]              = kDeskSurface;
+    colors[ImGuiCol_ChildBg]               = kVellumWhite;
+    colors[ImGuiCol_PopupBg]               = kVellumWhite;
+    colors[ImGuiCol_Border]                = kBorderGraphite;
     colors[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
 
-    colors[ImGuiCol_FrameBg]               = kBgElement;
-    colors[ImGuiCol_FrameBgHovered]        = kBgHovered;
-    colors[ImGuiCol_FrameBgActive]         = kBgActive;
+    colors[ImGuiCol_FrameBg]               = kElementRecessed;
+    colors[ImGuiCol_FrameBgHovered]        = kElementHovered;
+    colors[ImGuiCol_FrameBgActive]         = kElementActive;
 
-    colors[ImGuiCol_TitleBg]               = kBgPanel;
-    colors[ImGuiCol_TitleBgActive]         = ImVec4(0.06f, 0.10f, 0.14f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed]      = kBgDeepBlack;
+    colors[ImGuiCol_TitleBg]               = kDeskSurface;
+    colors[ImGuiCol_TitleBgActive]         = kDeskSurface;
+    colors[ImGuiCol_TitleBgCollapsed]      = kDeskSurface;
 
-    colors[ImGuiCol_MenuBarBg]             = kBgPanel;
-    colors[ImGuiCol_ScrollbarBg]           = kBgDeepBlack;
-    colors[ImGuiCol_ScrollbarGrab]         = kBgElement;
-    colors[ImGuiCol_ScrollbarGrabHovered]  = kBgHovered;
-    colors[ImGuiCol_ScrollbarGrabActive]   = kCyanDimmed;
+    colors[ImGuiCol_MenuBarBg]             = kVellumWhite;
+    colors[ImGuiCol_ScrollbarBg]           = kDeskSurface;
+    colors[ImGuiCol_ScrollbarGrab]         = kBorderGraphite;
+    colors[ImGuiCol_ScrollbarGrabHovered]  = kDraftingInkMuted;
+    colors[ImGuiCol_ScrollbarGrabActive]   = kBlueprintCobalt;
 
-    colors[ImGuiCol_CheckMark]             = kCyanAccent;
-    colors[ImGuiCol_SliderGrab]            = kCyanAccent;
-    colors[ImGuiCol_SliderGrabActive]      = ImVec4(0.30f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_CheckMark]             = kBlueprintCobalt;
+    colors[ImGuiCol_SliderGrab]            = kBlueprintCobalt;
+    colors[ImGuiCol_SliderGrabActive]      = kBlueprintLight;
 
-    colors[ImGuiCol_Button]                = kBgElement;
-    colors[ImGuiCol_ButtonHovered]         = kBgHovered;
-    colors[ImGuiCol_ButtonActive]          = kCyanDimmed;
+    colors[ImGuiCol_Button]                = kElementRecessed;
+    colors[ImGuiCol_ButtonHovered]         = kElementHovered;
+    colors[ImGuiCol_ButtonActive]          = kElementActive;
 
-    colors[ImGuiCol_Header]                = kBgHovered;
-    colors[ImGuiCol_HeaderHovered]         = kCyanDimmed;
-    colors[ImGuiCol_HeaderActive]          = kCyanAccent;
+    colors[ImGuiCol_Header]                = kElementHovered;
+    colors[ImGuiCol_HeaderHovered]         = kElementActive;
+    colors[ImGuiCol_HeaderActive]          = kBlueprintCobalt;
 
-    colors[ImGuiCol_Separator]             = kBorderMuted;
-    colors[ImGuiCol_SeparatorHovered]      = kCyanDimmed;
-    colors[ImGuiCol_SeparatorActive]       = kCyanAccent;
+    colors[ImGuiCol_Separator]             = kBorderSubtle;
+    colors[ImGuiCol_SeparatorHovered]      = kBorderGraphite;
+    colors[ImGuiCol_SeparatorActive]       = kBlueprintCobalt;
 
-    colors[ImGuiCol_ResizeGrip]            = kBgElement;
-    colors[ImGuiCol_ResizeGripHovered]     = kCyanDimmed;
-    colors[ImGuiCol_ResizeGripActive]      = kCyanAccent;
+    colors[ImGuiCol_ResizeGrip]            = kBorderGraphite;
+    colors[ImGuiCol_ResizeGripHovered]     = kBlueprintCobalt;
+    colors[ImGuiCol_ResizeGripActive]      = kBlueprintLight;
 
-    colors[ImGuiCol_Tab]                   = kBgElement;
-    colors[ImGuiCol_TabHovered]            = kBgHovered;
-    colors[ImGuiCol_TabActive]             = ImVec4(0.08f, 0.16f, 0.22f, 1.00f);
-    colors[ImGuiCol_TabUnfocused]          = kBgPanel;
-    colors[ImGuiCol_TabUnfocusedActive]    = kBgElement;
+    // Clean drafting tabs
+    colors[ImGuiCol_Tab]                   = kElementRecessed;
+    colors[ImGuiCol_TabHovered]            = kElementHovered;
+    colors[ImGuiCol_TabActive]             = kVellumWhite;
+    colors[ImGuiCol_TabUnfocused]          = kElementRecessed;
+    colors[ImGuiCol_TabUnfocusedActive]    = kVellumWhite;
 
-    colors[ImGuiCol_PlotLines]             = kCyanAccent;
-    colors[ImGuiCol_PlotLinesHovered]      = kAmberAccent;
-    colors[ImGuiCol_PlotHistogram]         = kAmberAccent;
-    colors[ImGuiCol_PlotHistogramHovered]  = kRedSignal;
+    colors[ImGuiCol_PlotLines]             = kBlueprintCobalt;
+    colors[ImGuiCol_PlotLinesHovered]      = kDraftingAmber;
+    colors[ImGuiCol_PlotHistogram]         = kBlueprintCobalt;
+    colors[ImGuiCol_PlotHistogramHovered]  = kDraftingCrimson;
 
-    colors[ImGuiCol_TableHeaderBg]         = kBgElement;
-    colors[ImGuiCol_TableBorderStrong]     = kBorderMuted;
-    colors[ImGuiCol_TableBorderLight]      = ImVec4(0.14f, 0.16f, 0.20f, 1.00f);
-    colors[ImGuiCol_TableRowBg]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_TableRowBgAlt]         = ImVec4(1.00f, 1.00f, 1.00f, 0.02f);
+    colors[ImGuiCol_TableHeaderBg]         = kElementRecessed;
+    colors[ImGuiCol_TableBorderStrong]     = kBorderGraphite;
+    colors[ImGuiCol_TableBorderLight]      = kBorderSubtle;
+    colors[ImGuiCol_TableRowBg]            = kVellumWhite;
+    colors[ImGuiCol_TableRowBgAlt]         = ImVec4(0.96f, 0.97f, 0.98f, 1.00f);
 }
 
 } // namespace audio_core::ui

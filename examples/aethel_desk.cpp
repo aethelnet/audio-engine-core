@@ -74,8 +74,9 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    // Apply Brutalist High-Contrast Workstation Theme
-    ui::apply_brutalist_theme();
+    // Apply Orderly Architect's Desk Theme
+    ui::apply_architect_desk_theme();
+
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
@@ -239,13 +240,14 @@ int main(int argc, char** argv) {
             }
 
             ImGui::SameLine(0, 20);
-            ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f), "[PIPEWIRE RT]");
+            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "[PIPEWIRE RT]");
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.6f, 0.65f, 0.75f, 1.0f), "| 48.0 kHz | 256s (5.3ms) | CPU: 3.8%%");
+            ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| 48.0 kHz | 256s (5.3ms) | CPU: 3.8%%");
 
             ImGui::SameLine(0, 30);
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "MASTER:");
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MASTER:");
             ImGui::SameLine();
+
 
             // Compact Master VU Meter
             ImVec2 meter_pos = ImGui::GetCursorScreenPos();
@@ -297,10 +299,13 @@ int main(int argc, char** argv) {
                     ImVec2 canvas_size = ImGui::GetContentRegionAvail();
                     canvas_size.y = std::max(canvas_size.y - 4.0f, 120.0f);
 
-                    // Draw Timeline Background
+                    // Draw Timeline Background (Pure Vellum White with Graphite Border)
                     draw_list->AddRectFilled(canvas_pos,
                                              ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
-                                             ImColor(14, 16, 21, 255), 2.0f);
+                                             ImColor(255, 255, 255, 255), 2.0f);
+                    draw_list->AddRect(canvas_pos,
+                                       ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+                                       ImColor(190, 196, 206, 255), 2.0f);
 
                     // Bar Grid lines (16 bars)
                     constexpr int kTotalBars = 16;
@@ -309,12 +314,12 @@ int main(int argc, char** argv) {
                         float bx = canvas_pos.x + b * bar_w;
                         draw_list->AddLine(ImVec2(bx, canvas_pos.y),
                                            ImVec2(bx, canvas_pos.y + canvas_size.y),
-                                           ImColor(35, 42, 54, 180), 1.0f);
+                                           ImColor(230, 235, 242, 255), 1.0f);
                         if (b < kTotalBars) {
                             char b_txt[16];
                             std::snprintf(b_txt, sizeof(b_txt), "%d.1", b + 1);
                             draw_list->AddText(ImVec2(bx + 4.0f, canvas_pos.y + 2.0f),
-                                               ImColor(100, 115, 135, 255), b_txt);
+                                               ImColor(100, 110, 125, 255), b_txt);
                         }
                     }
 
@@ -325,39 +330,40 @@ int main(int argc, char** argv) {
                         float ly = canvas_pos.y + 20.0f + t * lane_h;
                         draw_list->AddLine(ImVec2(canvas_pos.x, ly),
                                            ImVec2(canvas_pos.x + canvas_size.x, ly),
-                                           ImColor(25, 30, 40, 255), 1.0f);
+                                           ImColor(230, 235, 242, 255), 1.0f);
 
-                        // Highlight selected lane
+                        // Highlight selected lane (Subtle blueprint tint)
                         if (selected_track == t) {
                             draw_list->AddRectFilled(ImVec2(canvas_pos.x, ly),
                                                      ImVec2(canvas_pos.x + canvas_size.x, ly + lane_h),
-                                                     ImColor(0, 229, 255, 18));
+                                                     ImColor(31, 97, 217, 18));
                         }
 
-                        // Clip Blocks
+                        // Clip Blocks (Blueprint Blue Vellum Cards)
                         float clip_x1 = canvas_pos.x + (t * 2.0f) * bar_w;
                         float clip_x2 = clip_x1 + (4.0f) * bar_w;
                         draw_list->AddRectFilled(ImVec2(clip_x1 + 2.0f, ly + 4.0f),
                                                  ImVec2(clip_x2 - 2.0f, ly + lane_h - 4.0f),
-                                                 (selected_track == t) ? ImColor(0, 180, 220, 180) : ImColor(35, 55, 75, 160),
-                                                 3.0f);
+                                                 (selected_track == t) ? ImColor(215, 230, 255, 240) : ImColor(235, 242, 255, 220),
+                                                 2.0f);
                         draw_list->AddRect(ImVec2(clip_x1 + 2.0f, ly + 4.0f),
                                            ImVec2(clip_x2 - 2.0f, ly + lane_h - 4.0f),
-                                           ImColor(0, 229, 255, 200), 3.0f);
+                                           ImColor(31, 97, 217, 220), 2.0f);
                         draw_list->AddText(ImVec2(clip_x1 + 8.0f, ly + 8.0f),
-                                           ImColor(240, 245, 255, 255), track_names[t]);
+                                           ImColor(15, 30, 70, 255), track_names[t]);
                     }
 
-                    // Playhead Line
+                    // Precision Playhead Needle (Drafting Black)
                     float play_ratio = playhead_seconds / loop_length_seconds;
                     float playhead_x = canvas_pos.x + play_ratio * canvas_size.x;
                     draw_list->AddLine(ImVec2(playhead_x, canvas_pos.y),
                                        ImVec2(playhead_x, canvas_pos.y + canvas_size.y),
-                                       ImColor(255, 255, 255, 255), 2.0f);
+                                       ImColor(20, 25, 35, 255), 2.0f);
                     draw_list->AddTriangleFilled(ImVec2(playhead_x - 6.0f, canvas_pos.y),
                                                  ImVec2(playhead_x + 6.0f, canvas_pos.y),
                                                  ImVec2(playhead_x, canvas_pos.y + 10.0f),
-                                                 ImColor(255, 255, 255, 255));
+                                                 ImColor(20, 25, 35, 255));
+
 
                     // Click detection to select tracks
                     ImGui::InvisibleButton("TimelineCanvasBtn", canvas_size);
@@ -378,9 +384,10 @@ int main(int argc, char** argv) {
                 // TAB B: UNIVERSAL ROUTING MATRIX
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  UNIVERSAL ROUTING MATRIX  ")) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f),
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
                                        "Universal Lock-Free Matrix Grid (Zero Bitwig-Converters / Native Vectorized FMA)");
                     ImGui::Separator();
+
 
                     const char* row_names[4] = { "Track 1 (Kick/808)", "Track 2 (Acid 303)", "Track 3 (Vocal)", "Track 4 (Drums)" };
                     const char* col_names[3] = { "Master Bus", "Reverb Return", "Sidechain Ducker" };
@@ -456,8 +463,9 @@ int main(int argc, char** argv) {
                             }
 
                             // 4 Insert Slots
-                            ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.9f, 1.0f), "Insert Slots (4x):");
+                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "Insert Slots (4x):");
                             const char* slot_labels[4] = {
+
                                 (t == 0) ? "[Baxandall EQ]" : ((t == 1) ? "[PurestDrive]" : "[Empty]"),
                                 (t == 0) ? "[ButterComp2]" : ((t == 1) ? "[WASM Sat]" : "[Empty]"),
                                 "[Empty]",
@@ -545,7 +553,7 @@ int main(int argc, char** argv) {
                 // TAB 2: SAMPLE EDITOR / SLICER
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  SAMPLE EDITOR / SLICER  ")) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f),
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
                                        "Transient Slicer & Hermite Resampler [Selected Track: %d]", selected_track + 1);
                     ImGui::Separator();
 
@@ -582,7 +590,7 @@ int main(int argc, char** argv) {
                 // TAB 3: ENVELOPES & AUTOMATION
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  ENVELOPES & AUTOMATION  ")) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f),
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
                                        "Liquid ODE Trapezoidal Modulation Envelope (A-Stable C^inf)");
                     ImGui::Separator();
 
@@ -615,13 +623,13 @@ int main(int argc, char** argv) {
                 // TAB 4: WASM PLUGIN RACK & GAS WATCHDOG
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  WASM PLUGIN RACK & GAS METER  ")) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f),
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
                                        "Sovereign WebAssembly Host (Lock-Free RCU Hot-Swap & Gas Metering)");
                     ImGui::Separator();
 
                     ImGui::Text("Active Plugin: ");
                     ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "saturator.wasm (936 Bytes)");
+                    ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "saturator.wasm (936 Bytes)");
 
                     ImGui::Spacing();
                     ImVec2 gas_pos = ImGui::GetCursorScreenPos();
@@ -659,9 +667,10 @@ int main(int argc, char** argv) {
         // 5. Render to OpenGL
         ImGui::Render();
         glViewport(0, 0, win_w, win_h);
-        glClearColor(0.04f, 0.05f, 0.07f, 1.0f);
+        glClearColor(0.94f, 0.95f, 0.96f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
 
         glfwSwapBuffers(window);
     }
