@@ -5076,6 +5076,153 @@ void test_sample_tap_quantized_bounce_and_commit() {
               << "Committed to Track 2 & 3 | Retroactive grab verified)" << std::endl;
 }
 
+void test_step_sequencer_midi_pattern_clips_and_arranger() {
+    std::cout << "[TEST] Running Step-Sequencer MIDI Pattern Clips & Arranger Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+
+    MixerGraph mixer(256);
+    mixer.clock().set_sample_rate(48000);
+    mixer.clock().set_bpm(120.0); // 48000 Hz, 120 BPM -> 24000 samples/beat, 96000 samples/bar
+    mixer.clock().set_playing(true);
+
+    // 1. Synthesize multi-slice drum/synth clip (4 slices of distinct frequencies)
+    constexpr uint32_t kFrames = 4000;
+    auto clip = std::make_shared<AudioClip>("SequencerTestKit", 48000, 2, kFrames);
+    clip->slices().push_back({0, 0, 1000, 1.0f});       // Slice 0: 440 Hz (Kick/Sub)
+    clip->slices().push_back({1, 1000, 2000, 1.0f});    // Slice 1: 880 Hz (Snare)
+    clip->slices().push_back({2, 2000, 3000, 1.0f});    // Slice 2: 220 Hz (Deep Bass)
+    clip->slices().push_back({3, 3000, 4000, 1.0f});    // Slice 3: 1760 Hz (HiHat)
+
+    float* ch0 = clip->channel(0);
+    float* ch1 = clip->channel(1);
+    const float freqs[4] = {440.0f, 880.0f, 220.0f, 1760.0f};
+    for (int s = 0; s < 4; ++s) {
+        uint32_t start = s * 1000;
+        for (uint32_t i = 0; i < 1000; ++i) {
+            float val = 0.6f * std::sin(2.0f * std::numbers::pi_v<float> * freqs[s] * static_cast<float>(i) / 48000.0f);
+            ch0[start + i] = val;
+            ch1[start + i] = val;
+        }
+    }
+
+    // 2. Track & Sequencer Integration
+    Track* trk = mixer.add_track("StepTrack");
+    TEST_CHECK(trk != nullptr);
+
+    auto seq = std::make_shared<StepSequencer>(clip);
+    trk->set_sequencer(seq);
+    TEST_CHECK(trk->sequencer() == seq.get());
+
+    // Initially in Arranger mode (sequencer disabled)
+    trk->enable_sequencer(false);
+    TEST_CHECK(!trk->is_sequencer_enabled());
+
+    // 3. Program Patterns in StepSequencer
+    // Pattern 0 ("Straight Beat"): 4-on-the-floor
+    auto& p0 = seq->pattern(0);
+    p0.name = "Straight Beat";
+    p0.clear();
+    p0.set_step(0, 0, 1.0f);  // Step 0: Slice 0 (Kick)
+    p0.set_step(4, 1, 0.9f);  // Step 4: Slice 1 (Snare)
+    p0.set_step(8, 0, 1.0f);  // Step 8: Slice 0 (Kick)
+    p0.set_step(12, 1, 0.95f);// Step 12: Slice 1 (Snare)
+    TEST_CHECK(p0.is_step_active(0));
+    TEST_CHECK(p0.is_step_active(4));
+    TEST_CHECK(!p0.is_step_active(1));
+
+    // Pattern 1 ("Drop"): Syncopated bass & hats
+    auto& p1 = seq->pattern(1);
+    p1.name = "Drop";
+    p1.clear();
+    p1.set_step(0, 2, 1.0f, 0.5f); // Deep octave-down bass
+    p1.set_step(2, 3, 0.8f);       // Hat
+    p1.set_step(6, 3, 0.8f);       // Hat
+    p1.set_step(8, 2, 1.0f, 1.0f); // Bass root
+
+    // 4. Test Step Grid Editing Helpers (toggle_step)
+    p1.toggle_step(10, 3, 0.85f);
+    TEST_CHECK(p1.is_step_active(10));
+    TEST_CHECK(p1.steps[10].slice_id == 3);
+    p1.toggle_step(10);
+    TEST_CHECK(!p1.is_step_active(10));
+
+    // 5. Test Clip Launcher Trigger: Launch Pattern 0 with Bar-Quantization
+    trk->enable_sequencer(true);
+    TEST_CHECK(trk->is_sequencer_enabled());
+
+    // Clock set to middle of bar 0 (sample 48000)
+    mixer.clock().set_sample_position(48000);
+    seq->queue_pattern_switch(0, PatternSwitchMode::BarQuantized);
+    TEST_CHECK(seq->has_queued_pattern());
+    TEST_CHECK(seq->is_pattern_queued(0));
+    TEST_CHECK(!seq->is_pattern_queued(1));
+
+    AudioBuffer master_buf(2, 256);
+    auto master_view = master_buf.view();
+
+    // Render blocks before downbeat (up to sample 95616)
+    for (int i = 0; i < 186; ++i) {
+        mixer.render(master_view);
+    }
+    // Still waiting for downbeat!
+    TEST_CHECK(seq->has_queued_pattern());
+    TEST_CHECK(seq->is_pattern_queued(0));
+
+    // Render blocks crossing 96000 (bar 1 downbeat)
+    mixer.render(master_view);
+    mixer.render(master_view); // Crosses sample 96000!
+
+    // Pattern 0 must now be active and queue cleared!
+    TEST_CHECK(!seq->has_queued_pattern());
+    TEST_CHECK(seq->current_pattern_index() == 0);
+
+    // Verify audio energy on master bus from step sequencer rendering
+    float p0_energy = 0.0f;
+    for (int i = 0; i < 20; ++i) {
+        mixer.render(master_view);
+        for (uint32_t s = 0; s < 256; ++s) {
+            p0_energy += std::abs(master_buf.channel(0)[s]);
+        }
+    }
+    TEST_CHECK(p0_energy > 1.0f);
+    TEST_CHECK(seq->current_step_index() < 16);
+
+    // 6. Test Bar-Quantized Switch from Pattern 0 to Pattern 1
+    seq->queue_pattern_switch(1, PatternSwitchMode::BarQuantized);
+    TEST_CHECK(seq->has_queued_pattern());
+    TEST_CHECK(seq->is_pattern_queued(1));
+
+    // Still on pattern 0 before bar 2 downbeat
+    TEST_CHECK(seq->current_pattern_index() == 0);
+
+    // Advance until next bar downbeat (sample 192000)
+    while (seq->has_queued_pattern()) {
+        mixer.render(master_view);
+    }
+    // Switched to Pattern 1 seamlessly!
+    TEST_CHECK(seq->current_pattern_index() == 1);
+    TEST_CHECK(!seq->has_queued_pattern());
+
+    // 7. Test Manual MPC Pad Triggering (Lock-free realtime dispatch)
+    TEST_CHECK(seq->trigger_slice(3, 1.0f)); // Trigger HiHat pad
+    mixer.render(master_view);
+    TEST_CHECK(seq->is_voice_active());
+
+    // 8. Test Stop & Return to Arranger
+    seq->stop();
+    TEST_CHECK(!seq->is_voice_active());
+    TEST_CHECK(seq->current_step_index() == 0);
+
+    trk->enable_sequencer(false);
+    TEST_CHECK(!trk->is_sequencer_enabled());
+
+    std::cout << "  -> Step-Sequencer MIDI Pattern Clips & Arranger: PASSED ("
+              << "Bar-quantized pattern switch verified | Live step grid toggling verified | "
+              << "Micro-fade choke voice active | Manual MPC trigger verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -5124,6 +5271,7 @@ int main() {
     test_derez_sampler_variable_clock_pitch();
     test_ptp_hardware_and_kernel_timestamping();
     test_sample_tap_quantized_bounce_and_commit();
+    test_step_sequencer_midi_pattern_clips_and_arranger();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

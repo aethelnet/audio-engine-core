@@ -72,6 +72,24 @@ struct Pattern {
             set_step(i, i, velocity);
         }
     }
+
+    std::string name{"Pattern"};
+
+    [[nodiscard]] bool is_step_active(size_t idx) const noexcept {
+        return (idx < kMaxSteps) ? steps[idx].active : false;
+    }
+
+    void toggle_step(size_t idx, uint32_t slice_id = 0, float velocity = 1.0f) noexcept {
+        if (idx < kMaxSteps) {
+            steps[idx].active = !steps[idx].active;
+            if (steps[idx].active) {
+                steps[idx].slice_id = slice_id;
+                steps[idx].velocity = std::clamp(velocity, 0.0f, 1.0f);
+                if (steps[idx].pitch_ratio <= 0.0f) steps[idx].pitch_ratio = 1.0f;
+                if (steps[idx].probability == 0) steps[idx].probability = 100;
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -129,6 +147,19 @@ public:
         return m_has_queued_pattern.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] uint32_t current_step_index() const noexcept {
+        return m_current_step.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] PatternSwitchMode switch_mode() const noexcept {
+        return m_switch_mode.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool is_pattern_queued(uint32_t pat_idx) const noexcept {
+        return m_has_queued_pattern.load(std::memory_order_relaxed) &&
+               m_queued_pattern.load(std::memory_order_relaxed) == (pat_idx % kMaxPatterns);
+    }
+
     // Direct / Immediate pattern switch (switches right now without waiting)
     void switch_pattern_immediate(uint32_t pattern_idx) noexcept {
         m_current_pattern.store(pattern_idx % kMaxPatterns, std::memory_order_relaxed);
@@ -164,6 +195,7 @@ public:
     void stop() noexcept {
         m_primary_voice.active = false;
         m_choked_voice.active = false;
+        m_current_step.store(0, std::memory_order_relaxed);
     }
 
     [[nodiscard]] bool is_voice_active() const noexcept {
@@ -241,6 +273,7 @@ public:
 
                 if (trigger_now && active_pattern.num_steps > 0) {
                     const uint32_t step_idx = static_cast<uint32_t>(step_index_total % active_pattern.num_steps);
+                    m_current_step.store(step_idx, std::memory_order_relaxed);
                     const auto& step = active_pattern.steps[step_idx];
                     if (step.active) {
                         bool fire = true;
@@ -399,6 +432,7 @@ private:
     std::atomic<uint32_t> m_queued_pattern{0};
     std::atomic<bool> m_has_queued_pattern{false};
     std::atomic<PatternSwitchMode> m_switch_mode{PatternSwitchMode::BarQuantized};
+    std::atomic<uint32_t> m_current_step{0};
 
     SliceVoice m_primary_voice{};
     SliceVoice m_choked_voice{};
