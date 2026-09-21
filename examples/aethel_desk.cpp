@@ -11,6 +11,7 @@
 #include "audio_core/sampling/wav_reader.hpp"
 #include "audio_core/sampling/sample_repair.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
+#include "audio_core/dsp/derez.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -180,6 +181,14 @@ int main(int argc, char** argv) {
     drive->set_parameter(0, 0.60f); // Harmonic saturation
     trk1->slot(0).set_processor(drive);
 
+    auto derez = std::make_shared<dsp::DeRez>();
+    derez->init(kSampleRate);
+    derez->set_parameter(0, 0.90f); // 32kHz rate decimation
+    derez->set_parameter(1, 0.80f); // 12-bit SP-1200 grit
+    derez->set_parameter(2, 0.0f);  // mu-Law vintage companding
+    derez->set_parameter(3, 1.0f);  // 100% wet
+    trk2->slot(0).set_processor(derez);
+
     auto drum_bus_comp = std::make_shared<dsp::ButterComp2>();
     drum_bus_comp->init(kSampleRate);
     drum_bus_comp->set_parameter(0, 0.35f); // Bus glue compression
@@ -257,6 +266,10 @@ int main(int argc, char** argv) {
     bool sample_reverse = false;
     bool sample_choke = true;
     bool creative_click_bypass = false;
+    float derez_rate = 0.85f;
+    float derez_res = 0.70f;
+    float derez_hard = 0.0f; // 0 = vintage mu-law soft, 1 = raw digital
+    float derez_wet = 1.0f;
     char manual_wav_path[512] = "";
     char status_toast[256] = "READY // DRAG & DROP ANY .WAV AUDIO FILE ONTO THE WORKSTATION";
 
@@ -1010,20 +1023,29 @@ int main(int argc, char** argv) {
 
                             // 4 Insert Slots
                             ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "Insert Slots (4x):");
-                            const char* slot_labels[4] = {
-                                (t == 0) ? "[Baxandall EQ]" : ((t == 1) ? "[PurestDrive]" : "[Empty]"),
-                                (t == 0) ? "[ButterComp2]" : ((t == 1) ? "[WASM Sat]" : "[Empty]"),
-                                "[Empty]",
-                                "[Empty]"
-                            };
+                            auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             for (int s = 0; s < 4; ++s) {
                                 ImGui::PushID(s);
                                 ImGui::TextDisabled("S%d:", s + 1);
                                 ImGui::SameLine();
-                                ImGui::Button(slot_labels[s], ImVec2(100, 18));
+                                const char* slot_name = "[Empty]";
+                                bool is_by = false;
+                                if (trk_ptr && trk_ptr->slot(s).processor()) {
+                                    slot_name = trk_ptr->slot(s).processor()->name();
+                                    is_by = trk_ptr->slot(s).is_bypassed();
+                                }
+                                char btn_label[48];
+                                std::snprintf(btn_label, sizeof(btn_label), "%.14s", slot_name);
+                                ImGui::Button(btn_label, ImVec2(100, 18));
+                                if (ImGui::IsItemHovered() && trk_ptr && trk_ptr->slot(s).processor()) {
+                                    ImGui::SetTooltip("%s", trk_ptr->slot(s).processor()->name());
+                                }
                                 ImGui::SameLine();
-                                static bool bypass[4][4] = {};
-                                ImGui::Checkbox("By", &bypass[t][s]);
+                                if (ImGui::Checkbox("By", &is_by)) {
+                                    if (trk_ptr) {
+                                        trk_ptr->slot(s).set_bypass(is_by);
+                                    }
+                                }
                                 ImGui::PopID();
                             }
 
@@ -1322,8 +1344,8 @@ int main(int argc, char** argv) {
                                            play_ratio, slice_points, active_slice);
                     ImGui::Dummy(wf_size);
 
-                    // Processing Control Groups (3 Panels)
-                    float panel_w = (ImGui::GetContentRegionAvail().x - 24.0f) / 3.0f;
+                    // Processing Control Groups (4 Panels)
+                    float panel_w = (ImGui::GetContentRegionAvail().x - 36.0f) / 4.0f;
 
                     // Panel A: Mastering Normalization
                     ImGui::BeginChild("PanelNorm", ImVec2(panel_w, 140), true);
@@ -1400,7 +1422,7 @@ int main(int argc, char** argv) {
                             "3: Rubberband WSOLA",
                             "4: Sovereign ODE Kinetic"
                         };
-                        ImGui::SetNextItemWidth(170);
+                        ImGui::SetNextItemWidth(panel_w * 0.60f);
                         ImGui::Combo("##Algo", &pitch_algo_mode, algo_names, 4);
                         ImGui::SameLine();
                         if (ImGui::Button("RESET##Orig", ImVec2(-1, 20))) {
@@ -1412,10 +1434,10 @@ int main(int argc, char** argv) {
                             }
                         }
 
-                        ImGui::SetNextItemWidth(130);
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
                         ImGui::SliderFloat("Pitch", &sample_pitch_shift, -24.0f, 24.0f, "%.1f st");
                         ImGui::SameLine();
-                        ImGui::SetNextItemWidth(130);
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
                         ImGui::SliderFloat("Stretch", &sample_time_stretch, 0.25f, 4.0f, "%.2fx");
 
                         if (ImGui::Button("PROCESS & APPLY STRETCH", ImVec2(-1, 24))) {
@@ -1428,6 +1450,56 @@ int main(int argc, char** argv) {
                                     std::snprintf(status_toast, sizeof(status_toast), "STRETCHED VIA %s (%u frames)",
                                                   algo_names[pitch_algo_mode], stretched->num_frames());
                                 }
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::SameLine();
+
+                    // Panel D: Airwindows DeRez2 Vintage Sampler Decimator
+                    ImGui::BeginChild("PanelDeRez", ImVec2(panel_w, 140), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.85f, 0.20f, 0.35f, 1.0f), "AIRWINDOWS DEREZ2 CRUNCH");
+                        ImGui::Separator();
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
+                        ImGui::SliderFloat("Rate##DR", &derez_rate, 0.0f, 1.0f, "%.2f");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
+                        ImGui::SliderFloat("Bits##DR", &derez_res, 0.0f, 1.0f, "%.2f");
+
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
+                        ImGui::SliderFloat("Hard##DR", &derez_hard, 0.0f, 1.0f, "%.2f");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(panel_w * 0.45f);
+                        ImGui::SliderFloat("Wet##DR", &derez_wet, 0.0f, 1.0f, "%.2f");
+
+                        float btn_w = (panel_w - 24.0f) / 3.0f;
+                        if (ImGui::Button("SP-1200", ImVec2(btn_w, 20))) {
+                            derez_rate = 0.85f; derez_res = 0.70f; derez_hard = 0.0f;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Mirage", ImVec2(btn_w, 20))) {
+                            derez_rate = 0.70f; derez_res = 0.40f; derez_hard = 0.0f;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Lo-Fi 4b", ImVec2(btn_w, 20))) {
+                            derez_rate = 0.50f; derez_res = 0.20f; derez_hard = 1.0f;
+                        }
+
+                        if (ImGui::Button("APPLY DEREZ2 CRUNCH", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                dsp::DeRez proc;
+                                proc.init(cur_clip->sample_rate());
+                                proc.set_parameter(0, derez_rate);
+                                proc.set_parameter(1, derez_res);
+                                proc.set_parameter(2, derez_hard);
+                                proc.set_parameter(3, derez_wet);
+                                proc.process_stereo(cur_clip->channel(0), cur_clip->channel(1), cur_clip->num_frames());
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast),
+                                              "APPLIED DEREZ2 CRUNCH (Rate=%.2f, Res=%.2f, Hard=%.2f)",
+                                              derez_rate, derez_res, derez_hard);
                             }
                         }
                     }

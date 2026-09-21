@@ -39,6 +39,7 @@
 #include "audio_core/sampling/wav_reader.hpp"
 #include "audio_core/sampling/sample_repair.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
+#include "audio_core/dsp/derez.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -4580,6 +4581,141 @@ void test_wav_reader_pitch_stretcher_and_sample_repair() {
               << " | Sovereign ODE transient punch=" << ode_out->channel(0)[0] << ")" << std::endl;
 }
 
+void test_airwindows_derez2_decimator() {
+    std::cout << "[TEST] Running Airwindows DeRez2 Bit & Rate Decimator Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+
+    DeRez derez;
+    derez.init(48000);
+    TEST_CHECK(std::string(derez.name()) == "Airwindows DeRez2");
+
+    // 1. Clean Passthrough Test (Rate=1.0, Res=1.0, Hard=1.0, Wet=1.0)
+    constexpr uint32_t kFrames = 512;
+    std::vector<Sample> left(kFrames);
+    std::vector<Sample> right(kFrames);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float val = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / 48000.0f) * 0.5f;
+        left[i] = val;
+        right[i] = val;
+    }
+
+    // Warm up smoothing
+    for (int w = 0; w < 4; ++w) {
+        derez.process_stereo(left.data(), right.data(), kFrames);
+    }
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float val = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i + kFrames) / 48000.0f) * 0.5f;
+        left[i] = val;
+        right[i] = val;
+    }
+    std::vector<Sample> ref_l = left;
+    derez.process_stereo(left.data(), right.data(), kFrames);
+
+    // 1. Bit-Exact Dry Bypass Test (Wet = 0.0f)
+    derez.set_parameter(3, 0.0f);
+    left = ref_l;
+    right = ref_l;
+    derez.process_stereo(left.data(), right.data(), kFrames);
+    float max_diff_dry = 0.0f;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        max_diff_dry = std::max(max_diff_dry, std::abs(left[i] - ref_l[i]));
+    }
+    TEST_CHECK(max_diff_dry < 1e-6f); // Bit-exact dry passthrough
+
+    // Settle with Wet = 1.0f at native rate
+    derez.set_parameter(3, 1.0f);
+    for (int w = 0; w < 4; ++w) {
+        derez.process_stereo(left.data(), right.data(), kFrames);
+    }
+    float max_val = 0.0f;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        max_val = std::max(max_val, std::abs(left[i]));
+    }
+    TEST_CHECK(max_val > 0.45f && max_val < 0.55f); // Signal passes with unity gain
+
+    // 2. Continuous Sample Rate Reduction (Frequency crushing)
+    derez.reset();
+    derez.set_parameter(0, 0.1f); // Severe sample rate reduction
+    derez.set_parameter(1, 1.0f); // Clean bit depth
+    derez.set_parameter(2, 1.0f); // Hard digital mode
+
+    // Warm up parameter smoothing
+    for (int w = 0; w < 4; ++w) {
+        derez.process_stereo(left.data(), right.data(), kFrames);
+    }
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        left[i] = std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * static_cast<float>(i) / 48000.0f) * 0.8f;
+        right[i] = left[i];
+    }
+    derez.process_stereo(left.data(), right.data(), kFrames);
+
+    uint32_t repeated_or_held = 0;
+    for (uint32_t i = 1; i < kFrames; ++i) {
+        if (std::abs(left[i] - left[i - 1]) < 1e-4f) {
+            repeated_or_held++;
+        }
+    }
+    TEST_CHECK(repeated_or_held > 100);
+
+    // 3. Bit Depth Decimation & mu-Law vs Hard Mode Test
+    derez.reset();
+    derez.set_parameter(0, 1.0f);  // Native sample rate
+    derez.set_parameter(1, 0.05f); // Extreme bit crushing (~ 1-2 bits)
+    derez.set_parameter(2, 1.0f);  // Hard linear digital mode
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        left[i] = 0.02f; // Small amplitude signal
+        right[i] = 0.02f;
+    }
+    for (int w = 0; w < 4; ++w) {
+        derez.process_stereo(left.data(), right.data(), kFrames);
+    }
+    float hard_out = std::abs(left[kFrames - 1]);
+
+    // Now test with soft mu-law companding mode (Hard = 0.0f)
+    derez.reset();
+    derez.set_parameter(0, 1.0f);
+    derez.set_parameter(1, 0.05f);
+    derez.set_parameter(2, 0.0f); // mu-law logarithmic companding
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        left[i] = 0.02f;
+        right[i] = 0.02f;
+    }
+    for (int w = 0; w < 4; ++w) {
+        derez.process_stereo(left.data(), right.data(), kFrames);
+    }
+    float mulaw_out = std::abs(left[kFrames - 1]);
+
+    // In Hard mode, linear quantization forces a 0.02 whisper up to 0.20 (huge quantization jump)
+    // In Soft mu-law mode, companding preserves micro-dynamics (0.02 -> ~0.034, drastically reducing error)
+    float hard_err = std::abs(hard_out - 0.02f);
+    float mulaw_err = std::abs(mulaw_out - 0.02f);
+    TEST_CHECK(mulaw_out > 0.0f);
+    TEST_CHECK(mulaw_err < hard_err); // mu-law drastically suppresses low-level quantization error
+
+    // 4. InsertSlot Hosting Verification
+    InsertSlot slot;
+    slot.init(48000);
+    auto derez_proc = std::make_shared<DeRez>();
+    derez_proc->set_parameter(0, 0.7f);
+    derez_proc->set_parameter(1, 0.7f);
+    slot.set_processor(derez_proc);
+
+    TEST_CHECK(slot.processor() != nullptr);
+    TEST_CHECK(std::string(slot.processor()->name()) == "Airwindows DeRez2");
+
+    slot.process_stereo(left.data(), right.data(), kFrames);
+    TEST_CHECK(!slot.has_fault());
+    TEST_CHECK(!slot.is_circuit_breaker_tripped());
+
+    std::cout << "  -> Airwindows DeRez2 Bit & Rate Decimator: PASSED (Continuous rate reduction held="
+              << repeated_or_held << " | mu-law preserved=" << mulaw_out
+              << " | InsertSlot hosting verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4623,6 +4759,7 @@ int main() {
     test_wasm_sidechain_and_arbitrary_buffer_chunking();
     test_kinetic_hit_meter_and_submix_bus_telemetry();
     test_wav_reader_pitch_stretcher_and_sample_repair();
+    test_airwindows_derez2_decimator();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
