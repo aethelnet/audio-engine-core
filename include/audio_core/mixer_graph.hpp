@@ -631,6 +631,10 @@ public:
         m_routing_matrix.clear_all_patches();
     }
 
+    bool update_route_conditioning(uint32_t patch_id, const routing::InlineConditionerConfig& config) noexcept {
+        return m_routing_matrix.update_patch_config(patch_id, config);
+    }
+
     int32_t connect_sidechain(uint32_t src_track_id, uint32_t dst_track_id,
                               uint32_t dst_slot_idx = 0, float lowpass_hz = 0.0f,
                               routing::TapPoint tap = routing::TapPoint::Input) noexcept {

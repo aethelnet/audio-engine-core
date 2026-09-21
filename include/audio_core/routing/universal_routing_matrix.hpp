@@ -190,6 +190,30 @@ public:
         return m_routes;
     }
 
+    [[nodiscard]] std::array<RoutingPatch, kMaxRoutes>& patches() noexcept {
+        return m_routes;
+    }
+
+    [[nodiscard]] RoutingPatch* get_patch(uint32_t patch_id) noexcept {
+        for (size_t i = 0; i < kMaxRoutes; ++i) {
+            if (m_routes[i].active && m_routes[i].id == patch_id) {
+                return &m_routes[i];
+            }
+        }
+        return nullptr;
+    }
+
+    bool update_patch_config(uint32_t patch_id, const InlineConditionerConfig& config) noexcept {
+        for (size_t i = 0; i < kMaxRoutes; ++i) {
+            if (m_routes[i].active && m_routes[i].id == patch_id) {
+                m_routes[i].conditioning = config;
+                m_conditioners[i].set_config(config);
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ------------------------------------------------------------------------
     // Network / Dante Tap Input Feed (Called when AoIP frames arrive)
     // ------------------------------------------------------------------------

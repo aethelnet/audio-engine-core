@@ -345,19 +345,9 @@ int main(int argc, char** argv) {
     float wasm_param1 = 0.55f;
     float wasm_param2 = 0.30f;
 
-    // Matrix routing crosspoints (4 sources x 3 destinations)
-    bool matrix_routes[4][3] = {
-        { true, false, false },
-        { true, true,  false },
-        { true, false, true  },
-        { true, false, false }
-    };
-    float matrix_gains[4][3] = {
-        { 1.0f, 0.0f, 0.0f },
-        { 1.0f, 0.4f, 0.0f },
-        { 1.0f, 0.0f, 0.6f },
-        { 1.0f, 0.0f, 0.0f }
-    };
+    // Universal Routing Matrix state: Pre-connect Track 1 Kick -> Track 2 Acid SC (120Hz Cytomic SVF)
+    mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
+    uint32_t selected_patch_id = 1;
 
     protocol::MixerTelemetryFrame telemetry{};
     auto last_time = std::chrono::high_resolution_clock::now();
@@ -878,45 +868,254 @@ int main(int argc, char** argv) {
                 }
 
                 // ------------------------------------------------------------
-                // TAB B: UNIVERSAL ROUTING MATRIX
+                // TAB C: UNIVERSAL ROUTING MATRIX & SIGNAL CONDITIONER
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  UNIVERSAL ROUTING MATRIX  ")) {
                     ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
-                                       "Universal Lock-Free Matrix Grid (Zero Bitwig-Converters / Native Vectorized FMA)");
+                                       "Universal Lock-Free Matrix Grid & Cytomic SVF Inline Conditioner");
                     ImGui::Separator();
 
+                    struct MatrixSource {
+                        const char* name;
+                        routing::RoutingSourceType type;
+                        uint32_t id;
+                    };
 
-                    const char* row_names[4] = { "Track 1 (Kick/808)", "Track 2 (Acid 303)", "Track 3 (Vocal)", "Track 4 (Drums)" };
-                    const char* col_names[3] = { "Master Bus", "Reverb Return", "Sidechain Ducker" };
+                    struct MatrixDest {
+                        const char* name;
+                        routing::RoutingDestType type;
+                        uint32_t id;
+                        uint32_t slot;
+                    };
 
-                    if (ImGui::BeginTable("MatrixTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                        ImGui::TableSetupColumn("Source \\ Destination", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-                        ImGui::TableSetupColumn(col_names[0], ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn(col_names[1], ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn(col_names[2], ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableHeadersRow();
+                    const MatrixSource sources[6] = {
+                        { "Trk 1: Kick/808", routing::RoutingSourceType::TrackAudio, trk0->id() },
+                        { "Trk 2: Acid 303", routing::RoutingSourceType::TrackAudio, trk1->id() },
+                        { "Trk 3: Vocal",    routing::RoutingSourceType::TrackAudio, trk2->id() },
+                        { "Trk 4: Drums",    routing::RoutingSourceType::TrackAudio, trk3->id() },
+                        { "Dante Net Ch 1",  routing::RoutingSourceType::NetworkAoip, 0 },
+                        { "Dante Net Ch 2",  routing::RoutingSourceType::NetworkAoip, 1 }
+                    };
 
-                        for (int r = 0; r < 4; ++r) {
-                            ImGui::TableNextRow();
-                            ImGui::TableSetColumnIndex(0);
-                            ImGui::Text("%s", row_names[r]);
+                    const MatrixDest dests[5] = {
+                        { "Trk 1 Comp SC", routing::RoutingDestType::TrackSidechain, trk0->id(), 1 },
+                        { "Trk 2 SC",      routing::RoutingDestType::TrackSidechain, trk1->id(), 0 },
+                        { "Trk 3 SC",      routing::RoutingDestType::TrackSidechain, trk2->id(), 0 },
+                        { "Aux 1 Reverb",  routing::RoutingDestType::BusAuxInput, bus_reverb->id(), 0 },
+                        { "Aux 2 Delay",   routing::RoutingDestType::BusAuxInput, bus_delay->id(), 0 }
+                    };
 
-                            for (int c = 0; c < 3; ++c) {
-                                ImGui::TableSetColumnIndex(c + 1);
-                                ImGui::PushID(r * 10 + c);
-                                if (ImGui::Checkbox("Route", &matrix_routes[r][c])) {
-                                    // Lock-free matrix patch command
-                                }
-                                if (matrix_routes[r][c]) {
-                                    ImGui::SameLine();
-                                    ImGui::SetNextItemWidth(70);
-                                    ImGui::SliderFloat("dB", &matrix_gains[r][c], 0.0f, 1.0f, "%.2f");
-                                }
-                                ImGui::PopID();
-                            }
+                    float left_w = ImGui::GetContentRegionAvail().x - 330.0f;
+                    if (left_w < 400.0f) left_w = 400.0f;
+
+                    // Left Column: Interactive Pin Matrix Grid
+                    ImGui::BeginChild("MatrixGridArea", ImVec2(left_w, 0), false);
+                    {
+                        // Quick Macro Buttons
+                        if (ImGui::Button("+ Kick->Acid Duck (120Hz LP)")) {
+                            int32_t pid = mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
+                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
                         }
-                        ImGui::EndTable();
+                        ImGui::SameLine();
+                        if (ImGui::Button("+ Vocal->Reverb")) {
+                            routing::RoutingPatch p{};
+                            p.source_type = routing::RoutingSourceType::TrackAudio;
+                            p.source_id = trk2->id();
+                            p.dest_type = routing::RoutingDestType::BusAuxInput;
+                            p.dest_id = bus_reverb->id();
+                            p.tap_point = routing::TapPoint::PostInsert;
+                            p.conditioning.gain = 0.5f;
+                            p.tag = "Vocal -> Aux 1 Reverb";
+                            int32_t pid = mixer.add_route(p);
+                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("+ Dante Ch1->Trk3")) {
+                            int32_t pid = mixer.connect_network_sidechain(0, trk2->id(), 0, 1.0f);
+                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear All")) {
+                            mixer.clear_routes();
+                            selected_patch_id = 0;
+                        }
+
+                        ImGui::Spacing();
+
+                        if (ImGui::BeginTable("MatrixGridTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
+                            ImGui::TableSetupColumn("Source \\ Destination", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                            for (int c = 0; c < 5; ++c) {
+                                ImGui::TableSetupColumn(dests[c].name, ImGuiTableColumnFlags_WidthStretch);
+                            }
+                            ImGui::TableHeadersRow();
+
+                            for (int r = 0; r < 6; ++r) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextColored(ImVec4(0.2f, 0.25f, 0.35f, 1.0f), "%s", sources[r].name);
+
+                                for (int c = 0; c < 5; ++c) {
+                                    ImGui::TableSetColumnIndex(c + 1);
+                                    ImGui::PushID(r * 100 + c);
+
+                                    // Find if patch is active
+                                    uint32_t patch_id = 0;
+                                    bool is_feedback = false;
+                                    const auto& patches = mixer.routing_matrix().patches();
+                                    for (size_t p = 0; p < routing::UniversalRoutingMatrix::kMaxRoutes; ++p) {
+                                        if (patches[p].active &&
+                                            patches[p].source_type == sources[r].type &&
+                                            patches[p].source_id == sources[r].id &&
+                                            patches[p].dest_type == dests[c].type &&
+                                            patches[p].dest_id == dests[c].id &&
+                                            patches[p].dest_slot == dests[c].slot) {
+                                            patch_id = patches[p].id;
+                                            is_feedback = patches[p].is_feedback;
+                                            break;
+                                        }
+                                    }
+
+                                    if (patch_id > 0) {
+                                        bool is_selected = (selected_patch_id == patch_id);
+                                        char btn_label[32];
+                                        if (is_feedback) {
+                                            std::snprintf(btn_label, sizeof(btn_label), "[ ⮌ Z⁻¹ ]##%u", patch_id);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.35f, 0.1f, 1.0f));
+                                        } else if (is_selected) {
+                                            std::snprintf(btn_label, sizeof(btn_label), "[ ● SEL ]##%u", patch_id);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 1.0f));
+                                        } else {
+                                            std::snprintf(btn_label, sizeof(btn_label), "[ ● ON ]##%u", patch_id);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.85f, 0.8f));
+                                        }
+
+                                        if (ImGui::Button(btn_label, ImVec2(-22, 22))) {
+                                            selected_patch_id = patch_id;
+                                        }
+                                        ImGui::PopStyleColor();
+
+                                        ImGui::SameLine();
+                                        if (ImGui::Button("x##del", ImVec2(18, 22))) {
+                                            mixer.remove_route(patch_id);
+                                            if (selected_patch_id == patch_id) selected_patch_id = 0;
+                                        }
+                                    } else {
+                                        if (ImGui::Button("[ + ]", ImVec2(-1, 22))) {
+                                            routing::RoutingPatch new_p{};
+                                            new_p.source_type = sources[r].type;
+                                            new_p.source_id = sources[r].id;
+                                            new_p.dest_type = dests[c].type;
+                                            new_p.dest_id = dests[c].id;
+                                            new_p.dest_slot = dests[c].slot;
+                                            new_p.tap_point = routing::TapPoint::Input;
+                                            new_p.source_channel = routing::RouteChannel::MonoSum;
+                                            new_p.dest_channel = routing::RouteChannel::StereoBoth;
+                                            new_p.conditioning.gain = 1.0f;
+                                            new_p.tag = std::string(sources[r].name) + " -> " + dests[c].name;
+                                            int32_t pid = mixer.add_route(new_p);
+                                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
+                                        }
+                                    }
+
+                                    ImGui::PopID();
+                                }
+                            }
+                            ImGui::EndTable();
+                        }
                     }
+                    ImGui::EndChild();
+
+                    // Right Column: Inline Signal Conditioner Inspector
+                    ImGui::SameLine();
+                    ImGui::BeginChild("PatchInspectorArea", ImVec2(0, 0), true);
+                    {
+                        routing::RoutingPatch* cur_patch = (selected_patch_id > 0)
+                            ? mixer.routing_matrix().get_patch(selected_patch_id) : nullptr;
+
+                        if (cur_patch && cur_patch->active) {
+                            ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "INLINE SIGNAL CONDITIONER");
+                            ImGui::Separator();
+                            ImGui::TextWrapped("Tag: %s", cur_patch->tag.c_str());
+
+                            if (cur_patch->is_feedback) {
+                                ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.1f, 1.0f), "[ ⮌ CYCLIC FEEDBACK: Z⁻¹ DELAY ACTIVE ]");
+                            } else {
+                                ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.3f, 1.0f), "[ ➔ FEEDFORWARD DIRECT COUPLING ]");
+                            }
+                            ImGui::Separator();
+
+                            auto& cfg = cur_patch->conditioning;
+                            bool cfg_changed = false;
+
+                            // 1. Send Gain
+                            float gain_db = 20.0f * std::log10(std::max(0.001f, cfg.gain));
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::SliderFloat("Send Gain", &gain_db, -48.0f, 12.0f, "%.1f dB")) {
+                                cfg.gain = std::pow(10.0f, gain_db / 20.0f);
+                                cfg_changed = true;
+                            }
+
+                            // 2. Tap Point
+                            const char* tap_names[5] = { "Input", "PreInsert", "PostInsert", "PreFader", "PostFader" };
+                            int cur_tap = static_cast<int>(cur_patch->tap_point);
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::Combo("Tap Point", &cur_tap, tap_names, 5)) {
+                                cur_patch->tap_point = static_cast<routing::TapPoint>(cur_tap);
+                            }
+
+                            // 3. Cytomic SVF Filter
+                            const char* filter_names[5] = { "Bypass", "Lowpass (SVF)", "Highpass", "Bandpass", "Notch" };
+                            int cur_filter = static_cast<int>(cfg.filter_mode);
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::Combo("Filter", &cur_filter, filter_names, 5)) {
+                                cfg.filter_mode = static_cast<routing::ConditionerFilterMode>(cur_filter);
+                                cfg_changed = true;
+                            }
+
+                            if (cfg.filter_mode != routing::ConditionerFilterMode::Bypass) {
+                                ImGui::SetNextItemWidth(140);
+                                if (ImGui::SliderFloat("Cutoff", &cfg.cutoff_hz, 20.0f, 18000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic)) {
+                                    cfg_changed = true;
+                                }
+                                ImGui::SetNextItemWidth(140);
+                                if (ImGui::SliderFloat("Res Q", &cfg.q, 0.5f, 10.0f, "%.2f")) {
+                                    cfg_changed = true;
+                                }
+                            }
+
+                            // 4. Rectification
+                            const char* rect_names[4] = { "Bipolar AC", "Half-Wave", "Full-Wave (|x|)", "Envelope" };
+                            int cur_rect = static_cast<int>(cfg.rectify);
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::Combo("Rectify", &cur_rect, rect_names, 4)) {
+                                cfg.rectify = static_cast<routing::ConditionerRectifyMode>(cur_rect);
+                                cfg_changed = true;
+                            }
+
+                            // 5. Invert Phase
+                            if (ImGui::Checkbox("Invert Phase (180°)", &cfg.invert_phase)) {
+                                cfg_changed = true;
+                            }
+
+                            if (cfg_changed) {
+                                mixer.update_route_conditioning(selected_patch_id, cfg);
+                            }
+
+                            ImGui::Spacing();
+                            if (ImGui::Button("DISCONNECT THIS ROUTE", ImVec2(-1, 24))) {
+                                mixer.remove_route(selected_patch_id);
+                                selected_patch_id = 0;
+                            }
+                        } else {
+                            ImGui::TextDisabled("NO ROUTE SELECTED");
+                            ImGui::Separator();
+                            ImGui::TextWrapped("Click any [ + ] cell in the matrix grid to create a real-time virtual patch cable.");
+                            ImGui::Spacing();
+                            ImGui::TextWrapped("Features zero converter friction: each patch includes its own Cytomic SVF filter, rectification, and automatic cyclic feedback Z^-1 delay decoupling.");
+                        }
+                    }
+                    ImGui::EndChild();
+
                     ImGui::EndTabItem();
                 }
 
