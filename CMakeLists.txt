@@ -121,3 +121,43 @@ add_executable(ab_summing_shootout
 )
 target_link_libraries(ab_summing_shootout PRIVATE audio_core)
 
+# ============================================================================
+# Dear ImGui & Desktop UI Workstation (aethel_desk)
+# ============================================================================
+find_package(OpenGL REQUIRED)
+find_package(glfw3 REQUIRED)
+
+set(IMGUI_SOURCES
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_glfw.cpp
+    third_party/imgui/backends/imgui_impl_opengl3.cpp
+)
+add_library(imgui_core STATIC ${IMGUI_SOURCES})
+target_include_directories(imgui_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
+)
+target_link_libraries(imgui_core PUBLIC
+    glfw
+    OpenGL::GL
+)
+
+# Desktop Workstation Executable
+add_executable(aethel_desk
+    examples/aethel_desk.cpp
+)
+target_include_directories(aethel_desk PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
+)
+target_link_libraries(aethel_desk PRIVATE
+    audio_core
+    imgui_core
+    glfw
+    OpenGL::GL
+)
+
+
