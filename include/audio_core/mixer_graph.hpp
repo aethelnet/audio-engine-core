@@ -7,6 +7,7 @@
 #include "audio_core/protocol/command_packet.hpp"
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/sampling/sample_tap.hpp"
+#include "audio_core/sampling/vari_speed_streamer.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
@@ -83,6 +84,7 @@ public:
         m_clip.reset();
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_sync_to_transport.store(false, std::memory_order_relaxed);
+        m_streamer.reset();
         m_buffer.clear();
         reset_meters();
         m_active.store(true, std::memory_order_release);
@@ -101,6 +103,7 @@ public:
         m_clip.reset();
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_sync_to_transport.store(false, std::memory_order_relaxed);
+        m_streamer.reset();
         m_buffer.clear();
         reset_meters();
     }
@@ -210,11 +213,15 @@ public:
         m_clip = std::move(clip);
         m_clip_loop.store(loop, std::memory_order_relaxed);
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
+        m_streamer.set_clip(m_clip);
+        m_streamer.set_loop(loop);
+        m_streamer.set_playhead(0.0);
     }
 
     void clear_clip() noexcept {
         m_clip.reset();
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
+        m_streamer.set_clip(nullptr);
     }
 
     [[nodiscard]] bool has_clip() const noexcept {
@@ -222,15 +229,16 @@ public:
     }
 
     [[nodiscard]] uint64_t clip_playhead() const noexcept {
-        return static_cast<uint64_t>(std::round(m_clip_playhead.load(std::memory_order_relaxed)));
+        return static_cast<uint64_t>(std::round(m_streamer.playhead()));
     }
 
     [[nodiscard]] double clip_playhead_f() const noexcept {
-        return m_clip_playhead.load(std::memory_order_relaxed);
+        return m_streamer.playhead();
     }
 
     void set_clip_playhead(double playhead) noexcept {
         m_clip_playhead.store(playhead, std::memory_order_relaxed);
+        m_streamer.set_playhead(playhead);
     }
 
     void set_sync_to_transport(bool sync) noexcept {
@@ -240,6 +248,31 @@ public:
     [[nodiscard]] bool sync_to_transport() const noexcept {
         return m_sync_to_transport.load(std::memory_order_relaxed);
     }
+
+    // Vari-Speed Streamer Control APIs
+    [[nodiscard]] sampling::VariSpeedStreamer& streamer() noexcept { return m_streamer; }
+    [[nodiscard]] const sampling::VariSpeedStreamer& streamer() const noexcept { return m_streamer; }
+
+    void set_playback_mode(sampling::PlaybackMode mode) noexcept { m_streamer.set_playback_mode(mode); }
+    [[nodiscard]] sampling::PlaybackMode playback_mode() const noexcept { return m_streamer.playback_mode(); }
+
+    void set_pitch_semitones(float semitones) noexcept { m_streamer.set_pitch_semitones(semitones); }
+    [[nodiscard]] float pitch_semitones() const noexcept { return m_streamer.pitch_semitones(); }
+
+    void set_speed_ratio(float ratio) noexcept { m_streamer.set_speed_ratio(ratio); }
+    [[nodiscard]] float speed_ratio() const noexcept { return m_streamer.speed_ratio(); }
+
+    void set_reverse(bool rev) noexcept { m_streamer.set_reverse(rev); }
+    [[nodiscard]] bool is_reverse() const noexcept { return m_streamer.is_reverse(); }
+
+    void set_capstan_inertia_ms(float ms) noexcept { m_streamer.set_capstan_inertia_ms(ms); }
+    [[nodiscard]] float capstan_inertia_ms() const noexcept { return m_streamer.capstan_inertia_ms(); }
+
+    void set_clip_bar_length(float bars) noexcept { m_streamer.set_bar_length(bars); }
+    [[nodiscard]] float clip_bar_length() const noexcept { return m_streamer.bar_length(); }
+
+    void trigger_tape_stop(float duration_sec = 0.5f) noexcept { m_streamer.trigger_tape_stop(duration_sec); }
+    void trigger_tape_start(float duration_sec = 0.3f) noexcept { m_streamer.trigger_tape_start(duration_sec); }
 
     void set_sequencer(std::shared_ptr<sequencer::StepSequencer> seq) noexcept {
         m_sequencer = std::move(seq);
@@ -286,9 +319,8 @@ public:
                 if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
                     // Stopped transport: no clip addition
                 } else {
-                    double ph = m_clip_playhead.load(std::memory_order_relaxed);
-                    m_clip->read_resampled(ph, clock.sample_rate(), tmp_l, tmp_r, f_proc, m_clip_loop.load(std::memory_order_relaxed));
-                    m_clip_playhead.store(ph, std::memory_order_relaxed);
+                    m_streamer.render(tmp_l, tmp_r, f_proc, clock);
+                    m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
                     for (uint32_t f = 0; f < f_proc; ++f) {
                         left[f] += tmp_l[f];
                         right[f] += tmp_r[f];
@@ -305,9 +337,8 @@ public:
                 std::memset(left, 0, frames * sizeof(Sample));
                 std::memset(right, 0, frames * sizeof(Sample));
             } else {
-                double ph = m_clip_playhead.load(std::memory_order_relaxed);
-                m_clip->read_resampled(ph, clock.sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
-                m_clip_playhead.store(ph, std::memory_order_relaxed);
+                m_streamer.render(left, right, frames, clock);
+                m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
             }
         }
     }
@@ -316,9 +347,8 @@ public:
         if (m_clip) {
             Sample* left = m_buffer.view().channel(0);
             Sample* right = m_buffer.view().channel(1);
-            double ph = m_clip_playhead.load(std::memory_order_relaxed);
-            m_clip->read_resampled(ph, m_clip->sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
-            m_clip_playhead.store(ph, std::memory_order_relaxed);
+            m_streamer.render(left, right, frames, m_clip->sample_rate(), 120.0, true);
+            m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
         }
     }
 
@@ -407,6 +437,7 @@ private:
     std::atomic<double> m_clip_playhead{0.0};
     std::atomic<bool> m_sync_to_transport{false};
     std::atomic<TrackInputMode> m_input_mode{TrackInputMode::InternalClip};
+    sampling::VariSpeedStreamer m_streamer;
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
@@ -1675,6 +1706,36 @@ public:
             }
             case protocol::MixerCommandType::SetMuteGroupActive: {
                 set_mute_group_active(static_cast<uint8_t>(cmd.target_id), (cmd.flags & 1) != 0);
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackPitchSemitones: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_pitch_semitones(cmd.value1);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackPlaybackMode: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_playback_mode(static_cast<sampling::PlaybackMode>(cmd.flags));
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SetTrackReverse: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->set_reverse((cmd.flags & 1) != 0);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::TriggerTrackTapeStop: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->trigger_tape_stop(cmd.value1 > 0.0f ? cmd.value1 : 0.5f);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::TriggerTrackTapeStart: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    trk->trigger_tape_start(cmd.value1 > 0.0f ? cmd.value1 : 0.3f);
+                }
                 break;
             }
             default:

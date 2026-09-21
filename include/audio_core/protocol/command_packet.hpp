@@ -37,6 +37,11 @@ enum class MixerCommandType : uint16_t {
     SetDcaMute,
     SetDcaSolo,
     SetMuteGroupActive,
+    SetTrackPitchSemitones,
+    SetTrackPlaybackMode,
+    SetTrackReverse,
+    TriggerTrackTapeStop,
+    TriggerTrackTapeStart,
 };
 
 // ============================================================================

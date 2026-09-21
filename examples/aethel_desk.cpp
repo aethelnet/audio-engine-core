@@ -2390,6 +2390,106 @@ int main(int argc, char** argv) {
                     ImGui::Spacing();
                     ImGui::Separator();
 
+                    // Panel Vari-Speed: Continuous Vari-Speed Resampler, Beat-Sync & Tape Ballistics
+                    ImGui::BeginChild("PanelVariSpeed", ImVec2(0, 115), true);
+                    {
+                        auto* cur_trk = (selected_track == 0) ? trk0 :
+                                        (selected_track == 1) ? trk1 :
+                                        (selected_track == 2) ? trk2 : trk3;
+
+                        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.15f, 1.0f),
+                                           "LIVE VARI-SPEED RESAMPLER & BEAT-SYNC ENGINE (ANALOG TAPE CAPSTAN MOTOR)");
+                        ImGui::SameLine(0, 20);
+                        if (cur_trk) {
+                            auto m_state = cur_trk->streamer().motor_state();
+                            const char* state_str = (m_state == sampling::TapeMotorState::Running) ? "RUNNING" :
+                                                    (m_state == sampling::TapeMotorState::Stopping) ? "STOPPING (BRAKE)" :
+                                                    (m_state == sampling::TapeMotorState::Stopped) ? "STOPPED" : "STARTING (TORQUE)";
+                            ImVec4 state_col = (m_state == sampling::TapeMotorState::Running) ? ImVec4(0.2f, 0.85f, 0.3f, 1.0f) :
+                                               (m_state == sampling::TapeMotorState::Stopping) ? ImVec4(0.9f, 0.4f, 0.1f, 1.0f) :
+                                               (m_state == sampling::TapeMotorState::Stopped) ? ImVec4(0.85f, 0.2f, 0.2f, 1.0f) :
+                                               ImVec4(0.2f, 0.6f, 0.9f, 1.0f);
+                            ImGui::TextColored(state_col, "[MOTOR: %s | SPEED: %.2fx | PH: %.1f]",
+                                               state_str, cur_trk->streamer().effective_playback_ratio(), cur_trk->clip_playhead_f());
+                        }
+                        ImGui::Separator();
+
+                        if (cur_trk) {
+                            // Row 1: Mode Combo, Pitch Slider, Speed Slider, Reverse Toggle
+                            ImGui::Text("Mode:");
+                            ImGui::SameLine();
+                            const char* mode_names[4] = {
+                                "Free (Manual Pitch/Speed)",
+                                "Beat-Sync Repitch (Tape Lock)",
+                                "Transport Phase-Lock (Hard Sync)",
+                                "Reverse Free"
+                            };
+                            int cur_mode_idx = static_cast<int>(cur_trk->playback_mode());
+                            ImGui::SetNextItemWidth(230);
+                            if (ImGui::Combo("##TrkMode", &cur_mode_idx, mode_names, 4)) {
+                                cur_trk->set_playback_mode(static_cast<sampling::PlaybackMode>(cur_mode_idx));
+                            }
+
+                            ImGui::SameLine(0, 15);
+                            float p_st = cur_trk->pitch_semitones();
+                            ImGui::SetNextItemWidth(160);
+                            if (ImGui::SliderFloat("Pitch##TrkP", &p_st, -24.0f, 24.0f, "%.1f st")) {
+                                cur_trk->set_pitch_semitones(p_st);
+                            }
+
+                            ImGui::SameLine(0, 15);
+                            float s_ratio = cur_trk->speed_ratio();
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::SliderFloat("Speed##TrkS", &s_ratio, 0.25f, 4.0f, "%.2fx")) {
+                                cur_trk->set_speed_ratio(s_ratio);
+                            }
+
+                            ImGui::SameLine(0, 15);
+                            bool rev = cur_trk->is_reverse();
+                            if (rev) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.2f, 0.2f, 1.0f));
+                            if (ImGui::Button(rev ? " REV [ON] " : " REV [OFF] ")) {
+                                cur_trk->set_reverse(!rev);
+                            }
+                            if (rev) ImGui::PopStyleColor();
+
+                            // Row 2: Capstan Inertia, Bar Length, Tape Stop & Tape Start
+                            ImGui::Spacing();
+                            float inertia = cur_trk->capstan_inertia_ms();
+                            ImGui::SetNextItemWidth(180);
+                            if (ImGui::SliderFloat("Capstan Inertia##TrkInertia", &inertia, 0.0f, 250.0f, "%.1f ms")) {
+                                cur_trk->set_capstan_inertia_ms(inertia);
+                            }
+
+                            ImGui::SameLine(0, 20);
+                            float bars = cur_trk->clip_bar_length();
+                            ImGui::SetNextItemWidth(120);
+                            if (ImGui::SliderFloat("Bars (Sync)##TrkBars", &bars, 0.0f, 16.0f, "%.0f bars")) {
+                                cur_trk->set_clip_bar_length(bars);
+                            }
+
+                            ImGui::SameLine(0, 25);
+                            if (ImGui::Button("  TAPE STOP (0.5s)  ")) {
+                                cur_trk->trigger_tape_stop(0.5f);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("  TAPE START (0.3s)  ")) {
+                                cur_trk->trigger_tape_start(0.3f);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("RESET##TrkVari")) {
+                                cur_trk->set_pitch_semitones(0.0f);
+                                cur_trk->set_speed_ratio(1.0f);
+                                cur_trk->set_reverse(false);
+                                cur_trk->set_capstan_inertia_ms(15.0f);
+                                cur_trk->trigger_tape_start(0.05f);
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
                     // Panel E: Live SampleTap Recorder & Downbeat-Quantized Bouncer
                     ImGui::BeginChild("PanelSampleTap", ImVec2(0, 0), true);
                     {

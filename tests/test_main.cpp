@@ -5761,6 +5761,232 @@ void test_liquid_vactrol_opto_leveler_and_buchla_lpg() {
     }
 }
 
+void test_vari_speed_streamer_and_beat_sync_repitch() {
+    std::cout << "[TEST] Running Vari-Speed Resampling, Continuous Beat-Sync & Analog Tape Ballistics..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    // 1. Basic Playback, Speed Scaling & Pitch Transposition (+12st / -12st)
+    {
+        const uint32_t kSr = 48000;
+        const uint32_t kFrames = 4800; // 100ms
+        auto clip = std::make_shared<AudioClip>("RampTest", kSr, 2, kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float v = static_cast<float>(i) / static_cast<float>(kFrames);
+            clip->channel(0)[i] = v;
+            clip->channel(1)[i] = -v;
+        }
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(false);
+        streamer.set_capstan_inertia_ms(0.0f); // instant response for exact testing
+
+        // 1a. Unity playback (0 semitones, 1.0x speed)
+        std::vector<Sample> out_l(100), out_r(100);
+        streamer.render(out_l.data(), out_r.data(), 100, kSr, 120.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 100.0) < 1e-3);
+        TEST_CHECK(std::abs(out_l[0] - 0.0f) < 1e-3);
+        TEST_CHECK(std::abs(out_l[50] - (50.0f / kFrames)) < 1e-3);
+
+        // 1b. Octave up (+12 semitones = 2.0x playback speed)
+        streamer.reset();
+        streamer.set_pitch_semitones(12.0f);
+        streamer.render(out_l.data(), out_r.data(), 100, kSr, 120.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 200.0) < 1e-3);
+
+        // 1c. Octave down (-12 semitones = 0.5x playback speed)
+        streamer.reset();
+        streamer.set_pitch_semitones(-12.0f);
+        streamer.render(out_l.data(), out_r.data(), 100, kSr, 120.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 50.0) < 1e-3);
+
+        std::cout << "  -> Pitch Transposition (+/-12 st = 2.0x / 0.5x): PASSED" << std::endl;
+    }
+
+    // 2. Continuous Beat-Sync Repitch (Vari-Speed Tape Lock)
+    {
+        const uint32_t kSr = 48000;
+        // 2-bar loop at 120 BPM:
+        // 2 bars = 8 beats = 8 * (48000 * 60 / 120) = 8 * 24000 = 192,000 frames
+        const uint32_t kLoopFrames = 192000;
+        auto clip = std::make_shared<AudioClip>("Loop120BPM", kSr, 2, kLoopFrames);
+        clip->set_bpm(120.0);
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(true);
+        streamer.set_playback_mode(PlaybackMode::BeatSyncRepitch);
+        streamer.set_capstan_inertia_ms(0.0f);
+
+        // Session running at 126 BPM:
+        // Expected tempo ratio = 126.0 / 120.0 = 1.05
+        std::vector<Sample> out_l(1000), out_r(1000);
+        streamer.render(out_l.data(), out_r.data(), 1000, kSr, 126.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 1050.0) < 1e-2);
+        TEST_CHECK(std::abs(streamer.effective_playback_ratio() - 1.05f) < 1e-4);
+
+        // Session running at 60 BPM (Half tempo):
+        // Expected tempo ratio = 60.0 / 120.0 = 0.5
+        streamer.reset();
+        streamer.render(out_l.data(), out_r.data(), 1000, kSr, 60.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 500.0) < 1e-2);
+        TEST_CHECK(std::abs(streamer.effective_playback_ratio() - 0.5f) < 1e-4);
+
+        std::cout << "  -> Beat-Sync Repitch (120 BPM -> 126 BPM = 1.05x, 60 BPM = 0.5x): PASSED" << std::endl;
+    }
+
+    // 3. Bidirectional Reverse Playback & Sample-Accurate Loop Range Wrapping
+    {
+        const uint32_t kSr = 48000;
+        const uint32_t kTotalFrames = 10000;
+        auto clip = std::make_shared<AudioClip>("WrapTest", kSr, 2, kTotalFrames);
+        for (uint32_t i = 0; i < kTotalFrames; ++i) {
+            float v = static_cast<float>(i);
+            clip->channel(0)[i] = v;
+            clip->channel(1)[i] = v;
+        }
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(true);
+        streamer.set_loop_range(2000, 6000); // Loop range: 2000..6000 (length 4000)
+        streamer.set_capstan_inertia_ms(0.0f);
+
+        // 3a. Forward wrapping across loop_end
+        streamer.set_playhead(5995.0);
+        std::vector<Sample> out_l(10), out_r(10);
+        streamer.render(out_l.data(), out_r.data(), 10, kSr, 120.0, true);
+        // Playhead starts at 5995. Steps: 5995, 5996, 5997, 5998, 5999, then wraps: 6000 -> 2000, 2001, 2002, 2003, 2004. Final playhead = 2005.0.
+        TEST_CHECK(std::abs(streamer.playhead() - 2005.0) < 1e-2);
+        // Verify wrapped sample values are within [2000..6000]
+        TEST_CHECK(out_l[0] >= 5994.0f && out_l[0] <= 5996.0f);
+        TEST_CHECK(out_l[6] >= 2000.0f && out_l[6] <= 2002.0f);
+
+        // 3b. Reverse playback across loop_start
+        streamer.set_reverse(true);
+        streamer.set_playhead(2003.0);
+        streamer.render(out_l.data(), out_r.data(), 10, kSr, 120.0, true);
+        // Playhead starts at 2003. Steps down: 2003, 2002, 2001, 2000, then wraps: <2000 -> wraps towards 6000.
+        // 2003 - 10 = 1993 -> wraps to 2000 + fmod(1993 - 2000, 4000) = 2000 + 3993 = 5993.0
+        TEST_CHECK(std::abs(streamer.playhead() - 5993.0) < 1e-2);
+        TEST_CHECK(out_l[0] >= 2002.0f && out_l[0] <= 2004.0f);
+        TEST_CHECK(out_l[5] >= 5997.0f && out_l[5] <= 5999.0f);
+
+        std::cout << "  -> Hermite Spline Range Looping & Bidirectional Reverse: PASSED" << std::endl;
+    }
+
+    // 4. Capstan Motor Inertia & Tape Stop / Start Ballistics
+    {
+        const uint32_t kSr = 48000;
+        auto clip = std::make_shared<AudioClip>("TapeTone", kSr, 2, 48000 * 2);
+        for (uint32_t i = 0; i < 48000 * 2; ++i) {
+            clip->channel(0)[i] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * i / 48000.0f);
+            clip->channel(1)[i] = clip->channel(0)[i];
+        }
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(true);
+        streamer.set_capstan_inertia_ms(50.0f); // 50ms capstan slew inertia
+
+        // 4a. Initial block: starts at full speed 1.0 (no startup lag if not requested)
+        std::vector<Sample> out_l(480), out_r(480);
+        streamer.render(out_l.data(), out_r.data(), 480, kSr, 120.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - 480.0) < 1.0);
+
+        // 4b. Slew when changing speed ratio from 1.0 to 2.0
+        streamer.set_speed_ratio(2.0f);
+        // Over 480 samples (10ms), inertia prevents jumping immediately to 2.0
+        streamer.render(out_l.data(), out_r.data(), 480, kSr, 120.0, true);
+        // Should advance between 480 + 480*1.0 = 960 and 480 + 480*2.0 = 1440
+        TEST_CHECK(streamer.playhead() > 500.0 && streamer.playhead() < 1400.0);
+
+        // 4c. Analog Tape Stop (Quadratic Brake ODE)
+        // Set stop duration = 0.1s (4800 samples)
+        streamer.trigger_tape_stop(0.1f);
+        TEST_CHECK(streamer.motor_state() == TapeMotorState::Stopping);
+
+        // Render 4800 samples (0.1s)
+        std::vector<Sample> stop_buf_l(4800), stop_buf_r(4800);
+        streamer.render(stop_buf_l.data(), stop_buf_r.data(), 4800, kSr, 120.0, true);
+
+        // Motor must now be Stopped
+        TEST_CHECK(streamer.motor_state() == TapeMotorState::Stopped);
+        double stopped_ph = streamer.playhead();
+
+        // While Stopped, rendering produces silence / zero advance
+        streamer.render(out_l.data(), out_r.data(), 480, kSr, 120.0, true);
+        TEST_CHECK(std::abs(streamer.playhead() - stopped_ph) < 1e-4);
+
+        // 4d. Analog Tape Start (Torque Ramp ODE)
+        streamer.trigger_tape_start(0.1f);
+        TEST_CHECK(streamer.motor_state() == TapeMotorState::Starting);
+        streamer.render(stop_buf_l.data(), stop_buf_r.data(), 4800, kSr, 120.0, true);
+        TEST_CHECK(streamer.motor_state() == TapeMotorState::Running);
+        TEST_CHECK(streamer.playhead() > stopped_ph + 100.0);
+
+        std::cout << "  -> Capstan Motor Inertia & Tape Stop/Start Ballistics: PASSED" << std::endl;
+    }
+
+    // 5. MixerGraph & Command Queue Dispatch Integration
+    {
+        MixerGraph mixer(48000, 128);
+        auto* trk = mixer.allocate_track("VariTrack");
+        TEST_CHECK(trk != nullptr);
+
+        auto clip = std::make_shared<AudioClip>("MixerTestClip", 48000, 2, 48000);
+        clip->set_bpm(120.0);
+        for (uint32_t i = 0; i < 48000; ++i) {
+            clip->channel(0)[i] = 0.2f;
+            clip->channel(1)[i] = 0.2f;
+        }
+        trk->set_clip(clip, true);
+        trk->set_capstan_inertia_ms(0.0f);
+
+        // Dispatch binary commands via post_command()
+        protocol::MixerCommand cmd_pitch{};
+        cmd_pitch.type = protocol::MixerCommandType::SetTrackPitchSemitones;
+        cmd_pitch.target_id = trk->id();
+        cmd_pitch.value1 = 7.0f; // Perfect fifth up (+7 semitones)
+        mixer.post_command(cmd_pitch);
+
+        protocol::MixerCommand cmd_mode{};
+        cmd_mode.type = protocol::MixerCommandType::SetTrackPlaybackMode;
+        cmd_mode.target_id = trk->id();
+        cmd_mode.flags = static_cast<uint32_t>(PlaybackMode::BeatSyncRepitch);
+        mixer.post_command(cmd_mode);
+
+        protocol::MixerCommand cmd_rev{};
+        cmd_rev.type = protocol::MixerCommandType::SetTrackReverse;
+        cmd_rev.target_id = trk->id();
+        cmd_rev.flags = 1; // Reverse active
+        mixer.post_command(cmd_rev);
+
+        AudioBuffer out_buf(2, 128);
+        auto out_view = out_buf.view();
+        mixer.render(out_view);
+
+        // Verify Track picked up the command state
+        TEST_CHECK(std::abs(trk->pitch_semitones() - 7.0f) < 1e-3);
+        TEST_CHECK(trk->playback_mode() == PlaybackMode::BeatSyncRepitch);
+        TEST_CHECK(trk->is_reverse() == true);
+
+        // Dispatch Tape Stop command
+        protocol::MixerCommand cmd_stop{};
+        cmd_stop.type = protocol::MixerCommandType::TriggerTrackTapeStop;
+        cmd_stop.target_id = trk->id();
+        cmd_stop.value1 = 0.2f; // 200ms stop
+        mixer.post_command(cmd_stop);
+
+        mixer.render(out_view);
+        TEST_CHECK(trk->streamer().motor_state() == TapeMotorState::Stopping);
+
+        std::cout << "  -> MixerGraph Binary Command Protocol Dispatch: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -5813,6 +6039,7 @@ int main() {
     test_ptp_boundary_clock_and_master_sync_daemon();
     test_universal_routing_matrix_audio_and_aoip_transmission();
     test_liquid_vactrol_opto_leveler_and_buchla_lpg();
+    test_vari_speed_streamer_and_beat_sync_repitch();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
