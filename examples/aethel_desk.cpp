@@ -2418,15 +2418,17 @@ int main(int argc, char** argv) {
                             // Row 1: Mode Combo, Pitch Slider, Speed Slider, Reverse Toggle
                             ImGui::Text("Mode:");
                             ImGui::SameLine();
-                            const char* mode_names[4] = {
-                                "Free (Manual Pitch/Speed)",
+                            const char* mode_names[6] = {
+                                "Free (VariSpeed Repitch)",
                                 "Beat-Sync Repitch (Tape Lock)",
                                 "Transport Phase-Lock (Hard Sync)",
-                                "Reverse Free"
+                                "Reverse Free",
+                                "Beat-Sync WSOLA (Pitch Locked)",
+                                "Pitch-Shift WSOLA (Tempo Locked)"
                             };
                             int cur_mode_idx = static_cast<int>(cur_trk->playback_mode());
-                            ImGui::SetNextItemWidth(230);
-                            if (ImGui::Combo("##TrkMode", &cur_mode_idx, mode_names, 4)) {
+                            ImGui::SetNextItemWidth(250);
+                            if (ImGui::Combo("##TrkMode", &cur_mode_idx, mode_names, 6)) {
                                 cur_trk->set_playback_mode(static_cast<sampling::PlaybackMode>(cur_mode_idx));
                             }
 

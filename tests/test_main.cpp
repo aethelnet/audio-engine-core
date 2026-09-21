@@ -44,6 +44,7 @@
 #include "audio_core/dsp/time_stretcher.hpp"
 #include "audio_core/dsp/derez.hpp"
 #include "audio_core/dsp/liquid_vactrol.hpp"
+#include "audio_core/sampling/wsola_streamer.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -5987,6 +5988,134 @@ void test_vari_speed_streamer_and_beat_sync_repitch() {
     }
 }
 
+void test_wsola_streamer_and_realtime_pitch_shift() {
+    std::cout << "[TEST] Running Real-Time WSOLA Time-Stretching & Decoupled Pitch Shifting..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    // Helper: count positive-going zero crossings
+    auto count_zero_crossings = [](const float* data, size_t start, size_t count) -> uint32_t {
+        uint32_t zc = 0;
+        for (size_t i = start + 1; i < start + count; ++i) {
+            if (data[i - 1] <= 0.0f && data[i] > 0.0f) {
+                zc++;
+            }
+        }
+        return zc;
+    };
+
+    // 1. Standalone WSOLA: Time-Stretch 2.0x with Invariant Pitch (440 Hz)
+    {
+        const uint32_t kSr = 48000;
+        const uint32_t kFrames = 48000; // 1.0 second of pure 440 Hz sine wave
+        auto clip = std::make_shared<AudioClip>("Sine440", kSr, 2, kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / static_cast<float>(kSr));
+            clip->channel(0)[i] = s;
+            clip->channel(1)[i] = s;
+        }
+
+        WsolaStreamer wsola(static_cast<float>(kSr));
+        wsola.set_clip(clip);
+        wsola.set_loop(true);
+        wsola.set_beat_sync(false);
+        wsola.set_stretch_factor(2.0f); // 2.0x time stretch (plays at half speed)
+        wsola.set_pitch_semitones(0.0f); // Invariant pitch (remains at 440 Hz!)
+
+        std::vector<Sample> out_l(4800), out_r(4800);
+        wsola.render(out_l.data(), out_r.data(), 4800, kSr, 120.0, true);
+
+        // Check for NaN or Inf
+        for (uint32_t i = 0; i < 4800; ++i) {
+            TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+            TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+        }
+
+        // Measure frequency via zero crossings between sample 1000 and 3400 (2400 samples)
+        // Expected for 440 Hz: 2400 / (48000 / 440) = 22.0 cycles.
+        // If it were repitched to half speed (220 Hz), count would be 11!
+        uint32_t zc = count_zero_crossings(out_l.data(), 1000, 2400);
+        TEST_CHECK(zc >= 20 && zc <= 24);
+
+        std::cout << "  -> WSOLA 2.0x Time Stretch: PASSED (Frequency invariant @ 440Hz: zc=" << zc << " expected ~22 vs repitch=11)" << std::endl;
+    }
+
+    // 2. Standalone WSOLA: Decoupled Pitch-Shift +12st (880 Hz) with Invariant Duration
+    {
+        const uint32_t kSr = 48000;
+        const uint32_t kFrames = 48000;
+        auto clip = std::make_shared<AudioClip>("Sine440_Octave", kSr, 2, kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / static_cast<float>(kSr));
+            clip->channel(0)[i] = s;
+            clip->channel(1)[i] = s;
+        }
+
+        WsolaStreamer wsola(static_cast<float>(kSr));
+        wsola.set_clip(clip);
+        wsola.set_loop(true);
+        wsola.set_beat_sync(false);
+        wsola.set_stretch_factor(1.0f);   // Invariant duration (1.0x time)
+        wsola.set_pitch_semitones(12.0f); // Transpose up +1 octave (880 Hz!)
+
+        std::vector<Sample> out_l(4800), out_r(4800);
+        wsola.render(out_l.data(), out_r.data(), 4800, kSr, 120.0, true);
+
+        // Measure frequency via zero crossings between sample 1000 and 3400 (2400 samples)
+        // Expected for 880 Hz: 2400 / (48000 / 880) = 44.0 cycles.
+        uint32_t zc = count_zero_crossings(out_l.data(), 1000, 2400);
+        TEST_CHECK(zc >= 40 && zc <= 48);
+
+        // Verify that analysis playhead advanced near 4800 samples (nominal duration), NOT 9600
+        TEST_CHECK(wsola.playhead() >= 4000.0 && wsola.playhead() <= 5600.0);
+
+        std::cout << "  -> WSOLA +12st Pitch Shift: PASSED (Transposed to 880Hz: zc=" << zc << " expected ~44, playhead=" << wsola.playhead() << ")" << std::endl;
+    }
+
+    // 3. BeatSyncTimeStretch Mode Integration in VariSpeedStreamer & Track
+    {
+        const uint32_t kSr = 48000;
+        // 2-bar drum loop at 120 BPM (192,000 frames)
+        const uint32_t kLoopFrames = 192000;
+        auto clip = std::make_shared<AudioClip>("DrumLoop120", kSr, 2, kLoopFrames);
+        clip->set_bpm(120.0);
+        for (uint32_t i = 0; i < kLoopFrames; ++i) {
+            float v = 0.4f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / static_cast<float>(kSr));
+            clip->channel(0)[i] = v;
+            clip->channel(1)[i] = v;
+        }
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(true);
+        streamer.set_playback_mode(PlaybackMode::BeatSyncTimeStretch);
+        streamer.set_pitch_semitones(0.0f); // 0 semitones: pure time stretch!
+
+        // Session at 140 BPM (faster than clip 120 BPM)
+        // Target duration stretch = 120.0 / 140.0 ≈ 0.857
+        std::vector<Sample> out_l(4800), out_r(4800);
+        streamer.render(out_l.data(), out_r.data(), 4800, kSr, 140.0, true);
+
+        // Pitch must remain 440 Hz (zc ~22 in 2400 samples)
+        uint32_t zc = count_zero_crossings(out_l.data(), 1000, 2400);
+        TEST_CHECK(zc >= 20 && zc <= 24);
+
+        // Effective stretch ratio matches 120 / 140 ≈ 0.857
+        TEST_CHECK(std::abs(streamer.effective_playback_ratio() - (120.0f / 140.0f)) < 0.05f);
+
+        // 4. Combined Beat-Sync + Transposition (Decoupled)
+        streamer.set_pitch_semitones(-12.0f); // Transpose down 1 octave (220 Hz)
+        streamer.render(out_l.data(), out_r.data(), 4800, kSr, 140.0, true);
+
+        // Expected zero crossings for 220 Hz: 2400 / (48000 / 220) = 11.0 cycles
+        uint32_t zc_down = count_zero_crossings(out_l.data(), 1000, 2400);
+        TEST_CHECK(zc_down >= 9 && zc_down <= 13);
+
+        std::cout << "  -> VariSpeedStreamer BeatSyncTimeStretch & Decoupled Pitch: PASSED (120->140 BPM tempo sync, 440Hz -> 220Hz transpose)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -6040,6 +6169,7 @@ int main() {
     test_universal_routing_matrix_audio_and_aoip_transmission();
     test_liquid_vactrol_opto_leveler_and_buchla_lpg();
     test_vari_speed_streamer_and_beat_sync_repitch();
+    test_wsola_streamer_and_realtime_pitch_shift();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -5,6 +5,7 @@
 #include "audio_core/sampling/audio_clip.hpp"
 #include "audio_core/dsp/resampler.hpp"
 #include "audio_core/dsp/liquid_ode.hpp"
+#include "audio_core/sampling/wsola_streamer.hpp"
 #include <memory>
 #include <atomic>
 #include <cmath>
@@ -21,7 +22,9 @@ enum class PlaybackMode : uint8_t {
     Free = 0,               // Standard playback: manual pitch semitones & speed ratio
     BeatSyncRepitch = 1,    // Continuous tape vari-speed: loop tempo dynamically matches TimelineClock BPM
     TransportPhaseLock = 2, // Hard phase-lock: loop playhead matches transport bar/beat phase exactly
-    ReverseFree = 3         // Reverse playback
+    ReverseFree = 3,        // Reverse playback
+    BeatSyncTimeStretch = 4,// Continuous WSOLA time-stretch: tempo matches TimelineClock, pitch locked
+    PitchShiftWsola = 5     // Continuous WSOLA pitch-shift: pitch transposed, tempo locked
 };
 
 enum class TapeMotorState : uint8_t {
@@ -81,11 +84,13 @@ public:
         m_motor_progress = 0.0f;
         m_needs_smoother_reset = true;
         m_effective_ratio = 1.0f;
+        m_wsola.reset();
     }
 
     void set_clip(std::shared_ptr<AudioClip> clip) noexcept {
         m_clip = std::move(clip);
         m_needs_smoother_reset = true;
+        m_wsola.set_clip(m_clip);
     }
     [[nodiscard]] std::shared_ptr<AudioClip> clip() const noexcept { return m_clip; }
     [[nodiscard]] bool has_clip() const noexcept { return m_clip != nullptr; }
@@ -96,7 +101,11 @@ public:
     }
     void set_playhead(double ph) noexcept {
         m_playhead.store(ph, std::memory_order_relaxed);
+        m_wsola.set_playhead(ph);
     }
+
+    [[nodiscard]] WsolaStreamer& wsola() noexcept { return m_wsola; }
+    [[nodiscard]] const WsolaStreamer& wsola() const noexcept { return m_wsola; }
 
     // Playback modes
     void set_playback_mode(PlaybackMode mode) noexcept {
@@ -239,6 +248,26 @@ public:
                 }
                 loop_bpm = best_bpm;
             }
+        }
+
+        // 1b. Real-Time WSOLA Time-Stretch & Decoupled Pitch Branch
+        if (mode == PlaybackMode::BeatSyncTimeStretch || mode == PlaybackMode::PitchShiftWsola) {
+            m_wsola.set_clip(m_clip);
+            m_wsola.set_loop(loop);
+            m_wsola.set_loop_range(l_start, l_end);
+            m_wsola.set_bar_length(user_bars);
+            m_wsola.set_pitch_semitones(m_pitch_semitones.load(std::memory_order_relaxed));
+            if (mode == PlaybackMode::BeatSyncTimeStretch) {
+                m_wsola.set_beat_sync(true);
+                m_wsola.set_stretch_factor(m_speed_ratio.load(std::memory_order_relaxed));
+            } else {
+                m_wsola.set_beat_sync(false);
+                m_wsola.set_stretch_factor(m_speed_ratio.load(std::memory_order_relaxed));
+            }
+            m_wsola.render(dst_l, dst_r, frames, session_sr, session_bpm, is_playing);
+            m_playhead.store(m_wsola.playhead(), std::memory_order_relaxed);
+            m_effective_ratio = m_wsola.effective_stretch_ratio();
+            return;
         }
 
         // 2. Base Sample Rate Ratio
@@ -391,6 +420,8 @@ private:
     dsp::LiquidParameterSmoother m_smoother;
     bool m_needs_smoother_reset{true};
     float m_effective_ratio{1.0f};
+
+    WsolaStreamer m_wsola;
 };
 
 } // namespace audio_core::sampling
