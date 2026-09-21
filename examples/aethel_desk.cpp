@@ -12,6 +12,8 @@
 #include "audio_core/sampling/sample_repair.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
 #include "audio_core/dsp/derez.hpp"
+#include "audio_core/dsp/liquid_vactrol.hpp"
+#include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
@@ -1882,6 +1884,37 @@ int main(int argc, char** argv) {
                                             p->set_parameter(1, 0.80f);
                                             p->set_parameter(2, 0.0f); // mu-law
                                             p->set_parameter(3, 1.0f);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    ImGui::Separator();
+                                    if (ImGui::MenuItem("Liquid Vactrol Leveler (LA-2A Opto)")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::LiquidVactrolProcessor>(kSampleRate);
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.60f); // Peak Reduction
+                                            p->set_parameter(1, 0.0f);  // Makeup
+                                            p->set_parameter(2, 0.0f);  // OptoCompressor
+                                            p->set_parameter(3, 0.75f); // Memory depth
+                                            p->set_parameter(4, 0.50f); // HF Emphasis (R37)
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    if (ImGui::MenuItem("Buchla 292 LPG (Vactrol Low-Pass Gate)")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::LiquidVactrolProcessor>(kSampleRate);
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.75f); // Sensitivity
+                                            p->set_parameter(1, 0.0f);
+                                            p->set_parameter(2, 2.0f);  // BuchlaLPG
+                                            p->set_parameter(6, 0.35f); // LPG Resonance
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    if (ImGui::MenuItem("Sovereign MultiHead ODE Compressor")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::MultiHeadOdeProcessor>(kSampleRate, 4);
+                                            p->init(kSampleRate);
                                             trk_ptr->slot(s).set_processor(p);
                                         }
                                     }

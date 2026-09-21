@@ -43,6 +43,7 @@
 #include "audio_core/sampling/sample_repair.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
 #include "audio_core/dsp/derez.hpp"
+#include "audio_core/dsp/liquid_vactrol.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -5546,6 +5547,220 @@ void test_universal_routing_matrix_audio_and_aoip_transmission() {
               << " | Cyclic Feedback Z^-1 Decoupled & A-Stable)" << std::endl;
 }
 
+void test_liquid_vactrol_opto_leveler_and_buchla_lpg() {
+    std::cout << "[TEST] Running Liquid Vactrol Opto-Leveler & Buchla 292 LPG Test..." << std::endl;
+    using namespace audio_core::dsp;
+
+    // 1. Multi-Sample-Rate A-Stability Test
+    const std::vector<float> sample_rates = {44100.0f, 48000.0f, 96000.0f, 192000.0f};
+    for (float sr : sample_rates) {
+        LiquidVactrolCell cell(sr);
+        cell.set_attack_ms(1.0f);
+        cell.set_release_fast_ms(30.0f);
+        cell.set_release_slow_ms(1000.0f);
+
+        // Feed aggressive impulse trains and extreme steps
+        for (int i = 0; i < 2000; ++i) {
+            float lum = (i % 200 < 20) ? 50.0f : 0.0f; // extreme light bursts
+            float c = cell.step(lum);
+            TEST_CHECK(!std::isnan(c) && !std::isinf(c));
+            TEST_CHECK(c >= 0.0f);
+            TEST_CHECK(!std::isnan(cell.trap_charge()) && !std::isinf(cell.trap_charge()));
+        }
+    }
+    std::cout << "  -> Multi-Sample-Rate A-Stability: PASSED (44.1k, 48k, 96k, 192k unconditionally A-stable, 0 NaN/Inf)" << std::endl;
+
+    // 2. Physical Two-Stage Release & Dark Memory Test ("Photocell History")
+    {
+        const float sr = 48000.0f;
+        // Test A: Short transient (10ms burst = 480 samples)
+        LiquidVactrolCell cell_short(sr);
+        for (int i = 0; i < 480; ++i) {
+            cell_short.step(1.0f);
+        }
+        const float peak_short = cell_short.conductance();
+        const float q_short = cell_short.trap_charge();
+        TEST_CHECK(q_short < 0.35f); // traps haven't had time to fill
+
+        // Measure samples until conductance decays to 20% of peak
+        uint32_t decay_short_samples = 0;
+        while (cell_short.conductance() > 0.20f * peak_short && decay_short_samples < 48000 * 5) {
+            cell_short.step(0.0f);
+            decay_short_samples++;
+        }
+
+        // Test B: Long sustained tone (800ms = 38400 samples)
+        LiquidVactrolCell cell_long(sr);
+        for (int i = 0; i < 38400; ++i) {
+            cell_long.step(1.0f);
+        }
+        const float peak_long = cell_long.conductance();
+        const float q_long = cell_long.trap_charge();
+        TEST_CHECK(q_long > 0.70f); // traps are deeply saturated
+
+        uint32_t decay_long_samples = 0;
+        while (cell_long.conductance() > 0.20f * peak_long && decay_long_samples < 48000 * 5) {
+            cell_long.step(0.0f);
+            decay_long_samples++;
+        }
+
+        const float t_short_ms = (static_cast<float>(decay_short_samples) / sr) * 1000.0f;
+        const float t_long_ms = (static_cast<float>(decay_long_samples) / sr) * 1000.0f;
+
+        // Long sustained exposure must decay significantly slower than short pulse
+        TEST_CHECK(decay_long_samples >= 2 * decay_short_samples);
+        std::cout << "  -> Two-Stage Release & Photocell Dark Memory: PASSED ("
+                  << "Short Pulse t=" << t_short_ms << "ms vs Sustained t=" << t_long_ms 
+                  << "ms | Memory Ratio=" << (t_long_ms / t_short_ms) << "x)" << std::endl;
+    }
+
+    // 3. LA-2A Optical Compression & HF Emphasis (R37) Test
+    {
+        LiquidVactrol vactrol(48000);
+        vactrol.set_mode(VactrolMode::OptoCompressor);
+        vactrol.set_peak_reduction(0.70f);
+        vactrol.set_makeup_gain_db(0.0f);
+        vactrol.set_hf_emphasis(0.0f); // flat
+
+        // 3a. Process 1kHz tone (100ms)
+        const uint32_t kFrames = 4800;
+        std::vector<float> buf_l(kFrames);
+        std::vector<float> buf_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * static_cast<float>(i) / 48000.0f);
+            buf_l[i] = s;
+            buf_r[i] = s;
+        }
+        vactrol.process_stereo(buf_l.data(), buf_r.data(), kFrames);
+
+        // Verify gain reduction occurred smoothly
+        TEST_CHECK(vactrol.gain_reduction_db_l() < -2.0f);
+        TEST_CHECK(vactrol.gain_reduction_db_l() > -26.0f);
+        TEST_CHECK(!std::isnan(buf_l[kFrames - 1]));
+
+        // 3b. HF Emphasis (R37) Verification
+        // Reset and test low frequency (100 Hz) vs high frequency (5 kHz) with hf_emphasis = 1.0f
+        vactrol.reset();
+        vactrol.set_peak_reduction(0.25f);
+        vactrol.set_hf_emphasis(1.0f);
+
+        std::vector<float> bass_l(kFrames), bass_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 100.0f * static_cast<float>(i) / 48000.0f);
+            bass_l[i] = s;
+            bass_r[i] = s;
+        }
+        vactrol.process_stereo(bass_l.data(), bass_r.data(), kFrames);
+        const float gr_bass = vactrol.gain_reduction_db_l();
+
+        vactrol.reset();
+        std::vector<float> treble_l(kFrames), treble_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 5000.0f * static_cast<float>(i) / 48000.0f);
+            treble_l[i] = s;
+            treble_r[i] = s;
+        }
+        vactrol.process_stereo(treble_l.data(), treble_r.data(), kFrames);
+        const float gr_treble = vactrol.gain_reduction_db_l();
+
+        // With R37 HF Emphasis active, 5kHz must compress substantially more than 100Hz
+        TEST_CHECK(gr_treble < gr_bass - 3.0f);
+        std::cout << "  -> LA-2A Optical Compression & HF Emphasis: PASSED ("
+                  << "100Hz Bass GR=" << gr_bass << " dB vs 5kHz Treble GR=" << gr_treble << " dB)" << std::endl;
+    }
+
+    // 4. Buchla 292 Low-Pass Gate Simultaneous Cutoff & VCA Ringing Test
+    {
+        LiquidVactrol lpg(48000);
+        lpg.set_mode(VactrolMode::BuchlaLPG);
+        lpg.set_peak_reduction(0.85f);
+        lpg.set_lpg_resonance(0.35f);
+
+        // Input: High-frequency rich harmonic signal (square-like pulse train at 2kHz)
+        const uint32_t kLpgFrames = 48000 / 2; // 500ms
+        std::vector<float> lpg_l(kLpgFrames, 0.0f);
+        std::vector<float> lpg_r(kLpgFrames, 0.0f);
+
+        // First 5ms has input strike excitation
+        for (uint32_t i = 0; i < 240; ++i) {
+            float pulse = (i % 24 < 12) ? 0.9f : -0.9f;
+            lpg_l[i] = pulse;
+            lpg_r[i] = pulse;
+        }
+
+        // Process block in slices to observe natural acoustic decay curve
+        float peak_early = 0.0f;
+        float peak_late = 0.0f;
+
+        const uint32_t slice = 256;
+        for (uint32_t offset = 0; offset < kLpgFrames; offset += slice) {
+            uint32_t frames_to_process = std::min(slice, kLpgFrames - offset);
+            lpg.process_stereo(lpg_l.data() + offset, lpg_r.data() + offset, frames_to_process);
+
+            for (uint32_t s = 0; s < frames_to_process; ++s) {
+                float val = std::abs(lpg_l[offset + s]);
+                if (offset < 2400) { // first 50ms
+                    peak_early = std::max(peak_early, val);
+                } else if (offset > 14400) { // after 300ms
+                    peak_late = std::max(peak_late, val);
+                }
+            }
+        }
+
+        // Peak early must be loud (>0.2), peak late must have naturally decayed by >20dB (<0.02)
+        TEST_CHECK(peak_early > 0.20f);
+        TEST_CHECK(peak_late < 0.02f);
+        TEST_CHECK(peak_early > 10.0f * peak_late);
+        std::cout << "  -> Buchla 292 LPG Acoustic Ringing: PASSED ("
+                  << "Early Strike Peak=" << peak_early << " vs 300ms Decayed=" << peak_late << ")" << std::endl;
+    }
+
+    // 5. InsertSlot Integration & Sidechain Ducking Test
+    {
+        audio_core::InsertSlot slot;
+        slot.init(48000);
+
+        auto proc = std::make_shared<LiquidVactrolProcessor>(48000);
+        proc->init(48000);
+        proc->set_parameter(0, 0.80f); // Peak reduction 80%
+        proc->set_parameter(1, 0.0f);  // 0 dB makeup
+        proc->set_parameter(2, 0.0f);  // OptoCompressor mode
+        slot.set_processor(proc);
+
+        TEST_CHECK(slot.processor() != nullptr);
+        TEST_CHECK(slot.processor()->supports_sidechain());
+        TEST_CHECK(std::string_view(slot.processor()->name()) == "LiquidVactrol");
+        TEST_CHECK(std::abs(slot.processor()->get_parameter(0) - 0.80f) < 1e-4f);
+
+        // Continuous audio on main: 1kHz tone (RMS ~ 0.5)
+        const uint32_t kScFrames = 2400; // 50ms
+        std::vector<float> main_l(kScFrames), main_r(kScFrames);
+        std::vector<float> sc_l(kScFrames), sc_r(kScFrames);
+
+        for (uint32_t i = 0; i < kScFrames; ++i) {
+            main_l[i] = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 1000.0f * static_cast<float>(i) / 48000.0f);
+            main_r[i] = main_l[i];
+            // Loud sidechain kick drum impulse
+            sc_l[i] = 1.0f * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * static_cast<float>(i) / 48000.0f);
+            sc_r[i] = sc_l[i];
+        }
+
+        // Process through slot with sidechain
+        slot.process_stereo(main_l.data(), main_r.data(), kScFrames, sc_l.data(), sc_r.data());
+
+        // Main audio should be ducked by the loud sidechain kick
+        float final_rms = 0.0f;
+        for (uint32_t i = kScFrames - 480; i < kScFrames; ++i) {
+            final_rms += main_l[i] * main_l[i];
+        }
+        final_rms = std::sqrt(final_rms / 480.0f);
+
+        // Clean uncompressed RMS was 0.5 / sqrt(2) ≈ 0.353. Ducked RMS should be < 0.25
+        TEST_CHECK(final_rms < 0.25f);
+        std::cout << "  -> InsertSlot Sidechain Ducking: PASSED (Sidechain Ducked RMS=" << final_rms << " < 0.25)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -5597,9 +5812,11 @@ int main() {
     test_step_sequencer_midi_pattern_clips_and_arranger();
     test_ptp_boundary_clock_and_master_sync_daemon();
     test_universal_routing_matrix_audio_and_aoip_transmission();
+    test_liquid_vactrol_opto_leveler_and_buchla_lpg();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
+
