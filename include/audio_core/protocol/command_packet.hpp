@@ -42,6 +42,10 @@ enum class MixerCommandType : uint16_t {
     SetTrackReverse,
     TriggerTrackTapeStop,
     TriggerTrackTapeStart,
+    LaunchTrackClip,
+    StopTrackClip,
+    LaunchScene,
+    StopAllClips,
 };
 
 // ============================================================================

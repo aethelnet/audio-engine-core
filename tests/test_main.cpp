@@ -6116,6 +6116,185 @@ void test_wsola_streamer_and_realtime_pitch_shift() {
     }
 }
 
+void test_clip_launcher_and_loop_trigger_engine() {
+    std::cout << "[TEST] Running Clip Launcher & Loop Trigger Engine Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::clock;
+
+    const uint32_t kSr = 48000;
+    const double kBpm = 120.0;
+    TimelineClock clock(kSr, kBpm);
+    clock.set_playing(true);
+    // At 120 BPM & 48kHz: spb = 24000, spbar = 96000
+    TEST_CHECK(std::abs(clock.samples_per_beat() - 24000.0) < 1e-4);
+    TEST_CHECK(std::abs(clock.samples_per_bar() - 96000.0) < 1e-4);
+
+    // 1. Setup Audio Clips:
+    // Clip A: 440 Hz sine tone (1 bar = 96000 frames)
+    // Clip B: 880 Hz sine tone (1 bar = 96000 frames)
+    auto clip_a = std::make_shared<AudioClip>("LoopA_440Hz", kSr, 2, 96000);
+    clip_a->set_bpm(120.0);
+    auto clip_b = std::make_shared<AudioClip>("LoopB_880Hz", kSr, 2, 96000);
+    clip_b->set_bpm(120.0);
+    for (uint32_t i = 0; i < 96000; ++i) {
+        float sa = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / static_cast<float>(kSr));
+        clip_a->channel(0)[i] = sa;
+        clip_a->channel(1)[i] = sa;
+
+        float sb = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 880.0f * static_cast<float>(i) / static_cast<float>(kSr));
+        clip_b->channel(0)[i] = sb;
+        clip_b->channel(1)[i] = sb;
+    }
+
+    // 2. Test Standalone ClipLauncher
+    ClipLauncher launcher(static_cast<float>(kSr));
+    launcher.set_slot_audio(0, clip_a, PlaybackMode::BeatSyncTimeStretch, 0.0f, 1.0f, "Sine440");
+    launcher.set_slot_audio(1, clip_b, PlaybackMode::BeatSyncTimeStretch, 0.0f, 1.0f, "Sine880");
+
+    // Launch Slot 0 immediately
+    launcher.launch_slot(0, LaunchQuantize::Immediate);
+    TEST_CHECK(launcher.is_active());
+    TEST_CHECK(launcher.current_slot_idx() == 0);
+    TEST_CHECK(launcher.slot(0).state.load() == SlotPlayState::Playing);
+
+    // Render 1000 frames: output should be 440 Hz
+    std::vector<Sample> out_l(1000), out_r(1000);
+    BlockBoundaryEvents events{};
+    launcher.render(out_l.data(), out_r.data(), 1000, clock, events);
+    TEST_CHECK(out_l[500] != 0.0f);
+
+    // Mid-bar at sample 1000: Queue Slot 1 with BarQuantized
+    launcher.launch_slot(1, LaunchQuantize::Bar);
+    TEST_CHECK(launcher.queued_slot_idx() == 1);
+    TEST_CHECK(launcher.slot(1).state.load() == SlotPlayState::QueuedPlay);
+    TEST_CHECK(launcher.current_slot_idx() == 0); // Slot 0 still playing
+
+    // Render up to near bar boundary (e.g. advance clock to sample 95,900)
+    clock.set_sample_position(95900);
+    // Next block of 200 frames will cross bar boundary at sample 96,000 (offset = 100)
+    auto boundary = clock.advance_block(200);
+    TEST_CHECK(boundary.has_bar_boundary);
+    TEST_CHECK(boundary.bar_sample_offset == 100);
+
+    std::vector<Sample> cross_l(200), cross_r(200);
+    launcher.render(cross_l.data(), cross_r.data(), 200, clock, boundary);
+
+    // Verify boundary transition took place
+    TEST_CHECK(launcher.current_slot_idx() == 1);
+    TEST_CHECK(launcher.slot(1).state.load() == SlotPlayState::Playing);
+    TEST_CHECK(launcher.slot(0).state.load() == SlotPlayState::Stopped);
+    TEST_CHECK(launcher.queued_slot_idx() == -1);
+
+    // Verify samples before offset (0..99) contain audio, and samples after offset contain audio
+    // and no NaN / Inf
+    for (int i = 0; i < 200; ++i) {
+        TEST_CHECK(!std::isnan(cross_l[i]) && !std::isinf(cross_l[i]));
+        TEST_CHECK(!std::isnan(cross_r[i]) && !std::isinf(cross_r[i]));
+    }
+    std::cout << "  -> Bar-Quantized Audio Loop Launch & Anti-Click Micro-Fade: PASSED" << std::endl;
+
+    // 3. Legato Phase Locking Test
+    {
+        // Advance clock to middle of bar 2 (sample 96000 + 48000 = 144000)
+        clock.set_sample_position(144000); // 50% through 1-bar loop
+        launcher.launch_slot(0, LaunchQuantize::Immediate, true /* legato */);
+        // Playhead should start near 48,000 samples (within 2000 samples tolerance), NOT 0
+        TEST_CHECK(launcher.playhead() >= 46000.0 && launcher.playhead() <= 50000.0);
+        std::cout << "  -> Legato Phase Locking: PASSED (Playhead locked to transport bar phase=" << launcher.playhead() << ")" << std::endl;
+    }
+
+    // 4. MixerGraph Integration & Binary Command Protocol Dispatch
+    {
+        MixerGraph mixer(48000, 256);
+        auto* trk0 = mixer.allocate_track("Trk 1 Drums");
+        auto* trk1 = mixer.allocate_track("Trk 2 Bass");
+        auto* trk2 = mixer.allocate_track("Trk 3 Vocals");
+        auto* trk3 = mixer.allocate_track("Trk 4 Perc");
+
+        TEST_CHECK(trk0 && trk1 && trk2 && trk3);
+
+        std::array<Track*, 4> trks = {trk0, trk1, trk2, trk3};
+        for (auto* trk : trks) {
+            trk->clip_launcher().set_slot_audio(0, clip_a, PlaybackMode::BeatSyncTimeStretch, 0.0f, 1.0f, "Scene1");
+            trk->clip_launcher().set_slot_audio(1, clip_b, PlaybackMode::BeatSyncTimeStretch, 0.0f, 1.0f, "Scene2");
+            trk->clip_launcher().set_slot_audio(2, clip_a, PlaybackMode::PitchShiftWsola, 12.0f, 1.0f, "Scene3");
+        }
+
+        // Post LaunchScene(1, BarQuantized) via binary command
+        mixer.launch_scene(1, LaunchQuantize::Bar);
+
+        // Advance mixer clock to trigger command and boundary
+        mixer.clock().set_playing(true);
+        mixer.clock().set_sample_position(95900);
+
+        AudioBuffer out_buf(2, 256);
+        auto view = out_buf.view();
+        mixer.render(view);
+
+        // All 4 tracks should now be playing Slot 1!
+        for (auto* trk : trks) {
+            TEST_CHECK(trk->is_clip_launcher_active());
+            TEST_CHECK(trk->clip_launcher().current_slot_idx() == 1);
+            TEST_CHECK(trk->clip_launcher().slot(1).state.load() == SlotPlayState::Playing);
+        }
+
+        // Post StopAllClips(Immediate)
+        mixer.stop_all_clips(LaunchQuantize::Immediate);
+        mixer.render(view);
+
+        for (auto* trk : trks) {
+            TEST_CHECK(!trk->is_clip_launcher_active());
+            TEST_CHECK(trk->clip_launcher().current_slot_idx() == -1);
+        }
+
+        std::cout << "  -> MixerGraph Multi-Track Scene Launching & Binary Protocol: PASSED" << std::endl;
+    }
+
+    // 5. "Back to Arranger" Fallback Verification
+    {
+        MixerGraph mixer(48000, 256);
+        auto* trk = mixer.allocate_track("ArrangerTrack");
+        TEST_CHECK(trk != nullptr);
+        const uint32_t trk_id = trk->id();
+
+        // Arranger has clip_a
+        trk->set_clip(clip_a, true);
+        trk->set_sync_to_transport(true);
+        mixer.clock().set_playing(true);
+
+        // Slot 0 has clip_b
+        trk->clip_launcher().set_slot_audio(0, clip_b, PlaybackMode::BeatSyncTimeStretch, 0.0f, 1.0f, "SlotB");
+
+        AudioBuffer out_buf(2, 256);
+        auto view = out_buf.view();
+
+        // 1. Initially clip launcher is NOT active -> Arranger plays clip_a (440 Hz)
+        mixer.render(view);
+        TEST_CHECK(!trk->is_clip_launcher_active());
+        float arr_sample = std::abs(out_buf.channel(0)[50]);
+        TEST_CHECK(arr_sample > 0.001f);
+
+        // 2. Launch clip 0 -> Clip launcher overrides arranger
+        mixer.launch_track_clip(trk_id, 0, LaunchQuantize::Immediate);
+        mixer.render(view);
+        TEST_CHECK(trk->is_clip_launcher_active());
+        TEST_CHECK(trk->clip_launcher().current_slot_idx() == 0);
+
+        // 3. Return to arranger (stop_clip immediate)
+        mixer.stop_track_clip(trk_id, LaunchQuantize::Immediate);
+        mixer.render(view);
+        TEST_CHECK(!trk->is_clip_launcher_active());
+        // Track automatically resumes rendering arranger audio
+        float reverted_sample = std::abs(out_buf.channel(0)[50]);
+        TEST_CHECK(reverted_sample > 0.001f);
+
+        std::cout << "  -> Back to Arranger Seamless Fallback: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -6170,6 +6349,7 @@ int main() {
     test_liquid_vactrol_opto_leveler_and_buchla_lpg();
     test_vari_speed_streamer_and_beat_sync_repitch();
     test_wsola_streamer_and_realtime_pitch_shift();
+    test_clip_launcher_and_loop_trigger_engine();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -12,6 +12,7 @@
 #include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
+#include "audio_core/sequencer/clip_launcher.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/dsp/kinetic_meter.hpp"
@@ -85,6 +86,7 @@ public:
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_sync_to_transport.store(false, std::memory_order_relaxed);
         m_streamer.reset();
+        m_launcher.stop_immediate();
         m_buffer.clear();
         reset_meters();
         m_active.store(true, std::memory_order_release);
@@ -104,6 +106,7 @@ public:
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
         m_sync_to_transport.store(false, std::memory_order_relaxed);
         m_streamer.reset();
+        m_launcher.stop_immediate();
         m_buffer.clear();
         reset_meters();
     }
@@ -277,6 +280,7 @@ public:
     void set_sequencer(std::shared_ptr<sequencer::StepSequencer> seq) noexcept {
         m_sequencer = std::move(seq);
         m_sequencer_enabled.store(m_sequencer != nullptr, std::memory_order_relaxed);
+        m_launcher.set_associated_sequencer(m_sequencer.get());
     }
 
     void enable_sequencer(bool enable) noexcept {
@@ -287,6 +291,22 @@ public:
     [[nodiscard]] const sequencer::StepSequencer* sequencer() const noexcept { return m_sequencer.get(); }
     [[nodiscard]] bool is_sequencer_enabled() const noexcept {
         return m_sequencer_enabled.load(std::memory_order_relaxed) && (m_sequencer != nullptr);
+    }
+
+    // Clip Launcher Integration
+    [[nodiscard]] sequencer::ClipLauncher& clip_launcher() noexcept { return m_launcher; }
+    [[nodiscard]] const sequencer::ClipLauncher& clip_launcher() const noexcept { return m_launcher; }
+
+    void launch_clip(size_t slot_idx, sequencer::LaunchQuantize q = sequencer::LaunchQuantize::Bar, bool legato = false) noexcept {
+        m_launcher.launch_slot(slot_idx, q, legato);
+    }
+
+    void stop_clip(sequencer::LaunchQuantize q = sequencer::LaunchQuantize::Bar) noexcept {
+        m_launcher.stop(q);
+    }
+
+    [[nodiscard]] bool is_clip_launcher_active() const noexcept {
+        return m_launcher.is_active();
     }
 
     void set_input_mode(TrackInputMode mode) noexcept { m_input_mode.store(mode, std::memory_order_relaxed); }
@@ -305,11 +325,18 @@ public:
         }
 
         if (mode == TrackInputMode::MergeAll) {
-            // Additive summing: render internal clip/sequencer and sum into existing external audio
+            // Additive summing: render internal clip/launcher/sequencer and sum into existing external audio
             Sample tmp_l[2048];
             Sample tmp_r[2048];
             const uint32_t f_proc = std::min(frames, 2048u);
-            if (is_sequencer_enabled()) {
+            if (m_launcher.is_active()) {
+                m_launcher.render(tmp_l, tmp_r, f_proc, clock, boundary_events);
+                m_clip_playhead.store(m_launcher.playhead(), std::memory_order_relaxed);
+                for (uint32_t f = 0; f < f_proc; ++f) {
+                    left[f] += tmp_l[f];
+                    right[f] += tmp_r[f];
+                }
+            } else if (is_sequencer_enabled()) {
                 m_sequencer->render(tmp_l, tmp_r, f_proc, clock, boundary_events);
                 for (uint32_t f = 0; f < f_proc; ++f) {
                     left[f] += tmp_l[f];
@@ -330,6 +357,14 @@ public:
             return;
         }
 
+        // Dedicated clip launcher active (overrides arranger playback)
+        if (m_launcher.is_active()) {
+            m_launcher.render(left, right, frames, clock, boundary_events);
+            m_clip_playhead.store(m_launcher.playhead(), std::memory_order_relaxed);
+            return;
+        }
+
+        // Arranger fallback
         if (is_sequencer_enabled()) {
             m_sequencer->render(left, right, frames, clock, boundary_events);
         } else if (m_clip) {
@@ -441,6 +476,7 @@ private:
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
+    sequencer::ClipLauncher m_launcher;
 
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
@@ -1076,6 +1112,43 @@ public:
     // Lock-free command dispatch: UI or Network pushes binary POD packets
     bool post_command(const protocol::MixerCommand& cmd) noexcept {
         return m_command_queue.try_push(cmd);
+    }
+
+    void launch_track_clip(uint32_t track_id, uint32_t slot_id,
+                           sequencer::LaunchQuantize quantize = sequencer::LaunchQuantize::Bar,
+                           bool legato = false) noexcept {
+        protocol::MixerCommand cmd;
+        cmd.type = protocol::MixerCommandType::LaunchTrackClip;
+        cmd.target_id = track_id;
+        cmd.secondary_id = slot_id;
+        cmd.flags = (static_cast<uint32_t>(quantize) & 0xFF) | ((legato ? 1u : 0u) << 8);
+        post_command(cmd);
+    }
+
+    void stop_track_clip(uint32_t track_id,
+                         sequencer::LaunchQuantize quantize = sequencer::LaunchQuantize::Bar) noexcept {
+        protocol::MixerCommand cmd;
+        cmd.type = protocol::MixerCommandType::StopTrackClip;
+        cmd.target_id = track_id;
+        cmd.flags = static_cast<uint32_t>(quantize) & 0xFF;
+        post_command(cmd);
+    }
+
+    void launch_scene(uint32_t scene_id,
+                      sequencer::LaunchQuantize quantize = sequencer::LaunchQuantize::Bar,
+                      bool legato = false) noexcept {
+        protocol::MixerCommand cmd;
+        cmd.type = protocol::MixerCommandType::LaunchScene;
+        cmd.target_id = scene_id;
+        cmd.flags = (static_cast<uint32_t>(quantize) & 0xFF) | ((legato ? 1u : 0u) << 8);
+        post_command(cmd);
+    }
+
+    void stop_all_clips(sequencer::LaunchQuantize quantize = sequencer::LaunchQuantize::Bar) noexcept {
+        protocol::MixerCommand cmd;
+        cmd.type = protocol::MixerCommandType::StopAllClips;
+        cmd.flags = static_cast<uint32_t>(quantize) & 0xFF;
+        post_command(cmd);
     }
 
     // Lock-free telemetry capture: UI copies 60Hz state snapshot without blocking audio thread
@@ -1735,6 +1808,40 @@ public:
             case protocol::MixerCommandType::TriggerTrackTapeStart: {
                 if (auto* trk = get_track(cmd.target_id)) {
                     trk->trigger_tape_start(cmd.value1 > 0.0f ? cmd.value1 : 0.3f);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::LaunchTrackClip: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    auto q = static_cast<sequencer::LaunchQuantize>(cmd.flags & 0xFF);
+                    bool legato = ((cmd.flags >> 8) & 1) != 0;
+                    trk->launch_clip(cmd.secondary_id, q, legato);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::StopTrackClip: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    auto q = static_cast<sequencer::LaunchQuantize>(cmd.flags & 0xFF);
+                    trk->stop_clip(q);
+                }
+                break;
+            }
+            case protocol::MixerCommandType::LaunchScene: {
+                auto q = static_cast<sequencer::LaunchQuantize>(cmd.flags & 0xFF);
+                bool legato = ((cmd.flags >> 8) & 1) != 0;
+                for (auto& trk : m_tracks) {
+                    if (trk && trk->is_active()) {
+                        trk->launch_clip(cmd.target_id, q, legato);
+                    }
+                }
+                break;
+            }
+            case protocol::MixerCommandType::StopAllClips: {
+                auto q = static_cast<sequencer::LaunchQuantize>(cmd.flags & 0xFF);
+                for (auto& trk : m_tracks) {
+                    if (trk && trk->is_active()) {
+                        trk->stop_clip(q);
+                    }
                 }
                 break;
             }
