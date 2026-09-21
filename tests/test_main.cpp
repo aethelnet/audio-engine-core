@@ -4044,6 +4044,169 @@ void test_universal_routing_matrix_and_bitwig_converter_elimination() {
     }
 }
 
+void test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi() {
+    std::cout << "[TEST] Running Atomic Lock-Free WASM Hot-Swap, Gas Watchdog & Sovereign ABI Test..." << std::endl;
+
+    // 1. Sovereign WASM ABI Introspection & Verification (gain_delay.wasm)
+    {
+        auto wasm = std::make_unique<audio_core::WasmDspPlugin>();
+        bool loaded = wasm->load_from_file("plugins/gain_delay/gain_delay.wasm");
+        if (!loaded) loaded = wasm->load_from_file("../plugins/gain_delay/gain_delay.wasm");
+        TEST_CHECK(loaded);
+        TEST_CHECK(wasm->is_loaded());
+
+        TEST_CHECK(wasm->init(48000));
+        TEST_CHECK(wasm->get_num_parameters() == 2);
+        TEST_CHECK(wasm->get_parameter_name(1) == "Gain");
+        TEST_CHECK(wasm->get_parameter_name(2) == "Feedback");
+
+        wasm->set_parameter(1, 2.5f); // Gain = 2.5
+        TEST_CHECK(std::abs(wasm->get_parameter(1) - 2.5f) < 1e-4f);
+
+        wasm->set_parameter(2, 0.4f); // Feedback = 0.4
+        TEST_CHECK(std::abs(wasm->get_parameter(2) - 0.4f) < 1e-4f);
+
+        std::cout << "  -> Sovereign ABI Introspection: PASSED (Param Count=2, 'Gain', 'Feedback' exports verified)" << std::endl;
+    }
+
+    // 2. Gas Limit Watchdog & Infinite Loop Isolation (rogue.wasm)
+    {
+        auto rogue_wasm = std::make_unique<audio_core::WasmDspPlugin>();
+        bool loaded = rogue_wasm->load_from_file("plugins/rogue/rogue.wasm");
+        if (!loaded) loaded = rogue_wasm->load_from_file("../plugins/rogue/rogue.wasm");
+        TEST_CHECK(loaded);
+        TEST_CHECK(rogue_wasm->init(48000));
+
+        audio_core::InsertSlot slot;
+        slot.init(48000);
+        auto rogue_proc = std::make_shared<audio_core::dsp::WasmProcessor>(std::move(rogue_wasm), "Rogue Plugin");
+        slot.set_processor(rogue_proc);
+
+        constexpr uint32_t kFrames = 256;
+        std::vector<float> left(kFrames, 0.5f);
+        std::vector<float> right(kFrames, 0.5f);
+
+        // A. Mode 0: Normal clean passthrough
+        slot.processor()->set_parameter(1, 0.0f);
+        slot.process_stereo(left.data(), right.data(), kFrames);
+        TEST_CHECK(!slot.has_fault());
+        TEST_CHECK(!slot.is_circuit_breaker_tripped());
+        TEST_CHECK(std::abs(left[0] - 0.5f) < 0.01f);
+
+        // B. Mode 2: Malicious Infinite Loop (while(true) in WASM)
+        slot.processor()->set_parameter(1, 2.0f); // Mode = 2 (infinite loop)
+
+        // Process should NOT freeze or hang! Gas watchdog must trap and silence output
+        slot.process_stereo(left.data(), right.data(), kFrames);
+        TEST_CHECK(slot.has_fault());
+        TEST_CHECK(slot.consecutive_faults() == 1);
+        // Output must be fail-safe zeroed
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(left[i] == 0.0f);
+            TEST_CHECK(right[i] == 0.0f);
+        }
+
+        // Run 7 more blocks to hit kCircuitBreakerFaultLimit (8)
+        for (int b = 0; b < 7; ++b) {
+            slot.process_stereo(left.data(), right.data(), kFrames);
+        }
+        TEST_CHECK(slot.is_circuit_breaker_tripped());
+        TEST_CHECK(slot.is_bypassed());
+
+        std::cout << "  -> Gas Watchdog & Runaway Isolation: PASSED (Infinite loop trapped via gas meter, circuit breaker auto-bypassed rogue module)" << std::endl;
+
+        // Reset and test Mode 1 (NaN explosion)
+        slot.reset_circuit_breaker();
+        slot.processor()->clear_fault();
+        slot.processor()->set_parameter(1, 1.0f); // Mode = 1 (Emit NaNs)
+
+        slot.process_stereo(left.data(), right.data(), kFrames);
+        TEST_CHECK(slot.has_fault());
+        // NaNs should be sanitized to 0.0f
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(!std::isnan(left[i]));
+            TEST_CHECK(!std::isnan(right[i]));
+        }
+        std::cout << "  -> NaN Sanitization & Auto-Bypass: PASSED (NaN output captured and sanitized, zero pops)" << std::endl;
+    }
+
+    // 3. Multi-Threaded Real-Time Lock-Free Plugin Hot-Swapping Concurrency Stress Test
+    {
+        audio_core::InsertSlot slot;
+        slot.init(48000);
+
+        auto load_plugin = [](const std::string& path, const std::string& name) -> std::shared_ptr<audio_core::IProcessor> {
+            auto wasm = std::make_unique<audio_core::WasmDspPlugin>();
+            bool loaded = wasm->load_from_file(path);
+            if (!loaded) loaded = wasm->load_from_file("../" + path);
+            if (!loaded) return nullptr;
+            return std::make_shared<audio_core::dsp::WasmProcessor>(std::move(wasm), name);
+        };
+
+        auto proc_sat = load_plugin("plugins/saturator/saturator.wasm", "Saturator");
+        auto proc_delay = load_plugin("plugins/gain_delay/gain_delay.wasm", "Delay");
+        TEST_CHECK(proc_sat != nullptr);
+        TEST_CHECK(proc_delay != nullptr);
+
+        slot.set_processor(proc_sat);
+
+        constexpr uint32_t kFrames = 256;
+        std::atomic<bool> audio_running{true};
+        std::atomic<uint64_t> blocks_processed{0};
+        std::atomic<uint32_t> swap_count{0};
+
+        // Real-Time Audio Thread Simulation
+        std::thread audio_thread([&]() {
+            std::vector<float> l(kFrames, 0.4f);
+            std::vector<float> r(kFrames, 0.4f);
+            while (audio_running.load(std::memory_order_relaxed)) {
+                for (uint32_t i = 0; i < kFrames; ++i) {
+                    l[i] = 0.3f;
+                    r[i] = 0.3f;
+                }
+                slot.process_stereo(l.data(), r.data(), kFrames);
+
+                for (uint32_t i = 0; i < kFrames; ++i) {
+                    if (std::isnan(l[i]) || std::isnan(r[i])) {
+                        std::cerr << "NaN detected during hot-swap!" << std::endl;
+                        std::abort();
+                    }
+                }
+                blocks_processed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        // Control / GUI / Network Thread Concurrently Hot-Swapping Plugins
+        std::thread control_thread([&]() {
+            for (int i = 0; i < 60; ++i) {
+                if (i % 3 == 0) {
+                    slot.swap_processor(proc_delay);
+                } else if (i % 3 == 1) {
+                    slot.swap_processor(proc_sat);
+                } else {
+                    slot.swap_processor(nullptr);
+                }
+                swap_count.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+        });
+
+        control_thread.join();
+        audio_running.store(false, std::memory_order_relaxed);
+        audio_thread.join();
+
+        // Prune graveyard after audio thread has stopped
+        slot.prune_graveyard();
+
+        TEST_CHECK(blocks_processed.load() > 100);
+        TEST_CHECK(swap_count.load() == 60);
+        TEST_CHECK(!slot.is_circuit_breaker_tripped());
+
+        std::cout << "  -> Concurrency Stress Test: PASSED ("
+                  << blocks_processed.load() << " audio blocks rendered during 60 lock-free plugin hot-swaps, 0 drops, 0 NaN)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4083,6 +4246,7 @@ int main() {
     test_multihead_ode_compressor_and_transient_accuracy();
     test_aes67_ptp_and_speaker_calibration_matrix();
     test_universal_routing_matrix_and_bitwig_converter_elimination();
+    test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

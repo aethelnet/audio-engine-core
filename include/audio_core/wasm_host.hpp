@@ -31,11 +31,22 @@ public:
                         Sample* out_left, Sample* out_right,
                         uint32_t num_frames) noexcept;
 
-    // Parameter Control
+    // Parameter Control & Sovereign WASM ABI
     void set_parameter(uint32_t param_id, float value) noexcept;
     [[nodiscard]] float get_parameter(uint32_t param_id) noexcept;
+    [[nodiscard]] uint32_t get_num_parameters() const noexcept;
+    [[nodiscard]] std::string get_parameter_name(uint32_t param_id) const;
 
+    // Watchdog & Fault Inspection
     [[nodiscard]] bool is_loaded() const noexcept;
+    [[nodiscard]] bool has_fault() const noexcept;
+    [[nodiscard]] const char* last_error() const noexcept;
+    [[nodiscard]] uint64_t trap_count() const noexcept;
+    void clear_fault() noexcept;
+
+    // Gas Limit Watchdog Configuration
+    void set_gas_limit_per_frame(double gas) noexcept;
+    [[nodiscard]] double gas_limit_per_frame() const noexcept;
 
 private:
     struct Impl;

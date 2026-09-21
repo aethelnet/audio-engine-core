@@ -31,10 +31,18 @@ struct WasmDspPlugin::Impl {
     IM3Function fn_get_param{nullptr};
     IM3Function fn_get_in_buf{nullptr};
     IM3Function fn_get_out_buf{nullptr};
+    IM3Function fn_get_num_params{nullptr};
+    IM3Function fn_get_param_name{nullptr};
 
     uint32_t in_buf_offset{0};
     uint32_t out_buf_offset{0};
     bool loaded{false};
+
+    bool has_fault{false};
+    uint64_t trap_count{0};
+    uint32_t consecutive_traps{0};
+    const char* last_error{""};
+    double gas_limit_per_frame{25.0};
 
     ~Impl() {
         cleanup();
@@ -53,6 +61,10 @@ struct WasmDspPlugin::Impl {
         loaded = false;
         in_buf_offset = 0;
         out_buf_offset = 0;
+        has_fault = false;
+        trap_count = 0;
+        consecutive_traps = 0;
+        last_error = "";
     }
 };
 
@@ -98,15 +110,24 @@ bool WasmDspPlugin::load_from_memory(std::span<const uint8_t> wasm_bytes) {
         return false;
     }
 
-    m3_FindFunction(&m_impl->fn_init, m_impl->runtime, "dsp_init");
-    m3_FindFunction(&m_impl->fn_process, m_impl->runtime, "dsp_process");
-    m3_FindFunction(&m_impl->fn_set_param, m_impl->runtime, "dsp_set_param");
-    m3_FindFunction(&m_impl->fn_get_param, m_impl->runtime, "dsp_get_param");
-    m3_FindFunction(&m_impl->fn_get_in_buf, m_impl->runtime, "dsp_get_input_buffer");
-    m3_FindFunction(&m_impl->fn_get_out_buf, m_impl->runtime, "dsp_get_output_buffer");
+    auto find_fn = [&](IM3Function* fn, const char* primary, const char* fallback) {
+        M3Result r = m3_FindFunction(fn, m_impl->runtime, primary);
+        if (r != m3Err_none && fallback) {
+            m3_FindFunction(fn, m_impl->runtime, fallback);
+        }
+    };
+
+    find_fn(&m_impl->fn_init, "sov_init", "dsp_init");
+    find_fn(&m_impl->fn_process, "sov_process", "dsp_process");
+    find_fn(&m_impl->fn_set_param, "sov_set_param", "dsp_set_param");
+    find_fn(&m_impl->fn_get_param, "sov_get_param", "dsp_get_param");
+    find_fn(&m_impl->fn_get_in_buf, "sov_get_input_buffer", "dsp_get_input_buffer");
+    find_fn(&m_impl->fn_get_out_buf, "sov_get_output_buffer", "dsp_get_output_buffer");
+    find_fn(&m_impl->fn_get_num_params, "sov_get_num_params", "dsp_get_num_params");
+    find_fn(&m_impl->fn_get_param_name, "sov_get_param_name", "dsp_get_param_name");
 
     if (!m_impl->fn_process || !m_impl->fn_get_in_buf || !m_impl->fn_get_out_buf) {
-        std::cerr << "[WasmHost] Missing required DSP exports (dsp_process, dsp_get_input_buffer, dsp_get_output_buffer)" << std::endl;
+        std::cerr << "[WasmHost] Missing required DSP exports (process, get_input_buffer, get_output_buffer)" << std::endl;
         return false;
     }
 
@@ -167,6 +188,16 @@ void WasmDspPlugin::process_stereo(const Sample* in_left, const Sample* in_right
     constexpr uint32_t kMaxPluginFrames = 1024;
     const uint32_t frames = (num_frames < kMaxPluginFrames) ? num_frames : kMaxPluginFrames;
 
+    // Linear memory safety bounds check
+    if (m_impl->in_buf_offset + frames * 2 * sizeof(Sample) > mem_size ||
+        m_impl->out_buf_offset + frames * 2 * sizeof(Sample) > mem_size) {
+        m_impl->has_fault = true;
+        m_impl->last_error = "buffer_out_of_bounds";
+        std::memset(out_left, 0, frames * sizeof(Sample));
+        std::memset(out_right, 0, frames * sizeof(Sample));
+        return;
+    }
+
     auto* wasm_in = reinterpret_cast<Sample*>(mem + m_impl->in_buf_offset);
     const auto* wasm_out = reinterpret_cast<const Sample*>(mem + m_impl->out_buf_offset);
 
@@ -174,18 +205,26 @@ void WasmDspPlugin::process_stereo(const Sample* in_left, const Sample* in_right
     std::memcpy(wasm_in, in_left, frames * sizeof(Sample));
     std::memcpy(wasm_in + kMaxPluginFrames, in_right, frames * sizeof(Sample));
 
-    // Arm gas limit watchdog: budget 25,000 gas units per frame to prevent infinite loops / freezes
-    m3_SetGasLimit(m_impl->runtime, static_cast<double>(frames) * 25000.0);
+    // Arm gas limit watchdog: budget per frame to prevent infinite loops / freezes
+    m3_SetGasLimit(m_impl->runtime, static_cast<double>(frames) * m_impl->gas_limit_per_frame);
 
     // Execute sandboxed DSP with gas watchdog
     M3Result res = m3_CallV(m_impl->fn_process, frames);
     if (res != m3Err_none) {
         // Trap occurred (e.g. trapOutOfGas from while(true), memory fault, div-by-zero)
+        m_impl->has_fault = true;
+        m_impl->trap_count++;
+        m_impl->consecutive_traps++;
+        m_impl->last_error = res;
+
         // Fail-safe: zero out output to protect downstream signal path
         std::memset(out_left, 0, frames * sizeof(Sample));
         std::memset(out_right, 0, frames * sizeof(Sample));
         return;
     }
+
+    m_impl->has_fault = false;
+    m_impl->consecutive_traps = 0;
 
     // Copy processed samples back
     std::memcpy(out_left, wasm_out, frames * sizeof(Sample));
@@ -207,8 +246,58 @@ float WasmDspPlugin::get_parameter(uint32_t param_id) noexcept {
     return val;
 }
 
+uint32_t WasmDspPlugin::get_num_parameters() const noexcept {
+    if (!m_impl->loaded || !m_impl->fn_get_num_params) return 0;
+    M3Result r = m3_CallV(m_impl->fn_get_num_params);
+    if (r != m3Err_none) return 0;
+    uint32_t count = 0;
+    m3_GetResultsV(m_impl->fn_get_num_params, &count);
+    return count;
+}
+
+std::string WasmDspPlugin::get_parameter_name(uint32_t param_id) const {
+    if (!m_impl->loaded || !m_impl->fn_get_param_name) return "";
+    M3Result r = m3_CallV(m_impl->fn_get_param_name, param_id);
+    if (r != m3Err_none) return "";
+    uint32_t str_offset = 0;
+    m3_GetResultsV(m_impl->fn_get_param_name, &str_offset);
+    size_t mem_size = 0;
+    uint8_t* mem = m3_GetMemory(m_impl->module, &mem_size, 0);
+    if (!mem || str_offset >= mem_size) return "";
+    const char* str = reinterpret_cast<const char*>(mem + str_offset);
+    size_t max_len = mem_size - str_offset;
+    size_t len = strnlen(str, max_len);
+    return std::string(str, len);
+}
+
 bool WasmDspPlugin::is_loaded() const noexcept {
     return m_impl->loaded;
+}
+
+bool WasmDspPlugin::has_fault() const noexcept {
+    return m_impl->has_fault;
+}
+
+const char* WasmDspPlugin::last_error() const noexcept {
+    return m_impl->last_error;
+}
+
+uint64_t WasmDspPlugin::trap_count() const noexcept {
+    return m_impl->trap_count;
+}
+
+void WasmDspPlugin::clear_fault() noexcept {
+    m_impl->has_fault = false;
+    m_impl->consecutive_traps = 0;
+    m_impl->last_error = "";
+}
+
+void WasmDspPlugin::set_gas_limit_per_frame(double gas) noexcept {
+    if (gas > 0.0) m_impl->gas_limit_per_frame = gas;
+}
+
+double WasmDspPlugin::gas_limit_per_frame() const noexcept {
+    return m_impl->gas_limit_per_frame;
 }
 
 } // namespace audio_core

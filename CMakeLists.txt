@@ -28,6 +28,7 @@ set(WASM3_SOURCES
 )
 add_library(wasm3_core STATIC ${WASM3_SOURCES})
 target_include_directories(wasm3_core PUBLIC third_party/wasm3/source)
+target_compile_definitions(wasm3_core PUBLIC d_m3HasGasMetering=1)
 target_compile_options(wasm3_core PRIVATE -w) # Suppress warnings in vendored C library
 
 # PipeWire Integration
