@@ -27,6 +27,7 @@
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <filesystem>
 
 using namespace audio_core;
 
@@ -285,6 +286,32 @@ int main(int argc, char** argv) {
         }
     };
 
+    // SampleTap Recorder & Quantized Bouncer State
+    int tap_source_idx = 0; // 0=Master Out, 1=Trk 1 Post, 2=Trk 2 Post, 3=Trk 3 Post, 4=Trk 4 Post, 5=Bus 1 Drum Glue, 6=Trk 1 Pre, 7=Trk 2 Pre
+    bool tap_auto_seamless = true;
+    auto* tap0 = mixer.tap(0);
+    if (tap0) {
+        tap0->set_source(sampling::TapSourceType::MasterOutput, 0);
+        tap0->set_rolling_mode();
+    }
+
+    auto update_tap_source = [&](int src_idx) {
+        if (!tap0) return;
+        tap_source_idx = src_idx;
+        switch (src_idx) {
+            case 0: tap0->set_source(sampling::TapSourceType::MasterOutput, 0); break;
+            case 1: tap0->set_source(sampling::TapSourceType::TrackOutput, trk0->id()); break;
+            case 2: tap0->set_source(sampling::TapSourceType::TrackOutput, trk1->id()); break;
+            case 3: tap0->set_source(sampling::TapSourceType::TrackOutput, trk2->id()); break;
+            case 4: tap0->set_source(sampling::TapSourceType::TrackOutput, trk3->id()); break;
+            case 5: tap0->set_source(sampling::TapSourceType::BusOutput, 1); break;
+            case 6: tap0->set_source(sampling::TapSourceType::TrackInput, trk0->id()); break;
+            case 7: tap0->set_source(sampling::TapSourceType::TrackInput, trk1->id()); break;
+            default: tap0->set_source(sampling::TapSourceType::MasterOutput, 0); break;
+        }
+        tap0->set_rolling_mode();
+    };
+
     // Track UI state caches
     float track_gains[4] = { 0.85f, 0.70f, 0.80f, 0.90f };
     float track_pans[4] = { 0.0f, -0.25f, 0.30f, 0.0f };
@@ -495,6 +522,20 @@ int main(int argc, char** argv) {
                 ImGui::TextColored(ImVec4(0.20f, 0.75f, 0.90f, 1.0f), "[PTPv2: KERNEL (%ld ns)]", static_cast<long>(avg_j));
             } else {
                 ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1.0f), "[PTPv2: USERSPACE]");
+            }
+
+            if (tap0) {
+                auto tap_st = tap0->record_state();
+                if (tap_st == sampling::RecordState::Armed) {
+                    ImGui::SameLine(0, 8);
+                    ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.15f, 1.0f), "[TAP: ARMED]");
+                } else if (tap_st == sampling::RecordState::Recording) {
+                    ImGui::SameLine(0, 8);
+                    ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "[TAP: REC %.0f%%]", tap0->progress() * 100.0f);
+                } else if (tap_st == sampling::RecordState::Complete) {
+                    ImGui::SameLine(0, 8);
+                    ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f), "[TAP: READY]");
+                }
             }
 
             ImGui::SameLine(0, 20);
@@ -1997,6 +2038,194 @@ int main(int argc, char** argv) {
                                 std::snprintf(status_toast, sizeof(status_toast),
                                               "APPLIED DEREZ2 CRUNCH (Rate=%.2f, Res=%.2f, Hard=%.2f)",
                                               derez_rate, derez_res, derez_hard);
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
+                    // Panel E: Live SampleTap Recorder & Downbeat-Quantized Bouncer
+                    ImGui::BeginChild("PanelSampleTap", ImVec2(0, 0), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f),
+                                           "SAMPLETAP LIVE RECORDER & DOWNBEAT-QUANTIZED BOUNCER (ZERO-CLICK SEAMLESS LOOPING)");
+                        ImGui::Separator();
+
+                        // Row 1: Source & Current Status
+                        ImGui::Text("Tap Source:");
+                        ImGui::SameLine();
+                        const char* tap_source_names[8] = {
+                            "Master Out (Full Mix)",
+                            "Track 1 Post-FX (Kick / 808)",
+                            "Track 2 Post-FX (Acid 303)",
+                            "Track 3 Post-FX (Vocal)",
+                            "Track 4 Post-FX (Drums)",
+                            "Submix Bus 1 (Drum Glue Comp)",
+                            "Track 1 Pre-FX (PipeWire / AoIP)",
+                            "Track 2 Pre-FX (PipeWire / AoIP)"
+                        };
+                        ImGui::SetNextItemWidth(260);
+                        if (ImGui::Combo("##TapSrc", &tap_source_idx, tap_source_names, 8)) {
+                            update_tap_source(tap_source_idx);
+                        }
+
+                        ImGui::SameLine(0, 20);
+                        if (tap0) {
+                            auto t_state = tap0->record_state();
+                            if (t_state == sampling::RecordState::Armed) {
+                                ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.15f, 1.0f), "[ ARMED // WAITING FOR DOWNBEAT ]");
+                                ImGui::SameLine();
+                                if (ImGui::Button("CANCEL##Arm")) {
+                                    tap0->dismiss_bounce_to_rolling();
+                                }
+                            } else if (t_state == sampling::RecordState::Recording) {
+                                ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "[ RECORDING QUANTIZED BOUNCE ]");
+                                ImGui::SameLine();
+                                ImGui::ProgressBar(tap0->progress(), ImVec2(160, 20));
+                                ImGui::SameLine();
+                                if (ImGui::Button("CANCEL##Rec")) {
+                                    tap0->dismiss_bounce_to_rolling();
+                                }
+                            } else if (t_state == sampling::RecordState::Complete) {
+                                auto b_clip = tap0->get_quantized_clip();
+                                if (b_clip) {
+                                    ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f),
+                                                       "[ BOUNCE READY: %s (%u frames, %.2fs) ]",
+                                                       b_clip->name().c_str(), b_clip->num_frames(),
+                                                       static_cast<float>(b_clip->num_frames()) / b_clip->sample_rate());
+                                }
+                            } else {
+                                ImGui::TextColored(ImVec4(0.40f, 0.75f, 0.40f, 1.0f),
+                                                   "[ ROLLING BUFFER ACTIVE (10s Ring Buffer) ]");
+                            }
+                        }
+
+                        // Row 2: Quantized Downbeat Bounce Triggers
+                        ImGui::Text("Quantized Downbeat Bounce (BarSync):");
+                        ImGui::SameLine();
+                        if (ImGui::Button("ARM 1 BAR")) {
+                            if (tap0) {
+                                std::string name = "Bounce_1Bar_Trk" + std::to_string(selected_track + 1);
+                                tap0->arm_bar_bounce(mixer.clock(), 1, name, tap_auto_seamless);
+                                std::snprintf(status_toast, sizeof(status_toast), "ARMED 1-BAR BOUNCE ON NEXT DOWNBEAT");
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("ARM 2 BARS")) {
+                            if (tap0) {
+                                std::string name = "Bounce_2Bars_Trk" + std::to_string(selected_track + 1);
+                                tap0->arm_bar_bounce(mixer.clock(), 2, name, tap_auto_seamless);
+                                std::snprintf(status_toast, sizeof(status_toast), "ARMED 2-BAR BOUNCE ON NEXT DOWNBEAT");
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("ARM 4 BARS")) {
+                            if (tap0) {
+                                std::string name = "Bounce_4Bars_Trk" + std::to_string(selected_track + 1);
+                                tap0->arm_bar_bounce(mixer.clock(), 4, name, tap_auto_seamless);
+                                std::snprintf(status_toast, sizeof(status_toast), "ARMED 4-BAR BOUNCE ON NEXT DOWNBEAT");
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("ARM 8 BARS")) {
+                            if (tap0) {
+                                std::string name = "Bounce_8Bars_Trk" + std::to_string(selected_track + 1);
+                                tap0->arm_bar_bounce(mixer.clock(), 8, name, tap_auto_seamless);
+                                std::snprintf(status_toast, sizeof(status_toast), "ARMED 8-BAR BOUNCE ON NEXT DOWNBEAT");
+                            }
+                        }
+                        ImGui::SameLine(0, 15);
+                        ImGui::Checkbox("Equal-Power Seamless Crossfade (128 samples)", &tap_auto_seamless);
+
+                        // Row 3: Bounce Commit Actions (when Complete)
+                        if (tap0 && tap0->record_state() == sampling::RecordState::Complete) {
+                            auto b_clip = tap0->get_quantized_clip();
+                            if (b_clip) {
+                                ImGui::Separator();
+                                ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.1f, 1.0f), "Commit Bounce to Track / Storage:");
+                                ImGui::SameLine();
+                                if (ImGui::Button("  COMMIT TO CURRENT TRACK  ")) {
+                                    track_clips_orig[selected_track] = b_clip;
+                                    sync_track_clip(selected_track, b_clip);
+                                    std::snprintf(status_toast, sizeof(status_toast),
+                                                  "COMMITTED BOUNCE TO TRACK %d (%s)",
+                                                  selected_track + 1, b_clip->name().c_str());
+                                    tap0->dismiss_bounce_to_rolling();
+                                }
+                                ImGui::SameLine();
+                                for (int tr = 0; tr < 4; ++tr) {
+                                    char t_label[32];
+                                    std::snprintf(t_label, sizeof(t_label), "-> Trk %d", tr + 1);
+                                    if (ImGui::Button(t_label)) {
+                                        track_clips_orig[tr] = b_clip;
+                                        sync_track_clip(tr, b_clip);
+                                        std::snprintf(status_toast, sizeof(status_toast),
+                                                      "COMMITTED BOUNCE TO TRACK %d (%s)",
+                                                      tr + 1, b_clip->name().c_str());
+                                        tap0->dismiss_bounce_to_rolling();
+                                    }
+                                    ImGui::SameLine();
+                                }
+                                if (ImGui::Button("EXPORT 24-BIT WAV##Bounce")) {
+                                    std::filesystem::create_directories("renders");
+                                    std::string path = "renders/" + b_clip->name() + ".wav";
+                                    if (b_clip->save_to_wav(path, 24)) {
+                                        std::snprintf(status_toast, sizeof(status_toast),
+                                                      "SAVED 24-BIT BOUNCE TO: %s", path.c_str());
+                                    }
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("DISMISS##Bounce")) {
+                                    tap0->dismiss_bounce_to_rolling();
+                                }
+                            }
+                        }
+
+                        // Row 4: Retroactive Jam Grab (Capture last N bars from rolling circular buffer)
+                        ImGui::Separator();
+                        ImGui::Text("Retroactive Jam Grab (Capture Last N Bars):");
+                        ImGui::SameLine();
+                        if (ImGui::Button("GRAB LAST 1 BAR")) {
+                            if (tap0) {
+                                uint32_t frames = static_cast<uint32_t>(std::round(mixer.clock().samples_for_bars(1)));
+                                auto c = tap0->capture_retroactive(frames, "Retro_1Bar_Trk" + std::to_string(selected_track + 1), tap_auto_seamless);
+                                if (c) {
+                                    track_clips_orig[selected_track] = c;
+                                    sync_track_clip(selected_track, c);
+                                    std::snprintf(status_toast, sizeof(status_toast),
+                                                  "RETROACTIVE CAPTURE: 1 BAR (%.2fs) COMMITTED TO TRACK %d",
+                                                  static_cast<float>(frames) / mixer.sample_rate(), selected_track + 1);
+                                }
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("GRAB LAST 2 BARS")) {
+                            if (tap0) {
+                                uint32_t frames = static_cast<uint32_t>(std::round(mixer.clock().samples_for_bars(2)));
+                                auto c = tap0->capture_retroactive(frames, "Retro_2Bars_Trk" + std::to_string(selected_track + 1), tap_auto_seamless);
+                                if (c) {
+                                    track_clips_orig[selected_track] = c;
+                                    sync_track_clip(selected_track, c);
+                                    std::snprintf(status_toast, sizeof(status_toast),
+                                                  "RETROACTIVE CAPTURE: 2 BARS (%.2fs) COMMITTED TO TRACK %d",
+                                                  static_cast<float>(frames) / mixer.sample_rate(), selected_track + 1);
+                                }
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("GRAB LAST 4 BARS")) {
+                            if (tap0) {
+                                uint32_t frames = static_cast<uint32_t>(std::round(mixer.clock().samples_for_bars(4)));
+                                auto c = tap0->capture_retroactive(frames, "Retro_4Bars_Trk" + std::to_string(selected_track + 1), tap_auto_seamless);
+                                if (c) {
+                                    track_clips_orig[selected_track] = c;
+                                    sync_track_clip(selected_track, c);
+                                    std::snprintf(status_toast, sizeof(status_toast),
+                                                  "RETROACTIVE CAPTURE: 4 BARS (%.2fs) COMMITTED TO TRACK %d",
+                                                  static_cast<float>(frames) / mixer.sample_rate(), selected_track + 1);
+                                }
                             }
                         }
                     }

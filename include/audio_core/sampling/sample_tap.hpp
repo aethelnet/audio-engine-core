@@ -123,6 +123,31 @@ public:
         return m_sync_mode.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] RecordMode record_mode() const noexcept {
+        return m_record_mode.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t recorded_frames() const noexcept {
+        return m_quantized_recorded_frames.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t target_frames() const noexcept {
+        return m_quantized_target_frames;
+    }
+
+    [[nodiscard]] float progress() const noexcept {
+        if (m_record_mode.load(std::memory_order_relaxed) == RecordMode::QuantizedBounce && m_quantized_target_frames > 0) {
+            return std::clamp(static_cast<float>(m_quantized_recorded_frames.load(std::memory_order_relaxed)) / static_cast<float>(m_quantized_target_frames), 0.0f, 1.0f);
+        }
+        return 0.0f;
+    }
+
+    void dismiss_bounce_to_rolling() noexcept {
+        m_quantized_clip.reset();
+        m_quantized_recorded_frames.store(0, std::memory_order_relaxed);
+        set_rolling_mode();
+    }
+
     // RT Audio Thread Record Hook (Lock-free, zero allocation)
     void record(const float* left, const float* right, uint32_t frames,
                 const clock::BlockBoundaryEvents* boundary_events = nullptr) noexcept {

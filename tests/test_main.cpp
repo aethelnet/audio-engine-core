@@ -4934,6 +4934,148 @@ void test_ptp_hardware_and_kernel_timestamping() {
               << " | Jitter Math Verified)" << std::endl;
 }
 
+void test_sample_tap_quantized_bounce_and_commit() {
+    std::cout << "[TEST] Running SampleTap Quantized Live-Bounce & Clip-Commit Engine Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    MixerGraph mixer(256);
+    mixer.clock().set_sample_rate(48000);
+    mixer.clock().set_bpm(120.0); // 48000 Hz, 120 BPM -> 24000 samples/beat, 96000 samples/bar
+    mixer.clock().set_playing(true);
+
+    // 1. Setup Source Track with synth audio signal
+    Track* trk1 = mixer.add_track("SynthMasterSource");
+    TEST_CHECK(trk1 != nullptr);
+    constexpr uint32_t kSourceFrames = 48000 * 4; // 4 seconds
+    auto src_clip = std::make_shared<AudioClip>("OscLoop", 48000, 2, kSourceFrames);
+    float* src_l = src_clip->channel(0);
+    float* src_r = src_clip->channel(1);
+    for (uint32_t i = 0; i < kSourceFrames; ++i) {
+        float val = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / 48000.0f);
+        src_l[i] = val;
+        src_r[i] = val;
+    }
+    trk1->set_clip(src_clip, true);
+    TEST_CHECK(trk1->is_active());
+
+    // 2. Configure Tap 0 on MasterOutput
+    SampleTap* tap = mixer.tap(0);
+    TEST_CHECK(tap != nullptr);
+    tap->set_source(TapSourceType::MasterOutput, 0);
+    TEST_CHECK(tap->record_mode() == RecordMode::RollingBuffer);
+
+    // 3. Test Downbeat-Quantized Bounce (Arm 1-Bar with Seamless Hermite crossfade)
+    // Clock at sample 48000 (bar 0, beat 2.0)
+    mixer.clock().set_sample_position(48000);
+    tap->arm_bar_bounce(mixer.clock(), 1, "Quantized_1Bar_Master", true);
+
+    TEST_CHECK(tap->record_mode() == RecordMode::QuantizedBounce);
+    TEST_CHECK(tap->record_state() == RecordState::Armed);
+    TEST_CHECK(tap->progress() == 0.0f);
+    TEST_CHECK(tap->recorded_frames() == 0);
+    TEST_CHECK(tap->target_frames() == 96000);
+
+    AudioBuffer master_buf(2, 256);
+    auto master_view = master_buf.view();
+
+    // Render blocks prior to downbeat (up to 95616)
+    for (int i = 0; i < 186; ++i) {
+        mixer.render(master_view);
+    }
+    TEST_CHECK(tap->record_state() == RecordState::Armed);
+    TEST_CHECK(tap->progress() == 0.0f);
+    TEST_CHECK(tap->get_quantized_clip() == nullptr);
+
+    // Cross sample 96000 (downbeat of bar 1)
+    mixer.render(master_view); // 95616 -> 95872
+    mixer.render(master_view); // 95872 -> 96128 (crosses 96000!)
+    TEST_CHECK(tap->record_state() == RecordState::Recording);
+    TEST_CHECK(tap->progress() > 0.0f);
+    TEST_CHECK(tap->progress() < 1.0f);
+    TEST_CHECK(tap->recorded_frames() > 0);
+
+    // Render until bounce completes (full 96000 frames)
+    while (tap->record_state() == RecordState::Recording) {
+        mixer.render(master_view);
+    }
+    TEST_CHECK(tap->record_state() == RecordState::Complete);
+    TEST_CHECK(tap->progress() == 1.0f);
+    TEST_CHECK(tap->recorded_frames() == 96000);
+
+    // 4. Verify Quantized Clip and Seam Conditioning
+    auto bounce_clip = tap->get_quantized_clip();
+    TEST_CHECK(bounce_clip != nullptr);
+    TEST_CHECK(bounce_clip->num_frames() == 96000);
+    TEST_CHECK(bounce_clip->num_channels() == 2);
+    TEST_CHECK(bounce_clip->name() == "Quantized_1Bar_Master");
+
+    // Energy check: ensure audio was captured
+    float energy = 0.0f;
+    const float* b_l = bounce_clip->channel(0);
+    for (uint32_t i = 0; i < 96000; ++i) {
+        energy += std::abs(b_l[i]);
+    }
+    TEST_CHECK(energy > 100.0f);
+
+    // Seam discontinuity check: LoopConditioner::condition_seamless ensures tail matches head smoothly
+    float seam_delta = std::abs(b_l[95999] - b_l[127]);
+    TEST_CHECK(seam_delta < 0.05f);
+
+    // 5. Commit Bounce Clip to Track 2
+    Track* trk2 = mixer.add_track("CommittedBounceTrack");
+    TEST_CHECK(trk2 != nullptr);
+    trk2->set_clip(bounce_clip, true); // Looped playback
+    TEST_CHECK(trk2->is_active());
+
+    // Mute Track 1 to verify Track 2 alone renders audio to master
+    trk1->set_mute(true);
+    TEST_CHECK(trk1->is_muted());
+
+    mixer.render(master_view);
+    float trk2_energy = 0.0f;
+    for (uint32_t i = 0; i < 256; ++i) {
+        trk2_energy += std::abs(master_buf.channel(0)[i]);
+    }
+    TEST_CHECK(trk2_energy > 0.1f); // Track 2 is successfully playing the committed bounce!
+
+    // 6. Test Dismiss Bounce & Return to Rolling Buffer
+    tap->dismiss_bounce_to_rolling();
+    TEST_CHECK(tap->record_mode() == RecordMode::RollingBuffer);
+    TEST_CHECK(tap->record_state() == RecordState::Recording);
+    TEST_CHECK(tap->get_quantized_clip() == nullptr);
+    TEST_CHECK(tap->recorded_frames() == 0);
+
+    // 7. Test Retroactive Circular Jam Grab (Grab Last 1 Bar = 96000 frames)
+    // Render 400 blocks to fill the rolling buffer with Track 2's audio
+    for (int i = 0; i < 400; ++i) {
+        mixer.render(master_view);
+    }
+
+    uint32_t retro_frames = static_cast<uint32_t>(mixer.clock().samples_for_bars(1));
+    auto retro_clip = tap->capture_retroactive(retro_frames, "Retro_Captured_Jam", true);
+    TEST_CHECK(retro_clip != nullptr);
+    TEST_CHECK(retro_clip->num_frames() == retro_frames);
+    TEST_CHECK(retro_clip->name() == "Retro_Captured_Jam");
+
+    float retro_energy = 0.0f;
+    const float* r_l = retro_clip->channel(0);
+    for (uint32_t i = 0; i < retro_frames; ++i) {
+        retro_energy += std::abs(r_l[i]);
+    }
+    TEST_CHECK(retro_energy > 100.0f);
+
+    // Commit retroactive grab to Track 3
+    Track* trk3 = mixer.add_track("RetroJamTrack");
+    TEST_CHECK(trk3 != nullptr);
+    trk3->set_clip(retro_clip, true);
+    TEST_CHECK(trk3->is_active());
+
+    std::cout << "  -> SampleTap Live-Bounce & Clip-Commit: PASSED ("
+              << "Downbeat quantize verified | Target: " << tap->target_frames() << " frames | "
+              << "Committed to Track 2 & 3 | Retroactive grab verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4981,6 +5123,7 @@ int main() {
     test_airwindows_derez2_decimator();
     test_derez_sampler_variable_clock_pitch();
     test_ptp_hardware_and_kernel_timestamping();
+    test_sample_tap_quantized_bounce_and_commit();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
