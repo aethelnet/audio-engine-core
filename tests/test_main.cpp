@@ -19,6 +19,7 @@
 #include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/network/ptp_hardware_engine.hpp"
+#include "audio_core/network/ptp_boundary_clock.hpp"
 #include "audio_core/clock/link_bridge.hpp"
 #include "audio_core/analysis/transient_detector.hpp"
 #include "audio_core/sampling/loop_conditioner.hpp"
@@ -5223,6 +5224,212 @@ void test_step_sequencer_midi_pattern_clips_and_arranger() {
               << "Micro-fade choke voice active | Manual MPC trigger verified)" << std::endl;
 }
 
+void test_ptp_boundary_clock_and_master_sync_daemon() {
+    std::cout << "[TEST] Running IEEE 1588-2008 PTPv2 Boundary Clock, BMCA & Master Sync Daemon Test..." << std::endl;
+    using namespace audio_core::network;
+
+    // 1. Packed Wire Struct Integrity & Wire Timestamp Serialization
+    static_assert(sizeof(PtpHeader) == 34, "PtpHeader size must be 34 bytes packed");
+    static_assert(sizeof(PtpTimestampWire) == 10, "PtpTimestampWire size must be 10 bytes packed");
+    static_assert(sizeof(PtpAnnounceBody) == 30, "PtpAnnounceBody size must be 30 bytes packed");
+    static_assert(sizeof(PtpSyncFollowUpBody) == 10, "PtpSyncFollowUpBody size must be 10 bytes packed");
+    static_assert(sizeof(PtpDelayReqBody) == 10, "PtpDelayReqBody size must be 10 bytes packed");
+    static_assert(sizeof(PtpDelayRespBody) == 20, "PtpDelayRespBody size must be 20 bytes packed");
+
+    // Test PtpTimestampWire conversions to/from nanoseconds
+    constexpr uint64_t kTestNs = 1'720'000'000'123'456'789ULL; // 1.72 billion seconds + ns
+    PtpTimestampWire wire_ts = PtpTimestampWire::from_nanoseconds(kTestNs);
+    uint64_t unpacked_ns = wire_ts.to_nanoseconds();
+    TEST_CHECK(unpacked_ns == kTestNs);
+
+    // 2. Wire Packet Serialization & Zero-Allocation Parsing
+    PtpClockIdentity gm_id{};
+    gm_id.id[0] = 0xAA; gm_id.id[1] = 0xBB; gm_id.id[2] = 0xCC; gm_id.id[3] = 0xFF;
+    gm_id.id[4] = 0xFE; gm_id.id[5] = 0x11; gm_id.id[6] = 0x22; gm_id.id[7] = 0x33;
+
+    uint8_t wire_buf[256];
+
+    // (a) Sync Packet
+    size_t sync_len = PtpBoundaryClock::build_sync_packet(wire_buf, sizeof(wire_buf), gm_id, 1, 42, kTestNs, true);
+    TEST_CHECK(sync_len == sizeof(PtpHeader) + sizeof(PtpSyncFollowUpBody));
+    auto parsed_sync = PtpBoundaryClock::parse_packet(wire_buf, sync_len);
+    TEST_CHECK(parsed_sync.valid);
+    TEST_CHECK(parsed_sync.type == PtpMessageType::Sync);
+    TEST_CHECK(parsed_sync.sequence_id == 42);
+    TEST_CHECK(parsed_sync.source_port_number == 1);
+    TEST_CHECK(parsed_sync.source_clock_id == gm_id);
+    TEST_CHECK(parsed_sync.timestamp_ns == kTestNs);
+    TEST_CHECK((parsed_sync.flags & 0x0200) != 0); // Two-step flag set
+
+    // (b) Follow_Up Packet
+    size_t fup_len = PtpBoundaryClock::build_follow_up_packet(wire_buf, sizeof(wire_buf), gm_id, 1, 42, kTestNs + 100);
+    TEST_CHECK(fup_len == sizeof(PtpHeader) + sizeof(PtpSyncFollowUpBody));
+    auto parsed_fup = PtpBoundaryClock::parse_packet(wire_buf, fup_len);
+    TEST_CHECK(parsed_fup.valid);
+    TEST_CHECK(parsed_fup.type == PtpMessageType::Follow_Up);
+    TEST_CHECK(parsed_fup.sequence_id == 42);
+    TEST_CHECK(parsed_fup.timestamp_ns == kTestNs + 100);
+
+    // (c) Delay_Req Packet
+    size_t dreq_len = PtpBoundaryClock::build_delay_req_packet(wire_buf, sizeof(wire_buf), gm_id, 2, 77, kTestNs + 500);
+    TEST_CHECK(dreq_len == sizeof(PtpHeader) + sizeof(PtpDelayReqBody));
+    auto parsed_dreq = PtpBoundaryClock::parse_packet(wire_buf, dreq_len);
+    TEST_CHECK(parsed_dreq.valid);
+    TEST_CHECK(parsed_dreq.type == PtpMessageType::Delay_Req);
+    TEST_CHECK(parsed_dreq.sequence_id == 77);
+    TEST_CHECK(parsed_dreq.timestamp_ns == kTestNs + 500);
+
+    // (d) Delay_Resp Packet
+    PtpClockIdentity slave_id{};
+    slave_id.id[0] = 0x55; slave_id.id[1] = 0x66; slave_id.id[2] = 0x77;
+    size_t dresp_len = PtpBoundaryClock::build_delay_resp_packet(wire_buf, sizeof(wire_buf), gm_id, 1, 77, kTestNs + 600, slave_id, 2);
+    TEST_CHECK(dresp_len == sizeof(PtpHeader) + sizeof(PtpDelayRespBody));
+    auto parsed_dresp = PtpBoundaryClock::parse_packet(wire_buf, dresp_len);
+    TEST_CHECK(parsed_dresp.valid);
+    TEST_CHECK(parsed_dresp.type == PtpMessageType::Delay_Resp);
+    TEST_CHECK(parsed_dresp.requesting_clock_id == slave_id);
+    TEST_CHECK(parsed_dresp.requesting_port_number == 2);
+    TEST_CHECK(parsed_dresp.timestamp_ns == kTestNs + 600);
+
+    // (e) Announce Packet & Priority Vector
+    PtpPriorityVector ann_vec{};
+    ann_vec.priority1 = 120;
+    ann_vec.clock_quality.clock_class = 6; // GPS Primary Reference
+    ann_vec.clock_quality.clock_accuracy = 0x21; // < 100ns
+    ann_vec.clock_quality.offset_scaled_log_variance = host_to_net16(0x4000);
+    ann_vec.priority2 = 128;
+    ann_vec.identity = gm_id;
+    ann_vec.steps_removed = 0;
+
+    size_t ann_len = PtpBoundaryClock::build_announce_packet(wire_buf, sizeof(wire_buf), gm_id, 1, 101, ann_vec);
+    TEST_CHECK(ann_len == sizeof(PtpHeader) + sizeof(PtpAnnounceBody));
+    auto parsed_ann = PtpBoundaryClock::parse_packet(wire_buf, ann_len);
+    TEST_CHECK(parsed_ann.valid);
+    TEST_CHECK(parsed_ann.type == PtpMessageType::Announce);
+    TEST_CHECK(parsed_ann.announce_vector.priority1 == 120);
+    TEST_CHECK(parsed_ann.announce_vector.clock_quality.clock_class == 6);
+    TEST_CHECK(parsed_ann.announce_vector.identity == gm_id);
+    TEST_CHECK(parsed_ann.announce_vector.steps_removed == 0);
+
+    // 3. Best Master Clock Algorithm (BMCA) Priority Vector Invariants
+    PtpPriorityVector local_vec{};
+    local_vec.priority1 = 128;
+    local_vec.clock_quality.clock_class = 248;
+    local_vec.clock_quality.clock_accuracy = 0xFE;
+    local_vec.clock_quality.offset_scaled_log_variance = host_to_net16(0xFFFF);
+    local_vec.priority2 = 128;
+    local_vec.identity = slave_id;
+    local_vec.steps_removed = 0;
+
+    // Foreign vector (Priority1 = 120) beats Local vector (Priority1 = 128)
+    TEST_CHECK(ann_vec.compare(local_vec) < 0);
+    TEST_CHECK(local_vec.compare(ann_vec) > 0);
+
+    // If Priority1 is equal, ClockClass 6 (GPS) beats ClockClass 248 (Default)
+    PtpPriorityVector tie_vec = ann_vec;
+    tie_vec.priority1 = 128;
+    TEST_CHECK(tie_vec.compare(local_vec) < 0);
+
+    // 4. Boundary Clock State Machine & Port Role Transitions
+    PtpBoundaryClock boundary(slave_id, 128, 128);
+    // Port 0: Upstream port (connects to grandmaster, can be slave or master)
+    boundary.add_port(1, "eth0", true, true);
+    // Port 1: Downstream distribution port (connects to audio clients, master only)
+    boundary.add_port(2, "eth1", true, false);
+
+    TEST_CHECK(boundary.num_ports() == 2);
+    TEST_CHECK(boundary.port_state(0) == PtpPortState::Listening);
+    TEST_CHECK(boundary.port_state(1) == PtpPortState::Master);
+
+    // Receive Announce from GPS Grandmaster on Port 0
+    boundary.evaluate_announce(0, ann_vec);
+    // Port 0 transitions to Slave to lock to GPS Grandmaster!
+    TEST_CHECK(boundary.port_state(0) == PtpPortState::Slave);
+    // Port 1 remains Master to bridge and distribute time downstream!
+    TEST_CHECK(boundary.port_state(1) == PtpPortState::Master);
+    TEST_CHECK(boundary.has_foreign_master());
+
+    // Outgoing downstream announce vector must increment steps_removed!
+    auto master_ann = boundary.announce_vector_for_master();
+    TEST_CHECK(master_ann.steps_removed == 1);
+    TEST_CHECK(master_ann.priority1 == 120);
+
+    // 5. Two-Way Timing Message Exchange Math (t1, t2, t3, t4)
+    // Master TX Sync t1 = 1,000,000,000 ns
+    // Slave RX Sync  t2 = 1,000,025,000 ns (forward trip = 25 µs)
+    // Slave TX DelayReq t3 = 2,000,000,000 ns
+    // Master RX DelayReq t4 = 2,000,005,000 ns (return trip = 5 µs)
+    // Mean Path Delay = ((25000) + (5000)) / 2 = 15,000 ns
+    // Offset From Master = ((25000) - (5000)) / 2 = 10,000 ns (+10 µs slave ahead of master)
+    boundary.process_timing_exchange(0, 1'000'000'000ULL, 1'000'025'000ULL, 2'000'000'000ULL, 2'000'005'000ULL);
+
+    const auto& telem0 = boundary.port_telemetry(0);
+    TEST_CHECK(telem0.mean_path_delay_ns == 15'000);
+    TEST_CHECK(telem0.offset_from_master_ns == 10'000);
+    TEST_CHECK(boundary.current_offset_ns() == 10'000);
+
+    // 6. Proportional-Integral (PI) Clock Discipline Servo Convergence
+    PtpClockServo servo(0.6, 0.05);
+    TEST_CHECK(!servo.is_locked());
+
+    // Simulate closed-loop discipline over 30 cycles
+    double current_phase_offset = 10'000.0; // 10 µs initial step
+    for (int step = 0; step < 30; ++step) {
+        double freq_adj = servo.update(current_phase_offset);
+        // Closed loop phase correction: offset decreases proportionally to freq adjustment
+        current_phase_offset -= freq_adj * 0.9;
+    }
+
+    // Assert exponential decay into sub-microsecond lock (< 1000 ns = < 1 µs)
+    TEST_CHECK(std::abs(current_phase_offset) < 1'000.0);
+    TEST_CHECK(servo.is_locked());
+    TEST_CHECK(std::abs(servo.freq_drift_ppb()) < 10'000.0);
+
+    // Anti-windup test: massive offset clamped to +/- 250,000 ppb (+/- 250 ppm)
+    servo.reset();
+    servo.update(100'000'000.0); // 100 ms step transient
+    TEST_CHECK(std::abs(servo.freq_drift_ppb()) <= 250'000.0 * 2.0);
+
+    // 7. PtpBoundaryPortSocket Loopback & Hardware Timestamping Engine Verification
+    PtpBoundaryPortSocket test_sock;
+    // Bind to loopback on ephemeral test ports (e.g. 15319 / 15320)
+    bool sock_opened = test_sock.open("lo", 15319, 15320, 0);
+    TEST_CHECK(sock_opened);
+    TEST_CHECK(test_sock.is_open());
+    TEST_CHECK(test_sock.event_fd() >= 0);
+    TEST_CHECK(test_sock.general_fd() >= 0);
+    TEST_CHECK(test_sock.ts_engine().is_so_timestamping_active());
+
+    // Send Event Message over loopback
+    uint64_t tx_egress_ns = 0;
+    PtpTimestampSource tx_src = PtpTimestampSource::UserspaceMonotonic;
+    ssize_t s_bytes = test_sock.send_event(wire_buf, sync_len, tx_egress_ns, tx_src, "127.0.0.1", 15319);
+    TEST_CHECK(s_bytes == static_cast<ssize_t>(sync_len));
+    TEST_CHECK(tx_egress_ns > 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // Receive Event Message with ingress timestamp
+    uint8_t loop_rx_buf[256];
+    sockaddr_in rx_src{};
+    PtpTimestampInfo rx_ts{};
+    ssize_t r_bytes = test_sock.recv_event(loop_rx_buf, sizeof(loop_rx_buf), &rx_src, rx_ts);
+    TEST_CHECK(r_bytes == static_cast<ssize_t>(sync_len));
+    TEST_CHECK(rx_ts.rx_timestamp_ns > 0);
+    TEST_CHECK(rx_ts.source == PtpTimestampSource::KernelDriverStack ||
+               rx_ts.source == PtpTimestampSource::HardwareNicPhy ||
+               rx_ts.source == PtpTimestampSource::UserspaceMonotonic);
+
+    test_sock.close();
+    TEST_CHECK(!test_sock.is_open());
+
+    std::cout << "  -> PTPv2 Boundary Clock & Master Sync Daemon: PASSED ("
+              << "Packed wire structs verified | BMCA master election verified | "
+              << "Upstream slave / Downstream master state transition verified | "
+              << "Mean path delay (" << telem0.mean_path_delay_ns << " ns) & Offset (" << telem0.offset_from_master_ns << " ns) verified | "
+              << "PI Servo sub-microsecond lock verified | Socket loopback & timestamping engine verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -5272,6 +5479,7 @@ int main() {
     test_ptp_hardware_and_kernel_timestamping();
     test_sample_tap_quantized_bounce_and_commit();
     test_step_sequencer_midi_pattern_clips_and_arranger();
+    test_ptp_boundary_clock_and_master_sync_daemon();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

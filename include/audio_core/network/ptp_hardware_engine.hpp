@@ -57,8 +57,43 @@ class PtpSocketTimestampEngine {
 public:
     PtpSocketTimestampEngine() = default;
 
-    // Configure Linux socket for hardware/kernel timestamping
-    bool configure_socket(int sockfd, const std::string& iface_name = "") noexcept {
+    PtpSocketTimestampEngine(PtpSocketTimestampEngine&& other) noexcept
+        : m_hardware_capable(other.m_hardware_capable),
+          m_so_timestamping_active(other.m_so_timestamping_active),
+          m_has_last_transit(other.m_has_last_transit),
+          m_last_rx_ns(other.m_last_rx_ns),
+          m_last_tx_ns(other.m_last_tx_ns),
+          m_rx_timestamp_ns(other.m_rx_timestamp_ns.load(std::memory_order_relaxed)),
+          m_timestamp_source(other.m_timestamp_source.load(std::memory_order_relaxed)),
+          m_hardware_locked(other.m_hardware_locked.load(std::memory_order_relaxed)),
+          m_instant_jitter_ns(other.m_instant_jitter_ns.load(std::memory_order_relaxed)),
+          m_avg_jitter_ns(other.m_avg_jitter_ns.load(std::memory_order_relaxed)),
+          m_max_jitter_ns(other.m_max_jitter_ns.load(std::memory_order_relaxed)),
+          m_timestamp_count(other.m_timestamp_count.load(std::memory_order_relaxed)) {
+        other.reset_stats();
+    }
+
+    PtpSocketTimestampEngine& operator=(PtpSocketTimestampEngine&& other) noexcept {
+        if (this != &other) {
+            m_hardware_capable = other.m_hardware_capable;
+            m_so_timestamping_active = other.m_so_timestamping_active;
+            m_has_last_transit = other.m_has_last_transit;
+            m_last_rx_ns = other.m_last_rx_ns;
+            m_last_tx_ns = other.m_last_tx_ns;
+            m_rx_timestamp_ns.store(other.m_rx_timestamp_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_timestamp_source.store(other.m_timestamp_source.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_hardware_locked.store(other.m_hardware_locked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_instant_jitter_ns.store(other.m_instant_jitter_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_avg_jitter_ns.store(other.m_avg_jitter_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_max_jitter_ns.store(other.m_max_jitter_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_timestamp_count.store(other.m_timestamp_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            other.reset_stats();
+        }
+        return *this;
+    }
+
+    // Configure Linux socket for hardware/kernel timestamping (RX & TX)
+    bool configure_socket(int sockfd, const std::string& iface_name = "", bool enable_tx_hw = true) noexcept {
         if (sockfd < 0) return false;
 
         m_hardware_capable = false;
@@ -68,7 +103,7 @@ public:
         if (!iface_name.empty()) {
             struct hwtstamp_config hw_config{};
             hw_config.flags = 0;
-            hw_config.tx_type = HWTSTAMP_TX_OFF;
+            hw_config.tx_type = enable_tx_hw ? HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
             hw_config.rx_filter = HWTSTAMP_FILTER_ALL;
 
             struct ifreq ifr{};
@@ -77,13 +112,21 @@ public:
 
             if (::ioctl(sockfd, SIOCSHWTSTAMP, &ifr) == 0) {
                 m_hardware_capable = true;
+            } else if (enable_tx_hw) {
+                // Retry with TX_OFF if the driver/PHY only supports hardware RX timestamping
+                hw_config.tx_type = HWTSTAMP_TX_OFF;
+                if (::ioctl(sockfd, SIOCSHWTSTAMP, &ifr) == 0) {
+                    m_hardware_capable = true;
+                }
             }
         }
 
-        // 2. Request SO_TIMESTAMPING with both hardware and kernel options
-        int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+        // 2. Request SO_TIMESTAMPING with both hardware and kernel options (RX and TX)
+        int flags = SOF_TIMESTAMPING_TX_HARDWARE |
+                    SOF_TIMESTAMPING_RX_HARDWARE |
                     SOF_TIMESTAMPING_RAW_HARDWARE |
                     SOF_TIMESTAMPING_SYS_HARDWARE |
+                    SOF_TIMESTAMPING_TX_SOFTWARE |
                     SOF_TIMESTAMPING_RX_SOFTWARE |
                     SOF_TIMESTAMPING_SOFTWARE;
 
@@ -91,7 +134,7 @@ public:
             m_so_timestamping_active = true;
         } else {
             // Fallback: Software/driver timestamping only
-            flags = SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+            flags = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
             if (::setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) == 0) {
                 m_so_timestamping_active = true;
             } else {
@@ -104,6 +147,54 @@ public:
         }
 
         return m_so_timestamping_active;
+    }
+
+    // Zero-allocation fetch of transmit timestamp from socket error queue (MSG_ERRQUEUE)
+    uint64_t fetch_tx_timestamp(int sockfd, PtpTimestampSource& out_source) noexcept {
+        if (sockfd < 0) {
+            out_source = PtpTimestampSource::UserspaceMonotonic;
+            return 0;
+        }
+
+        alignas(alignof(struct cmsghdr)) char control_buf[512];
+        uint8_t dummy_buf[256];
+        struct iovec iov{};
+        iov.iov_base = dummy_buf;
+        iov.iov_len = sizeof(dummy_buf);
+
+        struct msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control_buf;
+        msg.msg_controllen = sizeof(control_buf);
+
+        ssize_t res = ::recvmsg(sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (res < 0) {
+            out_source = PtpTimestampSource::UserspaceMonotonic;
+            return 0;
+        }
+
+        uint64_t tx_ns = 0;
+        out_source = PtpTimestampSource::UserspaceMonotonic;
+
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+                auto* ts = reinterpret_cast<struct timespec*>(CMSG_DATA(cmsg));
+                // ts[2] is raw hardware NIC PHY timestamp
+                if (ts[2].tv_sec != 0 || ts[2].tv_nsec != 0) {
+                    tx_ns = static_cast<uint64_t>(ts[2].tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts[2].tv_nsec);
+                    out_source = PtpTimestampSource::HardwareNicPhy;
+                    break;
+                }
+                // ts[0] is software / kernel driver timestamp
+                if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
+                    tx_ns = static_cast<uint64_t>(ts[0].tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts[0].tv_nsec);
+                    out_source = PtpTimestampSource::KernelDriverStack;
+                    break;
+                }
+            }
+        }
+        return tx_ns;
     }
 
     // Zero-allocation stack msghdr receive with hardware/kernel timestamp extraction

@@ -121,6 +121,12 @@ add_executable(ab_summing_shootout
 )
 target_link_libraries(ab_summing_shootout PRIVATE audio_core)
 
+# Standalone PTPv2 Boundary Clock / Master Sync Daemon
+add_executable(ptp_boundary_daemon
+    examples/ptp_boundary_daemon.cpp
+)
+target_link_libraries(ptp_boundary_daemon PRIVATE audio_core)
+
 # ============================================================================
 # Dear ImGui & Desktop UI Workstation (aethel_desk)
 # ============================================================================
