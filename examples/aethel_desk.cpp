@@ -165,33 +165,11 @@ int main(int argc, char** argv) {
     trk2->set_target_bus(bus_music->id());
     trk3->set_target_bus(0); // Master Out
 
-    // Pre-insert standard Airwindows DSPs on tracks and buses
-    auto bax = std::make_shared<dsp::Baxandall>();
-    bax->init(kSampleRate);
-    bax->set_parameter(0, 2.5f); // +2.5dB Bass warmth
-    trk0->slot(0).set_processor(bax);
-
-    auto comp = std::make_shared<dsp::ButterComp2>();
-    comp->init(kSampleRate);
-    comp->set_parameter(0, 0.45f); // Smooth RMS compression
-    trk0->slot(1).set_processor(comp);
-
-    auto drive = std::make_shared<dsp::PurestDrive>();
-    drive->init(kSampleRate);
-    drive->set_parameter(0, 0.60f); // Harmonic saturation
-    trk1->slot(0).set_processor(drive);
-
-    auto derez = std::make_shared<dsp::DeRez>();
-    derez->init(kSampleRate);
-    derez->set_parameter(0, 0.90f); // 32kHz rate decimation
-    derez->set_parameter(1, 0.80f); // 12-bit SP-1200 grit
-    derez->set_parameter(2, 0.0f);  // mu-Law vintage companding
-    derez->set_parameter(3, 1.0f);  // 100% wet
-    trk2->slot(0).set_processor(derez);
-
+    // Tracks 0-3 start completely clean and transparent (Zähl AM1 console baseline)
+    // Inserts are user-assignable via Channel Strip slots S1..S4
     auto drum_bus_comp = std::make_shared<dsp::ButterComp2>();
     drum_bus_comp->init(kSampleRate);
-    drum_bus_comp->set_parameter(0, 0.35f); // Bus glue compression
+    drum_bus_comp->set_parameter(0, 0.35f); // Optional drum bus glue
     bus_drums->slot(0).set_processor(drum_bus_comp);
 
     // Master bus processors: Baxandall (Master EQ) + ClipOnly2 (Master Limiter)
@@ -1220,7 +1198,7 @@ int main(int argc, char** argv) {
                                 mixer.post_command(cmd);
                             }
 
-                            // 4 Insert Slots
+                            // 4 Insert Slots (Zähl AM1 Modular Inserts)
                             ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "Insert Slots (4x):");
                             auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             for (int s = 0; s < 4; ++s) {
@@ -1229,16 +1207,77 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine();
                                 const char* slot_name = "[Empty]";
                                 bool is_by = false;
-                                if (trk_ptr && trk_ptr->slot(s).processor()) {
+                                bool has_proc = (trk_ptr && trk_ptr->slot(s).processor() != nullptr);
+                                if (has_proc) {
                                     slot_name = trk_ptr->slot(s).processor()->name();
                                     is_by = trk_ptr->slot(s).is_bypassed();
                                 }
                                 char btn_label[48];
                                 std::snprintf(btn_label, sizeof(btn_label), "%.14s", slot_name);
-                                ImGui::Button(btn_label, ImVec2(100, 18));
-                                if (ImGui::IsItemHovered() && trk_ptr && trk_ptr->slot(s).processor()) {
-                                    ImGui::SetTooltip("%s", trk_ptr->slot(s).processor()->name());
+
+                                if (has_proc) {
+                                    if (is_by) {
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.12f, 0.45f, 0.95f, 1.0f));
+                                    }
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.45f, 0.50f, 0.7f));
                                 }
+
+                                if (ImGui::Button(btn_label, ImVec2(96, 18))) {
+                                    ImGui::OpenPopup("InsertSelectMenu");
+                                }
+                                ImGui::PopStyleColor();
+
+                                if (ImGui::IsItemHovered() && has_proc) {
+                                    ImGui::SetTooltip("%s (Click to change/clear)", trk_ptr->slot(s).processor()->name());
+                                } else if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("Click to load DSP module into Slot %d", s + 1);
+                                }
+
+                                if (ImGui::BeginPopup("InsertSelectMenu")) {
+                                    ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "TRACK %d - INSERT SLOT %d", t + 1, s + 1);
+                                    ImGui::Separator();
+                                    if (ImGui::MenuItem("None / Clear Slot", nullptr, !has_proc)) {
+                                        if (trk_ptr) trk_ptr->slot(s).set_processor(nullptr);
+                                    }
+                                    ImGui::Separator();
+                                    if (ImGui::MenuItem("Airwindows Baxandall EQ")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::Baxandall>();
+                                            p->init(kSampleRate);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    if (ImGui::MenuItem("Airwindows ButterComp2")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::ButterComp2>();
+                                            p->init(kSampleRate);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    if (ImGui::MenuItem("Airwindows PurestDrive")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::PurestDrive>();
+                                            p->init(kSampleRate);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    if (ImGui::MenuItem("Airwindows DeRez2 Crunch")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::DeRez>();
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.90f);
+                                            p->set_parameter(1, 0.80f);
+                                            p->set_parameter(2, 0.0f); // mu-law
+                                            p->set_parameter(3, 1.0f);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
+                                    ImGui::EndPopup();
+                                }
+
                                 ImGui::SameLine();
                                 if (ImGui::Checkbox("By", &is_by)) {
                                     if (trk_ptr) {
