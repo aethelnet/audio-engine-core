@@ -36,6 +36,9 @@
 #include "audio_core/routing/universal_routing_matrix.hpp"
 #include "audio_core/routing/inline_conditioner.hpp"
 #include "audio_core/routing/modulatable_parameter.hpp"
+#include "audio_core/sampling/wav_reader.hpp"
+#include "audio_core/sampling/sample_repair.hpp"
+#include "audio_core/dsp/time_stretcher.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -44,6 +47,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 
 #define TEST_CHECK(expr) \
     do { \
@@ -4377,6 +4381,205 @@ void test_kinetic_hit_meter_and_submix_bus_telemetry() {
               << " | Bus1 Peak=" << snapshot.bus_meters[1].peak_l << " | Master=" << snapshot.master_meter.peak_l << ")" << std::endl;
 }
 
+void test_wav_reader_pitch_stretcher_and_sample_repair() {
+    std::cout << "[TEST] Running WAV Audio File I/O, Normalization, Sample Repair & Pitch-Stretch Test..." << std::endl;
+    using namespace audio_core::sampling;
+    using namespace audio_core::dsp;
+
+    // ------------------------------------------------------------------------
+    // 1. WAV Reader / Writer Roundtrip Test (24-bit PCM)
+    // ------------------------------------------------------------------------
+    const std::string test_wav_path = "/tmp/test_sovereign_roundtrip.wav";
+    const uint32_t kSampleRate = 48000;
+    const uint32_t kFrames = 4800;
+    std::vector<float> orig_l(kFrames);
+    std::vector<float> orig_r(kFrames);
+
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        orig_l[i] = 0.707f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / kSampleRate);
+        orig_r[i] = 0.500f * std::sin(2.0f * std::numbers::pi_v<float> * 880.0f * static_cast<float>(i) / kSampleRate);
+    }
+
+    bool save_ok = WavReader::save_wav(test_wav_path, orig_l.data(), orig_r.data(), kFrames, kSampleRate, 24);
+    TEST_CHECK(save_ok);
+
+    std::vector<std::vector<float>> loaded_channels;
+    uint32_t loaded_rate = 0;
+    bool load_ok = WavReader::load_wav(test_wav_path, loaded_channels, loaded_rate);
+    TEST_CHECK(load_ok);
+    TEST_CHECK(loaded_rate == kSampleRate);
+    TEST_CHECK(loaded_channels.size() == 2);
+    TEST_CHECK(loaded_channels[0].size() == kFrames);
+
+    float max_diff = 0.0f;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        float dl = std::abs(loaded_channels[0][i] - orig_l[i]);
+        float dr = std::abs(loaded_channels[1][i] - orig_r[i]);
+        if (dl > max_diff) max_diff = dl;
+        if (dr > max_diff) max_diff = dr;
+    }
+    // 24-bit resolution is ~ 1 / 8388608 ≈ 1.2e-7
+    TEST_CHECK(max_diff < 1e-5f);
+    std::filesystem::remove(test_wav_path);
+
+    std::cout << "  -> WAV Reader 24-Bit Roundtrip: PASSED (Max error=" << max_diff << " < 1e-5)" << std::endl;
+
+    // ------------------------------------------------------------------------
+    // 2. AudioClip Normalization & DC Offset Trap
+    // ------------------------------------------------------------------------
+    AudioClip clip("TestNorm", kSampleRate, 2, 2000);
+    float* ch0 = clip.channel(0);
+    float* ch1 = clip.channel(1);
+
+    // Inject non-zero DC offset (+0.30f) and low peak (0.40f)
+    for (uint32_t i = 0; i < 2000; ++i) {
+        float sine = 0.40f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * static_cast<float>(i) / kSampleRate);
+        ch0[i] = sine + 0.30f;
+        ch1[i] = sine + 0.30f;
+    }
+
+    // A. Remove DC Offset
+    clip.remove_dc_offset();
+    double dc_sum = 0.0;
+    for (uint32_t i = 0; i < 2000; ++i) {
+        dc_sum += ch0[i];
+    }
+    float residual_dc = static_cast<float>(std::abs(dc_sum / 2000.0));
+    TEST_CHECK(residual_dc < 1e-6f);
+
+    // B. Peak Normalization to -0.1 dBFS (0.98855f)
+    clip.normalize_peak(0.98855f);
+    float peak_after = 0.0f;
+    for (uint32_t i = 0; i < 2000; ++i) {
+        float val = std::abs(ch0[i]);
+        if (val > peak_after) peak_after = val;
+    }
+    TEST_CHECK(std::abs(peak_after - 0.98855f) < 1e-4f);
+
+    // C. RMS Normalization to -14 dBFS (0.1995f)
+    clip.normalize_rms(-14.0f, 0.98855f);
+    double sq_sum = 0.0;
+    for (uint32_t i = 0; i < 2000; ++i) {
+        sq_sum += static_cast<double>(ch0[i]) * static_cast<double>(ch0[i]);
+    }
+    float rms_after = static_cast<float>(std::sqrt(sq_sum / 2000.0));
+    float target_rms = std::pow(10.0f, -14.0f / 20.0f);
+    TEST_CHECK(std::abs(rms_after - target_rms) < 0.01f);
+
+    std::cout << "  -> Normalization & DC Offset Trap: PASSED (Residual DC=" << residual_dc
+              << ", Peak=" << peak_after << " -> -0.1 dBFS, RMS=" << rms_after << " -> -14 dBFS)" << std::endl;
+
+    // ------------------------------------------------------------------------
+    // 3. Sample Repair Engine: Mid-Wave Chop Inpainting & Creative Click Bypass
+    // ------------------------------------------------------------------------
+    AudioClip cut_clip("CutClip", kSampleRate, 2, 2000);
+    float* cut_ch0 = cut_clip.channel(0);
+    float* cut_ch1 = cut_clip.channel(1);
+
+    // Generate smooth 100 Hz wave
+    for (uint32_t i = 0; i < 2000; ++i) {
+        float s = 0.70f * std::sin(2.0f * std::numbers::pi_v<float> * 100.0f * static_cast<float>(i) / kSampleRate);
+        cut_ch0[i] = s;
+        cut_ch1[i] = s;
+    }
+
+    // Simulate accidental mid-wave cut at frame 1000 by dropping audio by -0.85f
+    // Creates a harsh 0.85 Heaviside step jump between sample 999 and sample 1000
+    for (uint32_t i = 1000; i < 2000; ++i) {
+        cut_ch0[i] -= 0.85f;
+        cut_ch1[i] -= 0.85f;
+    }
+
+    // Detect discontinuities
+    auto disc_list = SampleRepairEngine::detect_discontinuities(cut_clip, 0.20f);
+    TEST_CHECK(!disc_list.empty());
+    bool found_cut_at_1000 = false;
+    for (const auto& d : disc_list) {
+        if (d.frame_index >= 995 && d.frame_index <= 1005) {
+            found_cut_at_1000 = true;
+            TEST_CHECK(d.step_magnitude >= 0.75f);
+        }
+    }
+    TEST_CHECK(found_cut_at_1000);
+
+    // Test Creative Click Bypass: do not repair if user intentionally wants lo-fi chopping click
+    uint32_t bypassed_repairs = SampleRepairEngine::heal_clip(cut_clip, 0.20f, 24, true);
+    TEST_CHECK(bypassed_repairs == 0);
+    // Discontinuity must still be raw
+    float step_before_heal = std::abs(cut_ch0[1000] - cut_ch0[999]);
+    TEST_CHECK(step_before_heal >= 0.75f);
+
+    // Test Active Healing via Hermite Inpainting
+    uint32_t healed_count = SampleRepairEngine::heal_clip(cut_clip, 0.20f, 24, false);
+    TEST_CHECK(healed_count > 0);
+    // After inpainting, inter-sample delta across the seam must be smooth (< 0.05)
+    float max_healed_step = 0.0f;
+    for (uint32_t i = 990; i < 1010; ++i) {
+        float step = std::abs(cut_ch0[i] - cut_ch0[i - 1]);
+        if (step > max_healed_step) max_healed_step = step;
+    }
+    TEST_CHECK(max_healed_step < 0.05f);
+
+    // Test Zero-Crossing Snapping
+    // Marker at frame 235 where sine wave is near the zero-crossing at 240
+    uint32_t snapped = SampleRepairEngine::find_nearest_zero_crossing(cut_ch0, 2000, 235, 64, false);
+    TEST_CHECK(std::abs(cut_ch0[snapped]) < 0.05f);
+
+    std::cout << "  -> Sample Repair & Creative Click Bypass: PASSED (Cut detected at " << disc_list[0].frame_index
+              << ", Creative bypass verified, Hermite healed step: " << step_before_heal << " -> " << max_healed_step << ")" << std::endl;
+
+    // ------------------------------------------------------------------------
+    // 4. Pitch & Time-Stretch Multi-Engine Algorithms
+    // ------------------------------------------------------------------------
+    AudioClip stretch_src("StretchSrc", kSampleRate, 2, 2400); // 50 ms @ 48k
+    float* s0 = stretch_src.channel(0);
+    float* s1 = stretch_src.channel(1);
+
+    // Attack transient in first 40 samples (Kick transient spike) + 200 Hz tone afterwards
+    for (uint32_t i = 0; i < 40; ++i) {
+        float kick = 0.95f * (1.0f - static_cast<float>(i) / 40.0f);
+        s0[i] = kick;
+        s1[i] = kick;
+    }
+    for (uint32_t i = 40; i < 2400; ++i) {
+        float tone = 0.50f * std::sin(2.0f * std::numbers::pi_v<float> * 200.0f * static_cast<float>(i) / kSampleRate);
+        s0[i] = tone;
+        s1[i] = tone;
+    }
+
+    // A. Vinyl Repitch (+12 semitones: duration halved, speed doubled)
+    auto vinyl_out = PitchTimeStretcher::process(stretch_src, PitchAlgorithm::VinylRepitch, +12.0f, 1.0f);
+    TEST_CHECK(vinyl_out != nullptr);
+    TEST_CHECK(vinyl_out->num_frames() >= 1195 && vinyl_out->num_frames() <= 1205);
+
+    // B. Vintage 12-Bit MPC Slicer (-5 semitones)
+    auto mpc_out = PitchTimeStretcher::process(stretch_src, PitchAlgorithm::VintageMpc, -5.0f, 1.0f);
+    TEST_CHECK(mpc_out != nullptr);
+    // Verify 12-bit quantization (values are exact multiples of 1/2048)
+    for (uint32_t i = 50; i < 150; ++i) {
+        float v = mpc_out->channel(0)[i];
+        float scaled = v * 2048.0f;
+        float frac = std::abs(scaled - std::round(scaled));
+        TEST_CHECK(frac < 1e-4f);
+    }
+
+    // C. Rubberband WSOLA Granular (Decoupled: Time-Stretch 2.0x, Pitch 0 st)
+    auto wsola_out = PitchTimeStretcher::process(stretch_src, PitchAlgorithm::RubberbandWsola, 0.0f, 2.0f);
+    TEST_CHECK(wsola_out != nullptr);
+    TEST_CHECK(wsola_out->num_frames() >= 4700 && wsola_out->num_frames() <= 4900);
+
+    // D. Sovereign ODE Kinetic Stretcher (Preserves attack punch, stretches sustain)
+    auto ode_out = PitchTimeStretcher::process(stretch_src, PitchAlgorithm::SovereignOde, 0.0f, 1.5f);
+    TEST_CHECK(ode_out != nullptr);
+    TEST_CHECK(ode_out->num_frames() > stretch_src.num_frames());
+    // Verify transient peak in ode_out is preserved without smearing
+    TEST_CHECK(ode_out->channel(0)[0] > 0.85f);
+
+    std::cout << "  -> Multi-Engine Pitch & Time Stretcher: PASSED (Vinyl +12st frames=" << vinyl_out->num_frames()
+              << " | MPC 12-bit quant verified | WSOLA 2.0x frames=" << wsola_out->num_frames()
+              << " | Sovereign ODE transient punch=" << ode_out->channel(0)[0] << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4419,6 +4622,7 @@ int main() {
     test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi();
     test_wasm_sidechain_and_arbitrary_buffer_chunking();
     test_kinetic_hit_meter_and_submix_bus_telemetry();
+    test_wav_reader_pitch_stretcher_and_sample_repair();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

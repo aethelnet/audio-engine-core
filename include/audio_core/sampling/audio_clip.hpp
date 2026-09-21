@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_core/dsp/resampler.hpp"
+#include "audio_core/sampling/wav_reader.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -308,6 +309,121 @@ public:
             frames_rendered++;
         }
         return frames_rendered;
+    }
+
+    // ========================================================================
+    // Audio File I/O & Mastering Operations
+    // ========================================================================
+
+    // Load audio from standard WAV file (16/24/32-bit PCM or 32-bit Float)
+    bool load_from_wav(const std::string& filepath) {
+        std::vector<std::vector<float>> channels;
+        uint32_t sample_rate = 0;
+        if (!WavReader::load_wav(filepath, channels, sample_rate)) {
+            return false;
+        }
+
+        m_channels = static_cast<uint32_t>(channels.size());
+        m_frames = static_cast<uint32_t>(channels[0].size());
+        m_sample_rate = sample_rate;
+        m_data = std::move(channels);
+        m_slices.clear();
+
+        // Extract base filename for clip name
+        size_t last_slash = filepath.find_last_of("/\\");
+        m_name = (last_slash != std::string::npos) ? filepath.substr(last_slash + 1) : filepath;
+        return true;
+    }
+
+    // Save audio clip to standard WAV file
+    bool save_to_wav(const std::string& filepath, uint16_t bits_per_sample = 24) const {
+        if (m_frames == 0 || m_channels == 0) return false;
+        return WavReader::save_wav(filepath, channel(0), channel(1), m_frames, m_sample_rate, bits_per_sample);
+    }
+
+    // Peak Normalization: scales clip so highest peak equals target_peak linear
+    // target_peak = 0.9885f corresponds to -0.1 dBFS (broadcast ceiling)
+    void normalize_peak(float target_peak = 0.9885f) noexcept {
+        if (m_frames == 0 || m_channels == 0 || target_peak <= 0.0f) return;
+
+        float max_val = 0.0f;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            const float* src = m_data[ch].data();
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                float val = std::abs(src[i]);
+                if (val > max_val) max_val = val;
+            }
+        }
+
+        if (max_val < 1e-7f) return; // Digital silence
+
+        const float gain = target_peak / max_val;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            float* src = m_data[ch].data();
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                src[i] *= gain;
+            }
+        }
+    }
+
+    // RMS Loudness Normalization: scales clip to target RMS dBFS (e.g. -14 dBFS for K-14)
+    // max_peak_ceiling prevents harsh digital clipping if crest factor is very high
+    void normalize_rms(float target_rms_db = -14.0f, float max_peak_ceiling = 0.9885f) noexcept {
+        if (m_frames == 0 || m_channels == 0) return;
+
+        double sum_sq = 0.0;
+        size_t total_samples = static_cast<size_t>(m_channels) * m_frames;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            const float* src = m_data[ch].data();
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                sum_sq += static_cast<double>(src[i]) * static_cast<double>(src[i]);
+            }
+        }
+
+        double cur_rms = std::sqrt(sum_sq / static_cast<double>(total_samples));
+        if (cur_rms < 1e-7) return;
+
+        double target_rms_lin = std::pow(10.0, static_cast<double>(target_rms_db) / 20.0);
+        float gain = static_cast<float>(target_rms_lin / cur_rms);
+
+        // First pass: check what maximum peak would become
+        float max_post_peak = 0.0f;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            const float* src = m_data[ch].data();
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                float v = std::abs(src[i]) * gain;
+                if (v > max_post_peak) max_post_peak = v;
+            }
+        }
+
+        // Clamp gain if it would violate the peak ceiling
+        if (max_post_peak > max_peak_ceiling && max_post_peak > 1e-6f) {
+            gain *= (max_peak_ceiling / max_post_peak);
+        }
+
+        // Apply gain
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            float* src = m_data[ch].data();
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                src[i] *= gain;
+            }
+        }
+    }
+
+    // Remove DC Offset: subtract channel mean to center waveform at 0.0
+    void remove_dc_offset() noexcept {
+        if (m_frames == 0 || m_channels == 0) return;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            float* src = m_data[ch].data();
+            double sum = 0.0;
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                sum += static_cast<double>(src[i]);
+            }
+            float dc = static_cast<float>(sum / m_frames);
+            for (uint32_t i = 0; i < m_frames; ++i) {
+                src[i] -= dc;
+            }
+        }
     }
 
 private:

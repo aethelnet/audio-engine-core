@@ -8,6 +8,9 @@
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/ui/theme.hpp"
 #include "audio_core/ui/custom_widgets.hpp"
+#include "audio_core/sampling/wav_reader.hpp"
+#include "audio_core/sampling/sample_repair.hpp"
+#include "audio_core/dsp/time_stretcher.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -87,6 +90,10 @@ static std::vector<float> generate_synthetic_vocal_chops(size_t num_samples) {
     return buf;
 }
 
+// Static variables for GLFW Drag & Drop Audio Import
+static std::string g_dropped_wav_path = "";
+static bool g_has_dropped_wav = false;
+
 int main(int argc, char** argv) {
     // 1. Initialize GLFW
     if (!glfwInit()) {
@@ -108,6 +115,14 @@ int main(int argc, char** argv) {
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable V-Sync (60/120 Hz refresh)
+
+    // Install GLFW Drag & Drop Callback for Audio Import (.wav)
+    glfwSetDropCallback(window, [](GLFWwindow*, int count, const char** paths) {
+        if (count > 0 && paths && paths[0]) {
+            g_dropped_wav_path = paths[0];
+            g_has_dropped_wav = true;
+        }
+    });
 
     // 2. Initialize Dear ImGui
     IMGUI_CHECKVERSION();
@@ -231,6 +246,43 @@ int main(int argc, char** argv) {
     int selected_track = 0;
     int active_slice = 0;
 
+    // Multi-Track Clip Pool & Original Backups
+    std::shared_ptr<sampling::AudioClip> track_clips[4] = { drum_clip, acid_clip, vocal_clip, nullptr };
+    std::shared_ptr<sampling::AudioClip> track_clips_orig[4] = { drum_clip, acid_clip, vocal_clip, nullptr };
+
+    // Sample Editor, Pitch & Repair state
+    int pitch_algo_mode = 0; // 0=Vinyl, 1=Vintage MPC, 2=WSOLA, 3=Sovereign ODE
+    float sample_pitch_shift = 0.0f;
+    float sample_time_stretch = 1.0f;
+    bool sample_reverse = false;
+    bool sample_choke = true;
+    bool creative_click_bypass = false;
+    char manual_wav_path[512] = "";
+    char status_toast[256] = "READY // DRAG & DROP ANY .WAV AUDIO FILE ONTO THE WORKSTATION";
+
+    auto sync_track_clip = [&](int t, std::shared_ptr<sampling::AudioClip> clip) {
+        if (t < 0 || t >= 4 || !clip) return;
+        track_clips[t] = clip;
+        if (t == 0) trk0->set_clip(clip, true);
+        else if (t == 1) trk1->set_clip(clip, true);
+        else if (t == 2) trk2->set_clip(clip, true);
+        else if (t == 3) trk3->set_clip(clip, true);
+
+        if (t == selected_track) {
+            const uint32_t f = clip->num_frames();
+            const float* src = clip->channel(0);
+            sample_waveform.resize(f);
+            if (src) std::copy_n(src, f, sample_waveform.data());
+            slice_points.clear();
+            for (const auto& s : clip->slices()) {
+                slice_points.push_back(static_cast<float>(s.start_frame) / static_cast<float>(f));
+            }
+            if (slice_points.empty()) {
+                slice_points = { 0.0f, 0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f };
+            }
+        }
+    };
+
     // Track UI state caches
     float track_gains[4] = { 0.85f, 0.70f, 0.80f, 0.90f };
     float track_pans[4] = { 0.0f, -0.25f, 0.30f, 0.0f };
@@ -265,11 +317,6 @@ int main(int argc, char** argv) {
     bool master_clipper_active = true;
     float master_gain = 0.90f;
     bool master_limiter = true;
-
-    // Sample Editor State
-    float sample_pitch_shift = 0.0f; // Semitones
-    bool sample_reverse = false;
-    bool sample_choke = true;
 
     // Envelope State
     float env_attack = 15.0f;
@@ -368,6 +415,24 @@ int main(int argc, char** argv) {
                 float r = (0.44f + kick_rad) * (1.0f + 0.12f * std::sin(angle * 3.0f + t * 4.0f));
                 telemetry.kinetic_meter.phase_x[i] = std::clamp(r * std::cos(angle), -0.98f, 0.98f);
                 telemetry.kinetic_meter.phase_y[i] = std::clamp(r * 1.22f * std::sin(angle) + 0.08f * std::sin(angle * 7.0f), -0.98f, 0.98f);
+            }
+        }
+
+        // Process any Drag & Drop Audio File Import from GLFW
+        if (g_has_dropped_wav) {
+            g_has_dropped_wav = false;
+            auto imported = std::make_shared<sampling::AudioClip>();
+            if (imported->load_from_wav(g_dropped_wav_path)) {
+                track_clips_orig[selected_track] = imported;
+                sync_track_clip(selected_track, imported);
+                std::snprintf(status_toast, sizeof(status_toast),
+                              "IMPORTED WAV: %s (%u Hz, %u ch, %.2fs)",
+                              imported->name().c_str(), imported->sample_rate(),
+                              imported->num_channels(),
+                              static_cast<float>(imported->num_frames()) / imported->sample_rate());
+            } else {
+                std::snprintf(status_toast, sizeof(status_toast),
+                              "ERROR: FAILED TO LOAD WAV: %s", g_dropped_wav_path.c_str());
             }
         }
 
@@ -1186,35 +1251,187 @@ int main(int argc, char** argv) {
                 // TAB 2: SAMPLE EDITOR / SLICER
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  SAMPLE EDITOR / SLICER  ")) {
-                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
-                                       "Transient Slicer & Hermite Resampler [Selected Track: %d]", selected_track + 1);
+                    // Track Selector Pills
+                    ImGui::Text("Active Track:");
+                    const char* trk_labels[4] = { "Track 1: Kick / 808", "Track 2: Acid 303", "Track 3: Vocal", "Track 4: Drums" };
+                    for (int t = 0; t < 4; ++t) {
+                        ImGui::SameLine();
+                        if (t == selected_track) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        }
+                        if (ImGui::Button(trk_labels[t])) {
+                            selected_track = t;
+                            sync_track_clip(selected_track, track_clips[selected_track]);
+                        }
+                        if (t == selected_track) {
+                            ImGui::PopStyleColor(2);
+                        }
+                    }
+
+                    auto cur_clip = track_clips[selected_track];
+
+                    ImGui::SameLine(0, 20);
+                    ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "[STATUS]");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", status_toast);
+
                     ImGui::Separator();
 
-                    // Waveform Display
+                    // Audio File I/O Bar (Drag & Drop or Manual Path)
+                    ImGui::SetNextItemWidth(340);
+                    ImGui::InputTextWithHint("##ManualWavPath", "Type / paste absolute .wav path...", manual_wav_path, sizeof(manual_wav_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("  LOAD WAV  ")) {
+                        if (std::strlen(manual_wav_path) > 0) {
+                            auto new_clip = std::make_shared<sampling::AudioClip>();
+                            if (new_clip->load_from_wav(manual_wav_path)) {
+                                track_clips_orig[selected_track] = new_clip;
+                                sync_track_clip(selected_track, new_clip);
+                                std::snprintf(status_toast, sizeof(status_toast), "LOADED: %s (%u Hz, %u frames)",
+                                              new_clip->name().c_str(), new_clip->sample_rate(), new_clip->num_frames());
+                            } else {
+                                std::snprintf(status_toast, sizeof(status_toast), "ERROR: FAILED TO LOAD WAV: %s", manual_wav_path);
+                            }
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("  EXPORT 24-BIT WAV  ")) {
+                        if (cur_clip) {
+                            std::string exp_path = "/tmp/" + cur_clip->name() + "_master.wav";
+                            if (cur_clip->save_to_wav(exp_path, 24)) {
+                                std::snprintf(status_toast, sizeof(status_toast), "SAVED 24-BIT MASTER TO: %s", exp_path.c_str());
+                            }
+                        }
+                    }
+                    ImGui::SameLine(0, 20);
+                    if (cur_clip) {
+                        float clip_dur = static_cast<float>(cur_clip->num_frames()) / cur_clip->sample_rate();
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "%s", cur_clip->name().c_str());
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("| %u Hz | %uch | %.2fs (%.1f Bars)",
+                                            cur_clip->sample_rate(), cur_clip->num_channels(), clip_dur, clip_dur / 2.0f);
+                    }
+
+                    // High-Resolution Waveform Display
                     ImVec2 wf_pos = ImGui::GetCursorScreenPos();
-                    ImVec2 wf_size(ImGui::GetContentRegionAvail().x, 150);
+                    ImVec2 wf_size(ImGui::GetContentRegionAvail().x, 100);
                     float play_ratio = playhead_seconds / loop_length_seconds;
                     ui::DrawWaveformDisplay(ImGui::GetWindowDrawList(), wf_pos, wf_size,
                                            sample_waveform.data(), sample_waveform.size(),
                                            play_ratio, slice_points, active_slice);
                     ImGui::Dummy(wf_size);
 
-                    // Slicer Tools
-                    ImGui::Spacing();
-                    ImGui::SetNextItemWidth(180);
-                    ImGui::SliderFloat("Pitch Shift (Semitones)", &sample_pitch_shift, -24.0f, 24.0f, "%.1f st");
-                    ImGui::SameLine(0, 20);
-                    ImGui::Checkbox("Reverse", &sample_reverse);
-                    ImGui::SameLine(0, 20);
-                    ImGui::Checkbox("Micro-Fade Choke (Anti-Click)", &sample_choke);
-                    ImGui::SameLine(0, 30);
-                    if (ImGui::Button("Detect Transients")) {
-                        // Re-run transient detector
+                    // Processing Control Groups (3 Panels)
+                    float panel_w = (ImGui::GetContentRegionAvail().x - 24.0f) / 3.0f;
+
+                    // Panel A: Mastering Normalization
+                    ImGui::BeginChild("PanelNorm", ImVec2(panel_w, 140), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "MASTERING NORMALIZATION");
+                        ImGui::Separator();
+                        if (ImGui::Button("Peak Normalize (-0.1 dBFS)", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                cur_clip->normalize_peak(0.98855f);
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast), "PEAK NORMALIZED TO -0.1 dBFS");
+                            }
+                        }
+                        if (ImGui::Button("RMS Normalize (-14 dBFS K-14)", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                cur_clip->normalize_rms(-14.0f, 0.98855f);
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast), "RMS NORMALIZED TO -14 dBFS (K-14)");
+                            }
+                        }
+                        if (ImGui::Button("Remove DC Offset", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                cur_clip->remove_dc_offset();
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast), "DC OFFSET REMOVED (CENTERED AT 0.0)");
+                            }
+                        }
                     }
+                    ImGui::EndChild();
+
                     ImGui::SameLine();
-                    if (ImGui::Button("Export Slices to Pads")) {
-                        // Slices mapped to sampler
+
+                    // Panel B: Sample Repair & Seam Inpainting
+                    ImGui::BeginChild("PanelRepair", ImVec2(panel_w, 140), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "SAMPLE REPAIR & ANTI-CLICK");
+                        ImGui::Separator();
+                        if (ImGui::Button("Scan Cuts / Discontinuities", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                auto cuts = sampling::SampleRepairEngine::detect_discontinuities(*cur_clip, 0.20f);
+                                std::snprintf(status_toast, sizeof(status_toast), "SCAN RESULT: %zu CUTS DETECTED", cuts.size());
+                            }
+                        }
+                        if (ImGui::Button("Heal Cuts (Hermite C1 Inpaint)", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                uint32_t count = sampling::SampleRepairEngine::heal_clip(*cur_clip, 0.20f, 24, creative_click_bypass);
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast),
+                                              creative_click_bypass ? "CREATIVE CLICK MODE ACTIVE: BYPASSED HEALING"
+                                                                    : "HEALED %u MID-WAVE CUTS VIA HERMITE INPAINTING", count);
+                            }
+                        }
+                        if (ImGui::Button("Snap Slices to Zero-Crossings", ImVec2(-1, 24))) {
+                            if (cur_clip) {
+                                sampling::SampleRepairEngine::snap_all_slices_to_zero_crossings(*cur_clip, 64);
+                                sync_track_clip(selected_track, cur_clip);
+                                std::snprintf(status_toast, sizeof(status_toast), "SNAPPED ALL SLICES TO ZERO CROSSINGS");
+                            }
+                        }
+                        ImGui::Checkbox("Creative Click Mode (Bypass)", &creative_click_bypass);
                     }
+                    ImGui::EndChild();
+
+                    ImGui::SameLine();
+
+                    // Panel C: Multi-Engine Pitch & Time Stretcher
+                    ImGui::BeginChild("PanelStretch", ImVec2(panel_w, 140), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "PITCH & TIME STRETCH SUITE");
+                        ImGui::Separator();
+                        const char* algo_names[4] = {
+                            "1: Vinyl Variclock",
+                            "2: Vintage 12-Bit MPC",
+                            "3: Rubberband WSOLA",
+                            "4: Sovereign ODE Kinetic"
+                        };
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::Combo("##Algo", &pitch_algo_mode, algo_names, 4);
+                        ImGui::SameLine();
+                        if (ImGui::Button("RESET##Orig", ImVec2(-1, 20))) {
+                            if (track_clips_orig[selected_track]) {
+                                sync_track_clip(selected_track, track_clips_orig[selected_track]);
+                                sample_pitch_shift = 0.0f;
+                                sample_time_stretch = 1.0f;
+                                std::snprintf(status_toast, sizeof(status_toast), "REVERTED TO ORIGINAL AUDIO");
+                            }
+                        }
+
+                        ImGui::SetNextItemWidth(130);
+                        ImGui::SliderFloat("Pitch", &sample_pitch_shift, -24.0f, 24.0f, "%.1f st");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(130);
+                        ImGui::SliderFloat("Stretch", &sample_time_stretch, 0.25f, 4.0f, "%.2fx");
+
+                        if (ImGui::Button("PROCESS & APPLY STRETCH", ImVec2(-1, 24))) {
+                            auto orig = track_clips_orig[selected_track];
+                            if (orig) {
+                                auto algo = static_cast<dsp::PitchAlgorithm>(pitch_algo_mode);
+                                auto stretched = dsp::PitchTimeStretcher::process(*orig, algo, sample_pitch_shift, sample_time_stretch);
+                                if (stretched) {
+                                    sync_track_clip(selected_track, stretched);
+                                    std::snprintf(status_toast, sizeof(status_toast), "STRETCHED VIA %s (%u frames)",
+                                                  algo_names[pitch_algo_mode], stretched->num_frames());
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
 
                     ImGui::EndTabItem();
                 }
