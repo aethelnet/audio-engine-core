@@ -1416,14 +1416,15 @@ int main(int argc, char** argv) {
                     {
                         ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "PITCH & TIME STRETCH SUITE");
                         ImGui::Separator();
-                        const char* algo_names[4] = {
+                        const char* algo_names[5] = {
                             "1: Vinyl Variclock",
                             "2: Vintage 12-Bit MPC",
                             "3: Rubberband WSOLA",
-                            "4: Sovereign ODE Kinetic"
+                            "4: Sovereign ODE Kinetic",
+                            "5: DeRez Sampler (SP/Mirage)"
                         };
                         ImGui::SetNextItemWidth(panel_w * 0.60f);
-                        ImGui::Combo("##Algo", &pitch_algo_mode, algo_names, 4);
+                        ImGui::Combo("##Algo", &pitch_algo_mode, algo_names, 5);
                         ImGui::SameLine();
                         if (ImGui::Button("RESET##Orig", ImVec2(-1, 20))) {
                             if (track_clips_orig[selected_track]) {

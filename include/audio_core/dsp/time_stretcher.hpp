@@ -16,7 +16,8 @@ enum class PitchAlgorithm : uint8_t {
     VinylRepitch = 0,    // Variclock: speed = 2^(semitones/12), pitch & time locked, Hermite C1 spline
     VintageMpc = 1,      // 12-bit vintage quantization, variable clock, gritty alias & micro-choke
     RubberbandWsola = 2, // WSOLA Granular: decoupled pitch shift and time-stretch, phase-aligned
-    SovereignOde = 3     // Continuous kinetic phase-space dilation: transients locked 1:1, tails ODE-stretched
+    SovereignOde = 3,    // Continuous kinetic phase-space dilation: transients locked 1:1, tails ODE-stretched
+    DeRezSampler = 4     // Airwindows DeRez2 Variable-Clock DAC: pitch-coupled sample-rate decimation + mu-law 12-bit/8-bit companding
 };
 
 // ============================================================================
@@ -292,7 +293,115 @@ public:
         return out_clip;
     }
 
-    // Unified dispatch function for all 4 algorithms
+    // 5. Airwindows DeRez2 Variable-Clock Vintage Sampler DAC Repitch
+    // Emulates the authentic physical re-clocking of vintage hardware samplers (SP-1200 / Mirage)
+    // Combines pitch-coupled variable sample-and-hold, sub-sample overrun interpolation,
+    // analog-slew edge-softening, and non-linear u-law companded bit reduction.
+    static std::shared_ptr<sampling::AudioClip> process_derez_sampler(
+        const sampling::AudioClip& in_clip, float semitones, float resolution = 0.70f, float hard = 0.0f) {
+        const double pitch_ratio = semitones_to_ratio(semitones);
+        const uint32_t in_frames = in_clip.num_frames();
+        const uint32_t channels = in_clip.num_channels();
+        if (in_frames == 0 || channels == 0 || pitch_ratio <= 0.0) return nullptr;
+
+        const uint32_t out_frames = static_cast<uint32_t>(std::max(1.0, std::round(in_frames / pitch_ratio)));
+        auto out_clip = std::make_shared<sampling::AudioClip>(
+            in_clip.name() + "_DeRezSampler", in_clip.sample_rate(), channels, out_frames);
+        out_clip->set_bpm(in_clip.bpm() * pitch_ratio);
+
+        // DeRez2 parameters derived from pitch and user resolution/hard settings
+        // Target A: tracks pitch ratio (when pitching down, effective clock drops)
+        double target_a = std::clamp(pitch_ratio, 0.001, 1.0);
+        double soften = (1.0 + target_a) * 0.5;
+
+        // Target B: Bit depth decimation (resolution 0.70 ~= 12-bit SP-1200, 0.40 ~= 8-bit Mirage)
+        double target_b = std::pow(1.0 - static_cast<double>(std::clamp(resolution, 0.0f, 1.0f)), 3.0) / 3.0;
+        const double hard_d = std::clamp(static_cast<double>(hard), 0.0, 1.0);
+        const double log256 = std::log(256.0);
+
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+            const float* src = in_clip.channel(ch);
+            float* dst = out_clip->channel(ch);
+
+            double position = 0.0;
+            double held_sample = 0.0;
+            double last_sample = 0.0;
+            double last_output = 0.0;
+            double last_dry = 0.0;
+
+            for (uint32_t i = 0; i < out_frames; ++i) {
+                // Determine source position
+                double src_pos = static_cast<double>(i) * pitch_ratio;
+                uint32_t src_idx = static_cast<uint32_t>(src_pos);
+                if (src_idx >= in_frames) src_idx = in_frames - 1;
+                double input_sample = static_cast<double>(src[src_idx]);
+                const double dry_sample = input_sample;
+
+                // 1. Variable-clock sub-sample accumulator
+                position += target_a;
+                double output_sample = held_sample;
+
+                if (position > 1.0) {
+                    position -= 1.0;
+                    // Sub-sample overrun interpolation
+                    held_sample = (last_sample * position) + (input_sample * (1.0 - position));
+                    output_sample = (output_sample * (1.0 - soften)) + (held_sample * soften);
+                }
+                input_sample = output_sample;
+
+                // 2. Intermediate dry-sample reconstruction at step transitions
+                double temp = input_sample;
+                if (input_sample != last_output) {
+                    temp = input_sample;
+                    input_sample = (input_sample * hard_d) + (last_dry * (1.0 - hard_d));
+                    last_output = temp;
+                } else {
+                    last_output = input_sample;
+                }
+                last_dry = dry_sample;
+
+                // 3. u-Law companding before bit reduction (if hard < 1.0)
+                temp = input_sample;
+                input_sample = std::clamp(input_sample, -1.0, 1.0);
+                if (hard_d < 1.0) {
+                    double ulaw = (input_sample > 0.0)
+                        ? (std::log(1.0 + 255.0 * std::abs(input_sample)) / log256)
+                        : -(std::log(1.0 + 255.0 * std::abs(input_sample)) / log256);
+                    input_sample = (temp * hard_d) + (ulaw * (1.0 - hard_d));
+                }
+
+                // 4. Continuous Bit-Depth Decimation
+                if (target_b > 0.0005) {
+                    if (input_sample > 0.0) {
+                        double offset = input_sample;
+                        while (offset > 0.0) offset -= target_b;
+                        input_sample -= offset;
+                    } else if (input_sample < 0.0) {
+                        double offset = input_sample;
+                        while (offset < 0.0) offset += target_b;
+                        input_sample -= offset;
+                    }
+                    input_sample *= (1.0 - target_b);
+                }
+
+                // 5. u-Law decoding expansion
+                temp = input_sample;
+                input_sample = std::clamp(input_sample, -1.0, 1.0);
+                if (hard_d < 1.0) {
+                    double dec = (input_sample > 0.0)
+                        ? ((std::pow(256.0, std::abs(input_sample)) - 1.0) / 255.0)
+                        : -((std::pow(256.0, std::abs(input_sample)) - 1.0) / 255.0);
+                    input_sample = (temp * hard_d) + (dec * (1.0 - hard_d));
+                }
+
+                last_sample = dry_sample;
+                dst[i] = static_cast<float>(std::clamp(input_sample, -1.0, 1.0));
+            }
+        }
+        return out_clip;
+    }
+
+    // Unified dispatch function for all 5 algorithms
     static std::shared_ptr<sampling::AudioClip> process(
         const sampling::AudioClip& in_clip,
         PitchAlgorithm algo,
@@ -307,6 +416,8 @@ public:
                 return process_wsola(in_clip, semitones, stretch_factor);
             case PitchAlgorithm::SovereignOde:
                 return process_sovereign_ode(in_clip, semitones, stretch_factor);
+            case PitchAlgorithm::DeRezSampler:
+                return process_derez_sampler(in_clip, semitones);
         }
         return nullptr;
     }

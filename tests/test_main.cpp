@@ -4716,6 +4716,57 @@ void test_airwindows_derez2_decimator() {
               << " | InsertSlot hosting verified)" << std::endl;
 }
 
+void test_derez_sampler_variable_clock_pitch() {
+    std::cout << "[TEST] Running Airwindows DeRez Sampler Variable-Clock Pitch Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+
+    // Create a 2400-frame test clip (50ms @ 48kHz) with a 440Hz sine + transient attack
+    sampling::AudioClip src_clip("TestSource", 48000, 2, 2400);
+    src_clip.set_bpm(120.0f);
+    for (uint32_t i = 0; i < 2400; ++i) {
+        float t = static_cast<float>(i) / 48000.0f;
+        float s = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * t) * 0.7f;
+        if (i == 0) s = 0.95f; // Transient attack
+        src_clip.channel(0)[i] = s;
+        src_clip.channel(1)[i] = s;
+    }
+
+    // 1. Classic -12 Semitone Down-Pitch (1 Octave down, 2x duration)
+    auto octave_down = PitchTimeStretcher::process(src_clip, PitchAlgorithm::DeRezSampler, -12.0f);
+    TEST_CHECK(octave_down != nullptr);
+    TEST_CHECK(octave_down->num_frames() == 4800);
+    TEST_CHECK(std::abs(octave_down->bpm() - 60.0f) < 0.1f);
+
+    // Verify bounded amplitude and no NaN/Inf
+    for (uint32_t i = 0; i < octave_down->num_frames(); ++i) {
+        float val = octave_down->channel(0)[i];
+        TEST_CHECK(!std::isnan(val) && !std::isinf(val));
+        TEST_CHECK(val >= -1.0f && val <= 1.0f);
+    }
+
+    // 2. The Legendary 45 RPM -> 33 RPM Down-Pitch (-5.2 semitones, SP-1200 style)
+    auto sp_down = PitchTimeStretcher::process(src_clip, PitchAlgorithm::DeRezSampler, -5.2f);
+    TEST_CHECK(sp_down != nullptr);
+    TEST_CHECK(sp_down->num_frames() >= 3230 && sp_down->num_frames() <= 3250);
+
+    // 3. Mirage 8-Bit Mode with u-Law Companding
+    auto mirage_down = PitchTimeStretcher::process_derez_sampler(src_clip, -12.0f, 0.40f, 0.0f);
+    TEST_CHECK(mirage_down != nullptr);
+    TEST_CHECK(mirage_down->num_frames() == 4800);
+
+    // Verify that low-level signal in tail is preserved by u-law companding
+    float tail_energy = 0.0f;
+    for (uint32_t i = 4000; i < 4800; ++i) {
+        tail_energy += std::abs(mirage_down->channel(0)[i]);
+    }
+    TEST_CHECK(tail_energy > 5.0f); // Signal does not collapse to zero
+
+    std::cout << "  -> Airwindows DeRez Sampler Variable-Clock Pitch: PASSED (-12st frames=" << octave_down->num_frames()
+              << " | 45->33 RPM -5.2st frames=" << sp_down->num_frames()
+              << " | Mirage 8-bit u-law tail energy=" << tail_energy << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4760,6 +4811,7 @@ int main() {
     test_kinetic_hit_meter_and_submix_bus_telemetry();
     test_wav_reader_pitch_stretcher_and_sample_repair();
     test_airwindows_derez2_decimator();
+    test_derez_sampler_variable_clock_pitch();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
