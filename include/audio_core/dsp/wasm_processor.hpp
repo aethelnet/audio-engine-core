@@ -65,6 +65,18 @@ public:
         }
     }
 
+    [[nodiscard]] bool supports_sidechain() const noexcept override {
+        return m_plugin && m_plugin->supports_sidechain();
+    }
+
+    void process_stereo_sidechain(Sample* left, Sample* right,
+                                  const Sample* sc_left, const Sample* sc_right,
+                                  uint32_t frames) noexcept override {
+        if (m_plugin && m_plugin->is_loaded()) {
+            m_plugin->process_stereo_sidechain(left, right, sc_left, sc_right, left, right, frames);
+        }
+    }
+
     [[nodiscard]] bool has_fault() const noexcept override {
         return m_plugin && m_plugin->has_fault();
     }

@@ -4207,6 +4207,81 @@ void test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi() {
     }
 }
 
+void test_wasm_sidechain_and_arbitrary_buffer_chunking() {
+    std::cout << "[TEST] Running Sovereign WASM Sidechain & Arbitrary Buffer Chunking Engine Test..." << std::endl;
+
+    auto wasm = std::make_unique<audio_core::WasmDspPlugin>();
+    bool loaded = wasm->load_from_file("plugins/sidechain_ducker/sidechain_ducker.wasm");
+    if (!loaded) loaded = wasm->load_from_file("../plugins/sidechain_ducker/sidechain_ducker.wasm");
+    TEST_CHECK(loaded);
+    TEST_CHECK(wasm->init(48000));
+    TEST_CHECK(wasm->supports_sidechain());
+    TEST_CHECK(wasm->get_num_parameters() == 2);
+    TEST_CHECK(wasm->get_parameter_name(1) == "Ducking");
+    TEST_CHECK(wasm->get_parameter_name(2) == "Threshold");
+
+    // 1. Arbitrary Large Buffer Chunking Verification (4,096 frames > 1,024 frame internal WASM buffer)
+    constexpr uint32_t kTotalFrames = 4096;
+    std::vector<float> in_l(kTotalFrames, 0.8f);
+    std::vector<float> in_r(kTotalFrames, 0.8f);
+    std::vector<float> out_l(kTotalFrames, 0.0f);
+    std::vector<float> out_r(kTotalFrames, 0.0f);
+
+    // Test standard stereo passthrough with chunking
+    wasm->process_stereo(in_l.data(), in_r.data(), out_l.data(), out_r.data(), kTotalFrames);
+    for (uint32_t i = 0; i < kTotalFrames; ++i) {
+        TEST_CHECK(std::abs(out_l[i] - 0.8f) < 1e-4f);
+        TEST_CHECK(std::abs(out_r[i] - 0.8f) < 1e-4f);
+    }
+    std::cout << "  -> Arbitrary Large Buffer Chunking: PASSED (4,096 frames sliced across 1,024 WASM chunks with zero loss)" << std::endl;
+
+    // 2. Dynamic Sidechain Ducking Verification
+    std::vector<float> sc_l(kTotalFrames, 0.0f);
+    std::vector<float> sc_r(kTotalFrames, 0.0f);
+    for (uint32_t i = 2048; i < kTotalFrames; ++i) {
+        sc_l[i] = 1.0f;
+        sc_r[i] = 1.0f;
+    }
+
+    wasm->set_parameter(1, 0.8f); // Ducking = 80%
+    wasm->set_parameter(2, 0.1f); // Threshold = 0.1
+
+    wasm->process_stereo_sidechain(in_l.data(), in_r.data(), sc_l.data(), sc_r.data(),
+                                  out_l.data(), out_r.data(), kTotalFrames);
+
+    // Pre-sidechain section untouched
+    for (uint32_t i = 0; i < 2000; ++i) {
+        TEST_CHECK(std::abs(out_l[i] - 0.8f) < 1e-3f);
+        TEST_CHECK(std::abs(out_r[i] - 0.8f) < 1e-3f);
+    }
+
+    // Ducked section settles around 0.16f
+    for (uint32_t i = 2500; i < 4000; ++i) {
+        TEST_CHECK(out_l[i] < 0.25f);
+        TEST_CHECK(out_r[i] < 0.25f);
+    }
+    std::cout << "  -> Sovereign WASM Sidechain Processing: PASSED (External key signal accurately ducked main channel)" << std::endl;
+
+    // 3. InsertSlot Hardening & Routing Integration
+    audio_core::InsertSlot slot;
+    slot.init(48000);
+    auto proc = std::make_shared<audio_core::dsp::WasmProcessor>(std::move(wasm), "WASM Ducker");
+    slot.set_processor(proc);
+    TEST_CHECK(slot.processor()->supports_sidechain());
+
+    std::vector<float> slot_l(2048, 0.7f);
+    std::vector<float> slot_r(2048, 0.7f);
+    std::vector<float> slot_sc_l(2048, 1.0f);
+    std::vector<float> slot_sc_r(2048, 1.0f);
+
+    slot.process_stereo(slot_l.data(), slot_r.data(), 2048, slot_sc_l.data(), slot_sc_r.data());
+
+    TEST_CHECK(!slot.has_fault());
+    TEST_CHECK(!slot.is_circuit_breaker_tripped());
+    TEST_CHECK(slot_l[1000] < 0.30f);
+    std::cout << "  -> Channel Strip InsertSlot Sidechain: PASSED (Hosted inside InsertSlot, sanitized and ducked)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4247,6 +4322,7 @@ int main() {
     test_aes67_ptp_and_speaker_calibration_matrix();
     test_universal_routing_matrix_and_bitwig_converter_elimination();
     test_lock_free_wasm_hot_swap_watchdog_and_sovereign_abi();
+    test_wasm_sidechain_and_arbitrary_buffer_chunking();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

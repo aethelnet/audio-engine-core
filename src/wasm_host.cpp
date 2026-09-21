@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 
 namespace audio_core {
 
@@ -27,15 +28,20 @@ struct WasmDspPlugin::Impl {
 
     IM3Function fn_init{nullptr};
     IM3Function fn_process{nullptr};
+    IM3Function fn_process_sc{nullptr};
     IM3Function fn_set_param{nullptr};
     IM3Function fn_get_param{nullptr};
     IM3Function fn_get_in_buf{nullptr};
     IM3Function fn_get_out_buf{nullptr};
+    IM3Function fn_get_sc_buf{nullptr};
+    IM3Function fn_supports_sc{nullptr};
     IM3Function fn_get_num_params{nullptr};
     IM3Function fn_get_param_name{nullptr};
 
     uint32_t in_buf_offset{0};
     uint32_t out_buf_offset{0};
+    uint32_t sc_buf_offset{0};
+    bool sidechain_supported{false};
     bool loaded{false};
 
     bool has_fault{false};
@@ -61,6 +67,8 @@ struct WasmDspPlugin::Impl {
         loaded = false;
         in_buf_offset = 0;
         out_buf_offset = 0;
+        sc_buf_offset = 0;
+        sidechain_supported = false;
         has_fault = false;
         trap_count = 0;
         consecutive_traps = 0;
@@ -119,10 +127,13 @@ bool WasmDspPlugin::load_from_memory(std::span<const uint8_t> wasm_bytes) {
 
     find_fn(&m_impl->fn_init, "sov_init", "dsp_init");
     find_fn(&m_impl->fn_process, "sov_process", "dsp_process");
+    find_fn(&m_impl->fn_process_sc, "sov_process_sidechain", "dsp_process_sidechain");
     find_fn(&m_impl->fn_set_param, "sov_set_param", "dsp_set_param");
     find_fn(&m_impl->fn_get_param, "sov_get_param", "dsp_get_param");
     find_fn(&m_impl->fn_get_in_buf, "sov_get_input_buffer", "dsp_get_input_buffer");
     find_fn(&m_impl->fn_get_out_buf, "sov_get_output_buffer", "dsp_get_output_buffer");
+    find_fn(&m_impl->fn_get_sc_buf, "sov_get_sidechain_buffer", "dsp_get_sidechain_buffer");
+    find_fn(&m_impl->fn_supports_sc, "sov_supports_sidechain", "dsp_supports_sidechain");
     find_fn(&m_impl->fn_get_num_params, "sov_get_num_params", "dsp_get_num_params");
     find_fn(&m_impl->fn_get_param_name, "sov_get_param_name", "dsp_get_param_name");
 
@@ -137,6 +148,21 @@ bool WasmDspPlugin::load_from_memory(std::span<const uint8_t> wasm_bytes) {
     }
     if (m3_CallV(m_impl->fn_get_out_buf) == m3Err_none) {
         m3_GetResultsV(m_impl->fn_get_out_buf, &m_impl->out_buf_offset);
+    }
+
+    // Sidechain detection
+    if (m_impl->fn_get_sc_buf) {
+        if (m3_CallV(m_impl->fn_get_sc_buf) == m3Err_none) {
+            m3_GetResultsV(m_impl->fn_get_sc_buf, &m_impl->sc_buf_offset);
+            m_impl->sidechain_supported = true;
+        }
+    }
+    if (m_impl->fn_supports_sc) {
+        if (m3_CallV(m_impl->fn_supports_sc) == m3Err_none) {
+            uint32_t sup = 0;
+            m3_GetResultsV(m_impl->fn_supports_sc, &sup);
+            m_impl->sidechain_supported = (sup != 0);
+        }
     }
 
     m_impl->loaded = true;
@@ -174,8 +200,7 @@ bool WasmDspPlugin::init(uint32_t sample_rate) {
 void WasmDspPlugin::process_stereo(const Sample* in_left, const Sample* in_right,
                                    Sample* out_left, Sample* out_right,
                                    uint32_t num_frames) noexcept {
-    if (!m_impl->loaded || !m_impl->fn_process) {
-        // Safe bypass
+    if (!m_impl->loaded || !m_impl->fn_process || num_frames == 0) {
         if (in_left != out_left) std::memcpy(out_left, in_left, num_frames * sizeof(Sample));
         if (in_right != out_right) std::memcpy(out_right, in_right, num_frames * sizeof(Sample));
         return;
@@ -186,49 +211,136 @@ void WasmDspPlugin::process_stereo(const Sample* in_left, const Sample* in_right
     if (!mem) return;
 
     constexpr uint32_t kMaxPluginFrames = 1024;
-    const uint32_t frames = (num_frames < kMaxPluginFrames) ? num_frames : kMaxPluginFrames;
-
-    // Linear memory safety bounds check
-    if (m_impl->in_buf_offset + frames * 2 * sizeof(Sample) > mem_size ||
-        m_impl->out_buf_offset + frames * 2 * sizeof(Sample) > mem_size) {
-        m_impl->has_fault = true;
-        m_impl->last_error = "buffer_out_of_bounds";
-        std::memset(out_left, 0, frames * sizeof(Sample));
-        std::memset(out_right, 0, frames * sizeof(Sample));
-        return;
-    }
-
     auto* wasm_in = reinterpret_cast<Sample*>(mem + m_impl->in_buf_offset);
     const auto* wasm_out = reinterpret_cast<const Sample*>(mem + m_impl->out_buf_offset);
 
-    // Copy planar channels into WASM memory
-    std::memcpy(wasm_in, in_left, frames * sizeof(Sample));
-    std::memcpy(wasm_in + kMaxPluginFrames, in_right, frames * sizeof(Sample));
+    uint32_t frames_processed = 0;
+    while (frames_processed < num_frames) {
+        const uint32_t chunk = std::min(num_frames - frames_processed, kMaxPluginFrames);
 
-    // Arm gas limit watchdog: budget per frame to prevent infinite loops / freezes
-    m3_SetGasLimit(m_impl->runtime, static_cast<double>(frames) * m_impl->gas_limit_per_frame);
+        // Linear memory safety bounds check
+        if (m_impl->in_buf_offset + chunk * 2 * sizeof(Sample) > mem_size ||
+            m_impl->out_buf_offset + chunk * 2 * sizeof(Sample) > mem_size) {
+            m_impl->has_fault = true;
+            m_impl->last_error = "buffer_out_of_bounds";
+            std::memset(out_left + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            std::memset(out_right + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            return;
+        }
 
-    // Execute sandboxed DSP with gas watchdog
-    M3Result res = m3_CallV(m_impl->fn_process, frames);
-    if (res != m3Err_none) {
-        // Trap occurred (e.g. trapOutOfGas from while(true), memory fault, div-by-zero)
-        m_impl->has_fault = true;
-        m_impl->trap_count++;
-        m_impl->consecutive_traps++;
-        m_impl->last_error = res;
+        // Copy planar channels into WASM memory
+        std::memcpy(wasm_in, in_left + frames_processed, chunk * sizeof(Sample));
+        std::memcpy(wasm_in + kMaxPluginFrames, in_right + frames_processed, chunk * sizeof(Sample));
 
-        // Fail-safe: zero out output to protect downstream signal path
-        std::memset(out_left, 0, frames * sizeof(Sample));
-        std::memset(out_right, 0, frames * sizeof(Sample));
+        // Arm gas limit watchdog
+        m3_SetGasLimit(m_impl->runtime, static_cast<double>(chunk) * m_impl->gas_limit_per_frame);
+
+        // Execute sandboxed DSP
+        M3Result res = m3_CallV(m_impl->fn_process, chunk);
+        if (res != m3Err_none) {
+            m_impl->has_fault = true;
+            m_impl->trap_count++;
+            m_impl->consecutive_traps++;
+            m_impl->last_error = res;
+
+            std::memset(out_left + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            std::memset(out_right + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            return;
+        }
+
+        m_impl->has_fault = false;
+        m_impl->consecutive_traps = 0;
+
+        // Copy processed samples back
+        std::memcpy(out_left + frames_processed, wasm_out, chunk * sizeof(Sample));
+        std::memcpy(out_right + frames_processed, wasm_out + kMaxPluginFrames, chunk * sizeof(Sample));
+
+        frames_processed += chunk;
+    }
+}
+
+void WasmDspPlugin::process_stereo_sidechain(const Sample* in_left, const Sample* in_right,
+                                             const Sample* sc_left, const Sample* sc_right,
+                                             Sample* out_left, Sample* out_right,
+                                             uint32_t num_frames) noexcept {
+    if (!m_impl->loaded || num_frames == 0) {
+        if (in_left != out_left) std::memcpy(out_left, in_left, num_frames * sizeof(Sample));
+        if (in_right != out_right) std::memcpy(out_right, in_right, num_frames * sizeof(Sample));
         return;
     }
 
-    m_impl->has_fault = false;
-    m_impl->consecutive_traps = 0;
+    if (!m_impl->sidechain_supported || !sc_left || !sc_right) {
+        // Fallback to standard process_stereo if sidechain not active/supported
+        process_stereo(in_left, in_right, out_left, out_right, num_frames);
+        return;
+    }
 
-    // Copy processed samples back
-    std::memcpy(out_left, wasm_out, frames * sizeof(Sample));
-    std::memcpy(out_right, wasm_out + kMaxPluginFrames, frames * sizeof(Sample));
+    size_t mem_size = 0;
+    uint8_t* mem = m3_GetMemory(m_impl->module, &mem_size, 0);
+    if (!mem) return;
+
+    constexpr uint32_t kMaxPluginFrames = 1024;
+    auto* wasm_in = reinterpret_cast<Sample*>(mem + m_impl->in_buf_offset);
+    auto* wasm_sc = reinterpret_cast<Sample*>(mem + m_impl->sc_buf_offset);
+    const auto* wasm_out = reinterpret_cast<const Sample*>(mem + m_impl->out_buf_offset);
+
+    IM3Function fn_to_call = m_impl->fn_process_sc ? m_impl->fn_process_sc : m_impl->fn_process;
+
+    uint32_t frames_processed = 0;
+    while (frames_processed < num_frames) {
+        const uint32_t chunk = std::min(num_frames - frames_processed, kMaxPluginFrames);
+
+        // Linear memory safety bounds check
+        if (m_impl->in_buf_offset + chunk * 2 * sizeof(Sample) > mem_size ||
+            m_impl->sc_buf_offset + chunk * 2 * sizeof(Sample) > mem_size ||
+            m_impl->out_buf_offset + chunk * 2 * sizeof(Sample) > mem_size) {
+            m_impl->has_fault = true;
+            m_impl->last_error = "buffer_out_of_bounds";
+            std::memset(out_left + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            std::memset(out_right + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            return;
+        }
+
+        // Copy audio and sidechain channels into WASM memory
+        std::memcpy(wasm_in, in_left + frames_processed, chunk * sizeof(Sample));
+        std::memcpy(wasm_in + kMaxPluginFrames, in_right + frames_processed, chunk * sizeof(Sample));
+
+        std::memcpy(wasm_sc, sc_left + frames_processed, chunk * sizeof(Sample));
+        std::memcpy(wasm_sc + kMaxPluginFrames, sc_right + frames_processed, chunk * sizeof(Sample));
+
+        // Arm gas limit watchdog
+        m3_SetGasLimit(m_impl->runtime, static_cast<double>(chunk) * m_impl->gas_limit_per_frame);
+
+        // Execute sandboxed sidechain DSP
+        M3Result res = m3_CallV(fn_to_call, chunk);
+        if (res != m3Err_none) {
+            m_impl->has_fault = true;
+            m_impl->trap_count++;
+            m_impl->consecutive_traps++;
+            m_impl->last_error = res;
+
+            std::memset(out_left + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            std::memset(out_right + frames_processed, 0, (num_frames - frames_processed) * sizeof(Sample));
+            return;
+        }
+
+        m_impl->has_fault = false;
+        m_impl->consecutive_traps = 0;
+
+        // Copy processed samples back
+        std::memcpy(out_left + frames_processed, wasm_out, chunk * sizeof(Sample));
+        std::memcpy(out_right + frames_processed, wasm_out + kMaxPluginFrames, chunk * sizeof(Sample));
+
+        frames_processed += chunk;
+    }
+}
+
+bool WasmDspPlugin::supports_sidechain() const noexcept {
+    return m_impl && m_impl->sidechain_supported;
+}
+
+uint32_t WasmDspPlugin::max_internal_buffer_frames() const noexcept {
+    return 1024;
 }
 
 void WasmDspPlugin::set_parameter(uint32_t param_id, float value) noexcept {

@@ -26,10 +26,19 @@ public:
     bool init(uint32_t sample_rate);
 
     // Real-Time Audio Processing (Planar Stereo)
-    // Non-allocating, safe for real-time audio thread
+    // Non-allocating, safe for real-time audio thread, chunk-scaled for arbitrary frame sizes
     void process_stereo(const Sample* in_left, const Sample* in_right,
                         Sample* out_left, Sample* out_right,
                         uint32_t num_frames) noexcept;
+
+    // Real-Time Audio Processing with External Sidechain
+    void process_stereo_sidechain(const Sample* in_left, const Sample* in_right,
+                                  const Sample* sc_left, const Sample* sc_right,
+                                  Sample* out_left, Sample* out_right,
+                                  uint32_t num_frames) noexcept;
+
+    [[nodiscard]] bool supports_sidechain() const noexcept;
+    [[nodiscard]] uint32_t max_internal_buffer_frames() const noexcept;
 
     // Parameter Control & Sovereign WASM ABI
     void set_parameter(uint32_t param_id, float value) noexcept;
