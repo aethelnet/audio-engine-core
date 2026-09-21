@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_core/protocol/aoip_packet.hpp"
+#include "audio_core/network/ptp_hardware_engine.hpp"
 #include "audio_core/ring_buffer.hpp"
 #include <cstdint>
 #include <vector>
@@ -29,6 +30,11 @@ struct AoipStreamStats {
     std::atomic<uint64_t> last_timestamp_ns{0};
     std::atomic<uint32_t> sample_rate{48000};
     std::atomic<uint16_t> channels{2};
+    std::atomic<int64_t>  jitter_ns{0};
+    std::atomic<int64_t>  avg_jitter_ns{0};
+    std::atomic<uint64_t> max_jitter_ns{0};
+    std::atomic<uint8_t>  timestamp_source{static_cast<uint8_t>(PtpTimestampSource::UserspaceMonotonic)};
+    std::atomic<bool>     hardware_locked{false};
 };
 
 struct TrackMapping {
@@ -61,7 +67,7 @@ public:
         close_socket();
     }
 
-    bool bind_port(uint16_t port, const std::string& bind_ip = "0.0.0.0") {
+    bool bind_port(uint16_t port, const std::string& bind_ip = "0.0.0.0", const std::string& iface = "") {
         close_socket();
         m_port = port;
 
@@ -76,6 +82,9 @@ public:
         // Enlarge kernel UDP receive buffer (512 KB) to prevent kernel drops under bursts
         int rcvbuf = 512 * 1024;
         ::setsockopt(m_sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        // Configure Tiered PTP Hardware / Kernel Timestamping Engine
+        m_ptp_engine.configure_socket(m_sockfd, iface);
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -143,9 +152,10 @@ public:
         std::vector<uint8_t> buffer(kMaxUdpPayloadSize);
 
         while (true) {
-            ssize_t bytes = ::recv(m_sockfd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+            PtpTimestampInfo ts_info{};
+            ssize_t bytes = m_ptp_engine.recvmsg_with_timestamp(m_sockfd, buffer.data(), buffer.size(), nullptr, ts_info);
             if (bytes <= 0) break;
-            if (process_datagram(buffer.data(), static_cast<size_t>(bytes))) {
+            if (process_datagram(buffer.data(), static_cast<size_t>(bytes), ts_info.rx_timestamp_ns)) {
                 count++;
             }
         }
@@ -153,7 +163,7 @@ public:
     }
 
     // Process a raw packet buffer directly (useful for testing & in-memory feeds)
-    bool process_datagram(const uint8_t* data, size_t size_bytes) noexcept {
+    bool process_datagram(const uint8_t* data, size_t size_bytes, uint64_t rx_timestamp_ns = 0) noexcept {
         if (!protocol::validate_aoip_packet(data, size_bytes)) {
             return false;
         }
@@ -175,6 +185,16 @@ public:
         m_stats.channels.store(hdr->channels, std::memory_order_relaxed);
         m_stats.packets_received.fetch_add(1, std::memory_order_relaxed);
         m_stats.frames_received.fetch_add(hdr->frames, std::memory_order_relaxed);
+
+        // Update physical transit jitter via PtpSocketTimestampEngine
+        if (rx_timestamp_ns > 0) {
+            m_ptp_engine.record_packet_transit(rx_timestamp_ns, hdr->timestamp_ns);
+            m_stats.jitter_ns.store(m_ptp_engine.current_jitter_ns(), std::memory_order_relaxed);
+            m_stats.avg_jitter_ns.store(static_cast<int64_t>(m_ptp_engine.avg_jitter_ns()), std::memory_order_relaxed);
+            m_stats.max_jitter_ns.store(m_ptp_engine.max_jitter_ns(), std::memory_order_relaxed);
+            m_stats.timestamp_source.store(static_cast<uint8_t>(m_ptp_engine.source()), std::memory_order_relaxed);
+            m_stats.hardware_locked.store(m_ptp_engine.is_hardware_locked(), std::memory_order_relaxed);
+        }
 
         const float* pcm_data = reinterpret_cast<const float*>(data + sizeof(protocol::AoipHeader));
         const uint16_t channels = hdr->channels;
@@ -251,6 +271,14 @@ public:
     [[nodiscard]] const AoipStreamStats& stats() const noexcept { return m_stats; }
     [[nodiscard]] uint16_t port() const noexcept { return m_port; }
 
+    [[nodiscard]] const PtpSocketTimestampEngine& ptp_engine() const noexcept { return m_ptp_engine; }
+    [[nodiscard]] PtpSocketTimestampEngine& ptp_engine() noexcept { return m_ptp_engine; }
+    [[nodiscard]] int64_t jitter_ns() const noexcept { return m_ptp_engine.current_jitter_ns(); }
+    [[nodiscard]] double avg_jitter_ns() const noexcept { return m_ptp_engine.avg_jitter_ns(); }
+    [[nodiscard]] uint64_t max_jitter_ns() const noexcept { return m_ptp_engine.max_jitter_ns(); }
+    [[nodiscard]] bool is_hardware_ptp_locked() const noexcept { return m_ptp_engine.is_hardware_locked(); }
+    [[nodiscard]] PtpTimestampSource timestamp_source() const noexcept { return m_ptp_engine.source(); }
+
 private:
     void close_socket() noexcept {
         if (m_sockfd >= 0) {
@@ -269,9 +297,10 @@ private:
             int ret = ::poll(&pfd, 1, 10); // 10ms poll timeout
             if (ret > 0 && (pfd.revents & POLLIN)) {
                 while (true) {
-                    ssize_t bytes = ::recv(m_sockfd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+                    PtpTimestampInfo ts_info{};
+                    ssize_t bytes = m_ptp_engine.recvmsg_with_timestamp(m_sockfd, buffer.data(), buffer.size(), nullptr, ts_info);
                     if (bytes <= 0) break;
-                    process_datagram(buffer.data(), static_cast<size_t>(bytes));
+                    process_datagram(buffer.data(), static_cast<size_t>(bytes), ts_info.rx_timestamp_ns);
                 }
             }
         }
@@ -282,6 +311,7 @@ private:
     std::atomic<bool> m_running{false};
     std::thread m_worker_thread;
 
+    PtpSocketTimestampEngine m_ptp_engine;
     AoipStreamStats m_stats;
     std::array<TrackMapping, kMaxTrackMappings> m_mappings{};
     std::array<std::unique_ptr<RingBuffer<float>>, kMaxTrackMappings> m_jitter_buffers_l;

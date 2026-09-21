@@ -487,7 +487,15 @@ int main(int argc, char** argv) {
                                static_cast<unsigned long>(pkts), static_cast<unsigned long>(drops));
 
             ImGui::SameLine(0, 8);
-            ImGui::TextColored(ImVec4(0.25f, 0.80f, 0.35f, 1.0f), "[PTPv2: LOCKED]");
+            auto ptp_src = static_cast<network::PtpTimestampSource>(aoip_stat.timestamp_source.load(std::memory_order_relaxed));
+            int64_t avg_j = aoip_stat.avg_jitter_ns.load(std::memory_order_relaxed);
+            if (aoip_stat.hardware_locked.load(std::memory_order_relaxed)) {
+                ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f), "[PTPv2: HW LOCKED (%ld ns)]", static_cast<long>(avg_j));
+            } else if (ptp_src == network::PtpTimestampSource::KernelDriverStack) {
+                ImGui::TextColored(ImVec4(0.20f, 0.75f, 0.90f, 1.0f), "[PTPv2: KERNEL (%ld ns)]", static_cast<long>(avg_j));
+            } else {
+                ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1.0f), "[PTPv2: USERSPACE]");
+            }
 
             ImGui::SameLine(0, 20);
             ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MASTER:");
@@ -1222,10 +1230,27 @@ int main(int argc, char** argv) {
                         uint64_t ooo = stats.out_of_order.load(std::memory_order_relaxed);
                         uint32_t sr = stats.sample_rate.load(std::memory_order_relaxed);
                         uint16_t ch = stats.channels.load(std::memory_order_relaxed);
+                        int64_t instant_j = stats.jitter_ns.load(std::memory_order_relaxed);
+                        int64_t avg_j = stats.avg_jitter_ns.load(std::memory_order_relaxed);
+                        uint64_t max_j = stats.max_jitter_ns.load(std::memory_order_relaxed);
+                        auto ptp_src = static_cast<network::PtpTimestampSource>(stats.timestamp_source.load(std::memory_order_relaxed));
+                        bool hw_locked = stats.hardware_locked.load(std::memory_order_relaxed);
 
-                        ImGui::Text("Socket Status: UDP Port 4848 (Listening on 0.0.0.0)");
+                        ImGui::Text("Socket Status: UDP Port 4848 (SO_TIMESTAMPING %s)",
+                                    aoip_rx.ptp_engine().is_so_timestamping_active() ? "ACTIVE" : "INACTIVE");
                         ImGui::Text("Wire Protocol: RTP L24 Uncompressed / Dante Multicast");
-                        ImGui::Text("PTPv2 Master Clock Lock: ACTIVE (Jitter < 50 ns)");
+
+                        if (hw_locked) {
+                            ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f),
+                                               "PTPv2 Timestamping: HARDWARE NIC PHY (IEEE 1588-2008 Latch)");
+                        } else if (ptp_src == network::PtpTimestampSource::KernelDriverStack) {
+                            ImGui::TextColored(ImVec4(0.20f, 0.75f, 0.90f, 1.0f),
+                                               "PTPv2 Timestamping: KERNEL DRIVER STACK (SOF_TIMESTAMPING_RX_SOFTWARE)");
+                        } else {
+                            ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.0f),
+                                               "PTPv2 Timestamping: USERSPACE MONOTONIC RAW (Fallback)");
+                        }
+
                         ImGui::Separator();
 
                         ImGui::Columns(2, "AoipStatsColumns", false);
@@ -1245,6 +1270,18 @@ int main(int argc, char** argv) {
 
                         ImGui::Text("Out of Order / Reordered:"); ImGui::NextColumn();
                         ImGui::Text("%lu", static_cast<unsigned long>(ooo)); ImGui::NextColumn();
+
+                        ImGui::Text("Instant Transit Jitter:"); ImGui::NextColumn();
+                        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.9f, 1.0f), "%ld ns (%.2f µs)",
+                                           static_cast<long>(instant_j), static_cast<double>(instant_j) * 1e-3); ImGui::NextColumn();
+
+                        ImGui::Text("Moving Average Jitter (ODE):"); ImGui::NextColumn();
+                        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.9f, 1.0f), "%ld ns (%.2f µs)",
+                                           static_cast<long>(avg_j), static_cast<double>(avg_j) * 1e-3); ImGui::NextColumn();
+
+                        ImGui::Text("Peak Jitter Observed:"); ImGui::NextColumn();
+                        ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.1f, 1.0f), "%lu ns (%.2f µs)",
+                                           static_cast<unsigned long>(max_j), static_cast<double>(max_j) * 1e-3); ImGui::NextColumn();
 
                         ImGui::Text("Stream Sample Rate:"); ImGui::NextColumn();
                         ImGui::Text("%u Hz", sr); ImGui::NextColumn();

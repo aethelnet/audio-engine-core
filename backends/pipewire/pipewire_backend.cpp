@@ -47,6 +47,7 @@ struct PipeWireBackend::Impl {
     mutable std::mutex discovery_mutex;
     std::vector<DiscoveredStreamPair> discovered_sources;
     std::vector<DiscoveredStreamPair> discovered_sinks;
+    std::thread discovery_thread;
 
     explicit Impl(MixerGraph& m) : mixer(m) {}
 
@@ -277,23 +278,35 @@ bool PipeWireBackend::start() {
     m_impl->running.store(true, std::memory_order_relaxed);
 
     // Master sink auto-connection & discovery in background thread
-    std::thread([this]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    m_impl->discovery_thread = std::thread([this]() {
+        for (int i = 0; i < 15; ++i) {
+            if (!m_impl->running.load(std::memory_order_relaxed)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!m_impl->running.load(std::memory_order_relaxed)) return;
         refresh_discovery();
-        FILE* fp = popen("pw-link -i", "r");
-        if (!fp) return;
-        char line[256];
+
         std::string sink_l, sink_r;
-        while (fgets(line, sizeof(line), fp)) {
-            std::string s(line);
-            if (!s.empty() && s.back() == '\n') s.pop_back();
-            if (s.find("playback_FL") != std::string::npos || s.find("playback_0") != std::string::npos || s.find("playback_1") != std::string::npos) {
-                if (sink_l.empty()) sink_l = s;
-            } else if (s.find("playback_FR") != std::string::npos || s.find("playback_2") != std::string::npos) {
-                if (sink_r.empty()) sink_r = s;
+        {
+            extern std::mutex g_pipewire_popen_mutex;
+            std::lock_guard<std::mutex> lock(g_pipewire_popen_mutex);
+            FILE* fp = popen("pw-link -i 2>/dev/null", "r");
+            if (fp) {
+                char line[256];
+                while (fgets(line, sizeof(line), fp)) {
+                    std::string s(line);
+                    if (!s.empty() && s.back() == '\n') s.pop_back();
+                    if (s.find("playback_FL") != std::string::npos || s.find("playback_0") != std::string::npos || s.find("playback_1") != std::string::npos) {
+                        if (sink_l.empty()) sink_l = s;
+                    } else if (s.find("playback_FR") != std::string::npos || s.find("playback_2") != std::string::npos) {
+                        if (sink_r.empty()) sink_r = s;
+                    }
+                }
+                pclose(fp);
             }
         }
-        pclose(fp);
+
+        if (!m_impl->running.load(std::memory_order_relaxed)) return;
 
         if (!sink_l.empty()) {
             std::string cmd = "pw-link \"aethel_mixer_graph:Master Out L\" \"" + sink_l + "\" 2>/dev/null";
@@ -304,16 +317,23 @@ bool PipeWireBackend::start() {
             (void)system(cmd.c_str());
         }
 
-        refresh_discovery();
-    }).detach();
+        if (m_impl->running.load(std::memory_order_relaxed)) {
+            refresh_discovery();
+        }
+    });
 
     return true;
 }
 
 void PipeWireBackend::stop() {
-    if (!m_impl || !m_impl->loop) return;
+    if (!m_impl) return;
 
     m_impl->running.store(false, std::memory_order_relaxed);
+    if (m_impl->discovery_thread.joinable()) {
+        m_impl->discovery_thread.join();
+    }
+
+    if (!m_impl->loop) return;
 
     pw_thread_loop_lock(m_impl->loop);
     if (m_impl->filter) {
@@ -341,8 +361,11 @@ uint32_t PipeWireBackend::sample_rate() const noexcept {
 // ----------------------------------------------------------------------------
 // Stream & Device Discovery Implementation
 // ----------------------------------------------------------------------------
+std::mutex g_pipewire_popen_mutex;
+
 static std::vector<DiscoveredStreamPair> parse_pw_links(const char* cmd, bool is_sink) {
     std::vector<DiscoveredStreamPair> result;
+    std::lock_guard<std::mutex> lock(g_pipewire_popen_mutex);
     FILE* fp = popen(cmd, "r");
     if (!fp) return result;
 
@@ -493,25 +516,28 @@ bool PipeWireBackend::unlink_all_for_track(uint32_t track_id) {
     std::string trk_l = "Track " + std::to_string(track_id) + " In L";
     std::string trk_r = "Track " + std::to_string(track_id) + " In R";
 
-    FILE* fp = popen("pw-link -l -I 2>/dev/null", "r");
-    if (fp) {
-        char line[512];
-        std::vector<int> link_ids;
-        while (fgets(line, sizeof(line), fp)) {
-            std::string s(line);
-            if (s.find(trk_l) != std::string::npos || s.find(trk_r) != std::string::npos) {
-                std::istringstream iss(s);
-                int id = 0;
-                if (iss >> id) {
-                    link_ids.push_back(id);
+    std::vector<int> link_ids;
+    {
+        std::lock_guard<std::mutex> lock(g_pipewire_popen_mutex);
+        FILE* fp = popen("pw-link -l -I 2>/dev/null", "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                std::string s(line);
+                if (s.find(trk_l) != std::string::npos || s.find(trk_r) != std::string::npos) {
+                    std::istringstream iss(s);
+                    int id = 0;
+                    if (iss >> id) {
+                        link_ids.push_back(id);
+                    }
                 }
             }
+            pclose(fp);
         }
-        pclose(fp);
-        for (int id : link_ids) {
-            std::string cmd = "pw-link -d " + std::to_string(id) + " 2>/dev/null";
-            (void)system(cmd.c_str());
-        }
+    }
+    for (int id : link_ids) {
+        std::string cmd = "pw-link -d " + std::to_string(id) + " 2>/dev/null";
+        (void)system(cmd.c_str());
     }
 
     auto* track = m_impl->mixer.get_track(track_id);

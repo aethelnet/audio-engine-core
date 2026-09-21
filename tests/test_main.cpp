@@ -17,6 +17,8 @@
 #include "audio_core/dsp/interstage.hpp"
 #include "audio_core/dsp/wasm_processor.hpp"
 #include "audio_core/network/aoip_transmitter.hpp"
+#include "audio_core/network/aoip_receiver.hpp"
+#include "audio_core/network/ptp_hardware_engine.hpp"
 #include "audio_core/clock/link_bridge.hpp"
 #include "audio_core/analysis/transient_detector.hpp"
 #include "audio_core/sampling/loop_conditioner.hpp"
@@ -4821,6 +4823,117 @@ void test_derez_sampler_variable_clock_pitch() {
               << " | Mirage 8-bit u-law tail energy=" << tail_energy << ")" << std::endl;
 }
 
+void test_ptp_hardware_and_kernel_timestamping() {
+    std::cout << "[TEST] Running PTPv2 Tiered Hardware / Kernel Timestamping & Transit Jitter Test..." << std::endl;
+    using namespace audio_core::network;
+
+    // 1. Initialize PtpSocketTimestampEngine
+    PtpSocketTimestampEngine engine;
+    TEST_CHECK(!engine.is_hardware_locked());
+    TEST_CHECK(engine.source() == PtpTimestampSource::UserspaceMonotonic);
+    TEST_CHECK(engine.current_jitter_ns() == 0);
+    TEST_CHECK(engine.avg_jitter_ns() == 0.0);
+    TEST_CHECK(engine.max_jitter_ns() == 0);
+
+    // 2. Open UDP socket on loopback and configure timestamping
+    int sockfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    TEST_CHECK(sockfd >= 0);
+
+    bool configured = engine.configure_socket(sockfd, "lo");
+    TEST_CHECK(configured);
+    TEST_CHECK(engine.is_so_timestamping_active());
+
+    // 3. Bind socket to random ephemeral port
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(0);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    TEST_CHECK(::bind(sockfd, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)) == 0);
+
+    socklen_t addr_len = sizeof(bind_addr);
+    TEST_CHECK(::getsockname(sockfd, reinterpret_cast<sockaddr*>(&bind_addr), &addr_len) == 0);
+    uint16_t assigned_port = ntohs(bind_addr.sin_port);
+
+    // 4. Send datagram over loopback
+    int send_sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_CHECK(send_sock >= 0);
+
+    sockaddr_in dest_addr{};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(assigned_port);
+    dest_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    const char test_payload[] = "AETHEL_PTP_PROBE";
+    ssize_t sent = ::sendto(send_sock, test_payload, sizeof(test_payload), 0,
+                            reinterpret_cast<const sockaddr*>(&dest_addr), sizeof(dest_addr));
+    TEST_CHECK(sent == sizeof(test_payload));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // 5. Receive via recvmsg_with_timestamp
+    uint8_t rx_buf[256];
+    sockaddr_in src_addr{};
+    PtpTimestampInfo ts_info{};
+    ssize_t recvd = engine.recvmsg_with_timestamp(sockfd, rx_buf, sizeof(rx_buf), &src_addr, ts_info);
+    TEST_CHECK(recvd == sizeof(test_payload));
+    TEST_CHECK(ts_info.rx_timestamp_ns > 0);
+    TEST_CHECK(ts_info.source == PtpTimestampSource::KernelDriverStack ||
+               ts_info.source == PtpTimestampSource::HardwareNicPhy ||
+               ts_info.source == PtpTimestampSource::UserspaceMonotonic);
+
+    ::close(send_sock);
+    ::close(sockfd);
+
+    // 6. Test Transit Jitter Mathematical Filter (RFC 3550 / IEEE 1588 ODE)
+    engine.reset_stats();
+    // Packet 0: rx = 1,000,000,000 ns, tx = 900,000,000 ns
+    engine.record_packet_transit(1'000'000'000ULL, 900'000'000ULL);
+    TEST_CHECK(engine.current_jitter_ns() == 0);
+
+    // Packet 1: rx = 1,001,000,000 ns (delta rx = 1ms), tx = 901,000,000 ns (delta tx = 1ms)
+    // Synchronous clock progression -> Jitter = 0
+    engine.record_packet_transit(1'001'000'000ULL, 901'000'000ULL);
+    TEST_CHECK(engine.current_jitter_ns() == 0);
+    TEST_CHECK(engine.max_jitter_ns() == 0);
+
+    // Packet 2: Jitter spike (50 µs delay)
+    // tx = 902,000,000 ns, rx = 1,002,050,000 ns -> Transit diff = 50,000 ns
+    engine.record_packet_transit(1'002'050'000ULL, 902'000'000ULL);
+    TEST_CHECK(engine.current_jitter_ns() == 50'000);
+    TEST_CHECK(engine.max_jitter_ns() == 50'000);
+    TEST_CHECK(engine.avg_jitter_ns() > 0.0);
+
+    // Packet 3: Negative transit differential (arrives 30 µs faster)
+    // tx = 903,000,000 ns, rx = 1,003,020,000 ns -> |970,000 - 1,000,000| = 30,000 ns
+    engine.record_packet_transit(1'003'020'000ULL, 903'000'000ULL);
+    TEST_CHECK(engine.current_jitter_ns() == 30'000);
+    TEST_CHECK(engine.max_jitter_ns() == 50'000);
+
+    // 7. Verify AoIP Receiver Integration with Jitter Metrics
+    AoipReceiver receiver(15880);
+    TEST_CHECK(receiver.bind_port(15880, "127.0.0.1"));
+    TEST_CHECK(receiver.ptp_engine().is_so_timestamping_active());
+
+    AoipTransmitter tx;
+    TEST_CHECK(tx.open("127.0.0.1", 15880));
+
+    float ch0[64] = {0.0f};
+    const float* ch_ptrs[1] = { ch0 };
+    TEST_CHECK(tx.send_multichannel(ch_ptrs, 1, 64, 48000, true));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    uint32_t count = receiver.poll_available_packets();
+    TEST_CHECK(count == 1);
+    TEST_CHECK(receiver.stats().packets_received.load() == 1);
+    TEST_CHECK(receiver.stats().timestamp_source.load() == static_cast<uint8_t>(receiver.timestamp_source()));
+
+    std::cout << "  -> PTPv2 Socket Timestamping & Transit Jitter: PASSED ("
+              << "Source: " << ptp_source_name(receiver.timestamp_source())
+              << " | Hardware Locked: " << (receiver.is_hardware_ptp_locked() ? "YES" : "NO")
+              << " | Socket Timestamping Active: " << (receiver.ptp_engine().is_so_timestamping_active() ? "YES" : "NO")
+              << " | Jitter Math Verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -4867,6 +4980,7 @@ int main() {
     test_wav_reader_pitch_stretcher_and_sample_repair();
     test_airwindows_derez2_decimator();
     test_derez_sampler_variable_clock_pitch();
+    test_ptp_hardware_and_kernel_timestamping();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
