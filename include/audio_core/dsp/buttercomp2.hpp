@@ -53,7 +53,15 @@ public:
         }
     }
 
+    [[nodiscard]] bool supports_sidechain() const noexcept override { return true; }
+
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
+        process_stereo_sidechain(left, right, nullptr, nullptr, frames);
+    }
+
+    void process_stereo_sidechain(Sample* left, Sample* right,
+                                  const Sample* sc_left, const Sample* sc_right,
+                                  uint32_t frames) noexcept override {
         if (m_compress <= 0.001f && m_output_gain == 1.0f && m_wet >= 0.999f) {
             return;
         }
@@ -68,9 +76,13 @@ public:
             float in_l = left[i] * input_gain;
             float in_r = right[i] * input_gain;
 
+            // Use external sidechain detector if provided, else self-audio
+            float det_l = (sc_left != nullptr) ? (sc_left[i] * input_gain) : in_l;
+            float det_r = (sc_right != nullptr) ? (sc_right[i] * input_gain) : in_r;
+
             // --- Left Channel Bipolar Tracking ---
-            float pos_l = std::max(0.0f, in_l);
-            float neg_l = std::max(0.0f, -in_l);
+            float pos_l = std::max(0.0f, det_l);
+            float neg_l = std::max(0.0f, -det_l);
 
             if (m_flip) {
                 m_control_a_pos_l = (m_control_a_pos_l * (1.0f - rate)) + (pos_l * rate);
@@ -83,8 +95,8 @@ public:
             }
 
             // --- Right Channel Bipolar Tracking ---
-            float pos_r = std::max(0.0f, in_r);
-            float neg_r = std::max(0.0f, -in_r);
+            float pos_r = std::max(0.0f, det_r);
+            float neg_r = std::max(0.0f, -det_r);
 
             if (m_flip) {
                 m_control_a_pos_r = (m_control_a_pos_r * (1.0f - rate)) + (pos_r * rate);

@@ -64,12 +64,14 @@ public:
         if (sr == 0 || sr == m_sample_rate) return;
         m_sample_rate = sr;
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
+        m_sidechain_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
         update_all_ballistics();
     }
 
     void set_crossover_mode(MultibandCrossoverMode mode) noexcept {
         m_crossover_mode = mode;
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
+        m_sidechain_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
     }
 
     void set_split_frequencies(const float* freqs, uint32_t count) noexcept {
@@ -79,11 +81,13 @@ public:
             m_split_freqs[i] = freqs[i];
         }
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
+        m_sidechain_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
     }
 
     void set_num_heads(uint32_t num_heads) noexcept {
         m_num_heads = std::clamp(num_heads, 2u, kMaxHeads);
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
+        m_sidechain_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
         update_all_ballistics();
     }
     [[nodiscard]] uint32_t num_heads() const noexcept { return m_num_heads; }
@@ -119,6 +123,7 @@ public:
 
     void reset() noexcept {
         m_crossover.reset();
+        m_sidechain_crossover.reset();
         for (uint32_t i = 0; i < kMaxHeads; ++i) {
             m_envelope_state[i] = 0.0f;
             m_current_gain[i] = 1.0f;
@@ -128,8 +133,9 @@ public:
         m_delay_pos = 0;
     }
 
-    // Process a stereo block in-place
-    void process_stereo(float* left, float* right, uint32_t frames) noexcept {
+    // Process a stereo block in-place (optional external sidechain support)
+    void process_stereo(float* left, float* right, uint32_t frames,
+                        const float* sc_left = nullptr, const float* sc_right = nullptr) noexcept {
         if (!left || !right || frames == 0) return;
 
         // Check solo state
@@ -140,8 +146,12 @@ public:
 
         alignas(16) float bands_l[kMaxHeads];
         alignas(16) float bands_r[kMaxHeads];
+        alignas(16) float sc_bands_l[kMaxHeads];
+        alignas(16) float sc_bands_r[kMaxHeads];
         alignas(16) float raw_stress[kMaxHeads];
         alignas(16) float coupled_stress[kMaxHeads];
+
+        const bool has_sc = (sc_left != nullptr && sc_right != nullptr);
 
         for (uint32_t i = 0; i < frames; ++i) {
             const float in_l = left[i];
@@ -150,10 +160,16 @@ public:
             // 1. Multiband Decomposition (Linkwitz-Riley or Subtractive Golden-Ratio)
             m_crossover.process_sample(in_l, in_r, bands_l, bands_r);
 
+            if (has_sc) {
+                m_sidechain_crossover.process_sample(sc_left[i], sc_right[i], sc_bands_l, sc_bands_r);
+            }
+
             // 2. Detect Energy & Raw Stress per Head
             for (uint32_t h = 0; h < m_num_heads; ++h) {
-                // Peak energy of current band
-                const float peak = std::max(std::abs(bands_l[h]), std::abs(bands_r[h]));
+                // Peak energy of current band (external sidechain or self audio)
+                const float det_l = has_sc ? sc_bands_l[h] : bands_l[h];
+                const float det_r = has_sc ? sc_bands_r[h] : bands_r[h];
+                const float peak = std::max(std::abs(det_l), std::abs(det_r));
                 const float thresh_lin = m_thresh_linear[h];
                 const float excess = std::max(0.0f, peak - thresh_lin);
 
@@ -246,6 +262,7 @@ private:
         // Default 4-Band setup: Sub (<120Hz), Low-Mid (120-1.2k), High-Mid (1.2k-6k), Air (>6k)
         m_split_freqs = {120.0f, 1200.0f, 6000.0f, 10000.0f, 12000.0f, 14000.0f, 16000.0f};
         m_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
+        m_sidechain_crossover.configure(m_num_heads, m_split_freqs.data(), m_sample_rate, m_crossover_mode);
 
         // Head 0: Sub Bass (<120Hz) - Slower attack to let sub-punch breathe, moderate release
         m_params[0].threshold_db = -16.0f;
@@ -307,6 +324,7 @@ private:
     MultibandCrossoverMode m_crossover_mode{MultibandCrossoverMode::LinkwitzRileyPhaseCompensated};
 
     MultibandCrossoverMatrix m_crossover;
+    MultibandCrossoverMatrix m_sidechain_crossover;
     std::array<float, kMaxHeads - 1> m_split_freqs{};
     std::array<HeadParameters, kMaxHeads> m_params{};
 
@@ -344,8 +362,16 @@ public:
         m_comp.reset();
     }
 
+    [[nodiscard]] bool supports_sidechain() const noexcept override { return true; }
+
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
-        m_comp.process_stereo(left, right, frames);
+        m_comp.process_stereo(left, right, frames, nullptr, nullptr);
+    }
+
+    void process_stereo_sidechain(Sample* left, Sample* right,
+                                  const Sample* sc_left, const Sample* sc_right,
+                                  uint32_t frames) noexcept override {
+        m_comp.process_stereo(left, right, frames, sc_left, sc_right);
     }
 
     void set_parameter(uint32_t index, float value) noexcept override {

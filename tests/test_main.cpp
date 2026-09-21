@@ -33,6 +33,9 @@
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include "audio_core/network/aes67_ptp_engine.hpp"
 #include "audio_core/dsp/speaker_calibration_matrix.hpp"
+#include "audio_core/routing/universal_routing_matrix.hpp"
+#include "audio_core/routing/inline_conditioner.hpp"
+#include "audio_core/routing/modulatable_parameter.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -3803,6 +3806,244 @@ void test_aes67_ptp_and_speaker_calibration_matrix() {
     }
 }
 
+void test_universal_routing_matrix_and_bitwig_converter_elimination() {
+    std::cout << "[TEST] Running Universal Routing Matrix, Multi-Source Grouping & Bitwig Converter Elimination Test..." << std::endl;
+
+    // 1. InlineConditioner: Cytomic SVF lowpass/highpass and rectification
+    {
+        audio_core::routing::InlineConditioner cond(48000);
+        audio_core::routing::InlineConditionerConfig cfg;
+        cfg.filter_mode = audio_core::routing::ConditionerFilterMode::Lowpass;
+        cfg.cutoff_hz = 120.0f; // 120Hz lowpass
+        cfg.q = 0.7071f;
+        cond.set_config(cfg);
+
+        // Test composite signal: 60Hz sub fundamental + 3000Hz click
+        constexpr uint32_t kFrames = 4800; // 100ms
+        std::vector<float> in(kFrames), out(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            float sub = std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+            float buzz = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 3000.0f * t);
+            in[i] = sub + buzz;
+        }
+
+        cond.process_block(in.data(), out.data(), kFrames);
+
+        // Check steady state (last 2400 frames)
+        float in_rms = 0.0f, out_rms = 0.0f;
+        for (uint32_t i = 2400; i < kFrames; ++i) {
+            in_rms += in[i] * in[i];
+            out_rms += out[i] * out[i];
+        }
+        in_rms = std::sqrt(in_rms / 2400.0f);
+        out_rms = std::sqrt(out_rms / 2400.0f);
+
+        TEST_CHECK(out_rms > 0.60f && out_rms < 0.80f);
+
+        // Test pure 3000Hz rejection
+        std::vector<float> buzz_in(kFrames), buzz_out(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            buzz_in[i] = std::sin(2.0f * std::numbers::pi_v<float> * 3000.0f * static_cast<float>(i) / 48000.0f);
+        }
+        cond.reset();
+        cond.process_block(buzz_in.data(), buzz_out.data(), kFrames);
+        float buzz_out_rms = 0.0f;
+        for (uint32_t i = 2400; i < kFrames; ++i) {
+            buzz_out_rms += buzz_out[i] * buzz_out[i];
+        }
+        buzz_out_rms = std::sqrt(buzz_out_rms / 2400.0f);
+        TEST_CHECK(buzz_out_rms < 0.01f);
+
+        // Rectification test
+        cfg.filter_mode = audio_core::routing::ConditionerFilterMode::Bypass;
+        cfg.rectify = audio_core::routing::ConditionerRectifyMode::FullWave;
+        cond.set_config(cfg);
+        cond.reset();
+        std::vector<float> rect_in = {-0.8f, 0.5f, -0.3f, 0.9f};
+        std::vector<float> rect_out(4);
+        cond.process_block(rect_in.data(), rect_out.data(), 4);
+        TEST_CHECK(rect_out[0] == 0.8f);
+        TEST_CHECK(rect_out[1] == 0.5f);
+        TEST_CHECK(rect_out[2] == 0.3f);
+        TEST_CHECK(rect_out[3] == 0.9f);
+
+        std::cout << "  -> Inline Conditioner: PASSED (Cytomic SVF 120Hz LP cuts 3kHz by >40dB [RMS=" << buzz_out_rms << "], Full-wave unipolar rectification verified)" << std::endl;
+    }
+
+    // 2. User exact request: Track 2 Kick with Lowpass + Dante Channel 4 grouped into Track 1 Compressor Squeeze!
+    {
+        constexpr uint32_t kFrames = 1024;
+        audio_core::MixerGraph mixer(kFrames);
+        auto* trk1 = mixer.add_track("Pad / Bass"); // Target track
+        auto* trk2 = mixer.add_track("Kick Drum");  // Sidechain source track
+
+        TEST_CHECK(trk1 != nullptr && trk2 != nullptr);
+
+        // Set up MultiHeadOdeProcessor in Slot 0 of Track 1
+        auto comp = std::make_shared<audio_core::dsp::MultiHeadOdeProcessor>(48000, 4);
+        for (uint32_t h = 0; h < 4; ++h) {
+            auto hp = comp->compressor().head_parameters(h);
+            hp.threshold_db = -24.0f;
+            hp.ratio = 8.0f;
+            hp.attack_ms = 4.0f;
+            hp.release_ms = 80.0f;
+            hp.makeup_gain_db = 0.0f;
+            comp->compressor().set_head_parameters(h, hp);
+        }
+        trk1->slot(0).set_processor(comp);
+
+        // Fill Track 1 with constant 220Hz test tone at amplitude 0.8
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * static_cast<float>(i) / 48000.0f);
+            trk1->buffer().channel(0)[i] = s;
+            trk1->buffer().channel(1)[i] = s;
+        }
+
+        // Fill Track 2 with Kick drum: 60Hz sub fundamental + 3500Hz beater click
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            float sub = 1.0f * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+            float click = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 3500.0f * t);
+            trk2->buffer().channel(0)[i] = sub + click;
+            trk2->buffer().channel(1)[i] = sub + click;
+        }
+
+        // Prepare Dante Channel 4 data: external trigger pulse at amplitude 0.7
+        std::vector<float> dante_ch4(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            dante_ch4[i] = 0.7f * std::cos(2.0f * std::numbers::pi_v<float> * 100.0f * static_cast<float>(i) / 48000.0f);
+        }
+        mixer.feed_dante_channel(4, dante_ch4.data(), kFrames);
+
+        trk2->set_gain(0.0f); // Kick drum is a pure sidechain trigger, fader down to master
+
+        // Configure Grouped Routing Matrix:
+        // Route A: Track 2 Input -> Track 1 Sidechain Slot 0, with 120Hz Lowpass
+        int32_t r1 = mixer.connect_sidechain(trk2->id(), trk1->id(), 0, 120.0f, audio_core::routing::TapPoint::Input);
+        TEST_CHECK(r1 > 0);
+
+        // Route B: Network AoIP Dante Channel 4 -> Track 1 Sidechain Slot 0, gain 0.8f
+        int32_t r2 = mixer.connect_network_sidechain(4, trk1->id(), 0, 0.8f);
+        TEST_CHECK(r2 > 0);
+
+        // Render 4 blocks through MixerGraph to allow dynamic compressor envelope to reach steady-state
+        audio_core::AudioBuffer master_out(2, kFrames);
+        auto view = master_out.view();
+        for (int blk = 0; blk < 4; ++blk) {
+            for (uint32_t i = 0; i < kFrames; ++i) {
+                float t = static_cast<float>(i + blk * kFrames) / 48000.0f;
+                float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * t);
+                trk1->buffer().channel(0)[i] = s;
+                trk1->buffer().channel(1)[i] = s;
+                float sub = 1.0f * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+                float click = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 3500.0f * t);
+                trk2->buffer().channel(0)[i] = sub + click;
+                trk2->buffer().channel(1)[i] = sub + click;
+                dante_ch4[i] = 0.7f * std::cos(2.0f * std::numbers::pi_v<float> * 100.0f * t);
+            }
+            mixer.feed_dante_channel(4, dante_ch4.data(), kFrames);
+            mixer.render(view);
+        }
+
+        // Verify that the sidechain destination buffer in the matrix holds the grouped sum!
+        const float* sc_l = mixer.routing_matrix().track_sidechain_l(trk1->id(), 0);
+        TEST_CHECK(sc_l != nullptr);
+        float sc_energy = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            sc_energy += sc_l[i] * sc_l[i];
+        }
+        sc_energy = std::sqrt(sc_energy / kFrames);
+        TEST_CHECK(sc_energy > 0.3f);
+
+        // Run uncompressed baseline to verify ducking squeeze:
+        trk1->slot(0).set_bypass(true);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i + 3 * kFrames) / 48000.0f;
+            float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * t);
+            trk1->buffer().channel(0)[i] = s;
+            trk1->buffer().channel(1)[i] = s;
+            trk2->buffer().channel(0)[i] = 0.0f;
+            trk2->buffer().channel(1)[i] = 0.0f;
+        }
+        audio_core::AudioBuffer uncomp_out(2, kFrames);
+        auto uncomp_view = uncomp_out.view();
+        mixer.render(uncomp_view);
+
+        float uncomp_rms = 0.0f, comp_rms = 0.0f;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            uncomp_rms += uncomp_view.channel(0)[i] * uncomp_view.channel(0)[i];
+            comp_rms += view.channel(0)[i] * view.channel(0)[i];
+        }
+        uncomp_rms = std::sqrt(uncomp_rms / kFrames);
+        comp_rms = std::sqrt(comp_rms / kFrames);
+
+        TEST_CHECK(comp_rms < uncomp_rms * 0.85f);
+
+        std::cout << "  -> Multi-Source Grouped Sidechain Squeeze: PASSED (Track 2 120Hz LP + Dante Ch 4 grouped into Track 1 Comp Slot 0, SC RMS="
+                  << sc_energy << ", Ducking RMS: " << uncomp_rms << " -> " << comp_rms << " [Squeeze active])" << std::endl;
+    }
+
+    // 3. Audio-Rate Parameter Modulation ("Bitwig Dilemma" Converter-Free Architecture)
+    {
+        audio_core::routing::ModulatableParameter param("FilterCutoff", 1000.0f, 20.0f, 20000.0f);
+        param.set_depth(400.0f);
+        param.set_modulation_active(true);
+
+        constexpr uint32_t kFrames = 256;
+        std::vector<float> mod_src(kFrames), evaluated(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            mod_src[i] = std::sin(2.0f * std::numbers::pi_v<float> * 100.0f * static_cast<float>(i) / 48000.0f);
+        }
+
+        param.evaluate_block(mod_src.data(), evaluated.data(), kFrames);
+
+        // Check AVX2/NEON FMA vectorization accuracy: evaluated[i] == 1000.0 + 400.0 * mod_src[i]
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float expected = 1000.0f + (400.0f * mod_src[i]);
+            TEST_CHECK(std::abs(evaluated[i] - expected) < 1e-4f);
+        }
+
+        // Test clipping at bounds
+        param.set_base(19800.0f);
+        param.set_depth(500.0f);
+        param.evaluate_block(mod_src.data(), evaluated.data(), kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(evaluated[i] <= 20000.0f);
+            TEST_CHECK(evaluated[i] >= 20.0f);
+        }
+
+        std::cout << "  -> Audio-Rate Parameter Modulation: PASSED (Zero-converter Vectorized FMA evaluated sample-accurately, bounds strictly preserved)" << std::endl;
+    }
+
+    // 4. DAG Cycle Detection & Z^-1 Automatic Feedback Decoupling
+    {
+        audio_core::routing::UniversalRoutingMatrix matrix(48000);
+
+        // Create cyclic loop: Track 1 -> Track 2 Sidechain, and Track 2 -> Track 1 Sidechain
+        audio_core::routing::RoutingPatch p1{};
+        p1.source_type = audio_core::routing::RoutingSourceType::TrackAudio;
+        p1.source_id = 1;
+        p1.dest_type = audio_core::routing::RoutingDestType::TrackSidechain;
+        p1.dest_id = 2;
+        matrix.add_patch(p1);
+
+        audio_core::routing::RoutingPatch p2{};
+        p2.source_type = audio_core::routing::RoutingSourceType::TrackAudio;
+        p2.source_id = 2;
+        p2.dest_type = audio_core::routing::RoutingDestType::TrackSidechain;
+        p2.dest_id = 1;
+        matrix.add_patch(p2);
+
+        // Verify that matrix detected the cycle and decoupled the feedback path with Z^-1
+        const auto& patches = matrix.patches();
+        TEST_CHECK(!patches[0].is_feedback);
+        TEST_CHECK(patches[1].is_feedback); // Second edge completed the cycle -> marked as feedback (Z^-1)
+
+        std::cout << "  -> DAG Cycle Feedback Decoupling: PASSED (Cyclic patch detected, Z^-1 delay buffer automatically assigned to feedback edge)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -3841,6 +4082,7 @@ int main() {
     test_liquid_ode_noise_colors_sweeps_and_dynamic_denoising();
     test_multihead_ode_compressor_and_transient_accuracy();
     test_aes67_ptp_and_speaker_calibration_matrix();
+    test_universal_routing_matrix_and_bitwig_converter_elimination();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

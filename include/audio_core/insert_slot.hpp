@@ -35,6 +35,13 @@ public:
     virtual void init(uint32_t sample_rate) noexcept = 0;
     virtual void reset() noexcept = 0;
     virtual void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept = 0;
+    virtual void process_stereo_sidechain(Sample* left, Sample* right,
+                                          const Sample* sc_left, const Sample* sc_right,
+                                          uint32_t frames) noexcept {
+        (void)sc_left; (void)sc_right;
+        process_stereo(left, right, frames);
+    }
+    [[nodiscard]] virtual bool supports_sidechain() const noexcept { return false; }
 
     virtual void set_parameter(uint32_t index, float value) noexcept = 0;
     [[nodiscard]] virtual float get_parameter(uint32_t index) const noexcept = 0;
@@ -139,13 +146,18 @@ public:
         return m_corrupt_samples_detected.load(std::memory_order_relaxed);
     }
 
-    inline void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept {
+    inline void process_stereo(Sample* left, Sample* right, uint32_t frames,
+                               const Sample* sc_left = nullptr, const Sample* sc_right = nullptr) noexcept {
         if (m_bypass.load(std::memory_order_relaxed) || !m_processor || frames == 0) {
             return;
         }
 
-        // 1. Run underlying DSP processor (Airwindows or WASM container)
-        m_processor->process_stereo(left, right, frames);
+        // 1. Run underlying DSP processor (Airwindows or WASM container or ODE Compressor)
+        if (sc_left && sc_right && m_processor->supports_sidechain()) {
+            m_processor->process_stereo_sidechain(left, right, sc_left, sc_right, frames);
+        } else {
+            m_processor->process_stereo(left, right, frames);
+        }
 
         // 2. Hardened Interceptor & Sanitizer Pass (Zero allocations)
         uint32_t bad_samples_in_block = 0;

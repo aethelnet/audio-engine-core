@@ -12,6 +12,7 @@
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/dsp/multichannel_bus.hpp"
+#include "audio_core/routing/universal_routing_matrix.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -268,13 +269,19 @@ public:
     }
 
     // Called inside the RT render loop
-    void process_channel_strip(uint32_t frames) noexcept {
+    void process_channel_strip(uint32_t frames, const routing::UniversalRoutingMatrix* matrix = nullptr) noexcept {
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
 
-        // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, PurestDrive, WASM)
-        for (auto& slot : m_slots) {
-            slot.process_stereo(left, right, frames);
+        // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, MultiHeadOde, PurestDrive, WASM)
+        for (size_t s = 0; s < m_slots.size(); ++s) {
+            const Sample* sc_l = nullptr;
+            const Sample* sc_r = nullptr;
+            if (matrix && matrix->has_track_sidechain(m_id, static_cast<uint32_t>(s))) {
+                sc_l = matrix->track_sidechain_l(m_id, static_cast<uint32_t>(s));
+                sc_r = matrix->track_sidechain_r(m_id, static_cast<uint32_t>(s));
+            }
+            m_slots[s].process_stereo(left, right, frames, sc_l, sc_r);
         }
 
         // 2. In-line Console Encode (Airwindows EveryConsole)
@@ -437,7 +444,7 @@ public:
         m_buffer.clear();
     }
 
-    void process_buss_strip(uint32_t frames) noexcept {
+    void process_buss_strip(uint32_t frames, const routing::UniversalRoutingMatrix* matrix = nullptr) noexcept {
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
 
@@ -445,8 +452,14 @@ public:
         m_console.process_stereo(left, right, frames);
 
         // 2. Process Bus Insert Slots (Bus Glue Comp, Master EQ, etc.)
-        for (auto& slot : m_slots) {
-            slot.process_stereo(left, right, frames);
+        for (size_t s = 0; s < m_slots.size(); ++s) {
+            const Sample* sc_l = nullptr;
+            const Sample* sc_r = nullptr;
+            if (matrix && matrix->has_bus_sidechain(m_id, static_cast<uint32_t>(s))) {
+                sc_l = matrix->bus_sidechain_l(m_id, static_cast<uint32_t>(s));
+                sc_r = matrix->bus_sidechain_r(m_id, static_cast<uint32_t>(s));
+            }
+            m_slots[s].process_stereo(left, right, frames, sc_l, sc_r);
         }
 
         // 3. Telemetry
@@ -552,6 +565,7 @@ public:
                 tap->set_sample_rate(sample_rate);
             }
         }
+        m_routing_matrix.set_sample_rate(sample_rate);
     }
 
     [[nodiscard]] uint32_t sample_rate() const noexcept {
@@ -576,6 +590,64 @@ public:
 
     [[nodiscard]] clock::TimelineClock& clock() noexcept { return m_clock; }
     [[nodiscard]] const clock::TimelineClock& clock() const noexcept { return m_clock; }
+
+    // ------------------------------------------------------------------------
+    // Universal Routing Matrix API
+    // ------------------------------------------------------------------------
+    [[nodiscard]] routing::UniversalRoutingMatrix& routing_matrix() noexcept { return m_routing_matrix; }
+    [[nodiscard]] const routing::UniversalRoutingMatrix& routing_matrix() const noexcept { return m_routing_matrix; }
+
+    int32_t add_route(const routing::RoutingPatch& patch) noexcept {
+        return m_routing_matrix.add_patch(patch);
+    }
+
+    bool remove_route(uint32_t patch_id) noexcept {
+        return m_routing_matrix.remove_patch(patch_id);
+    }
+
+    void clear_routes() noexcept {
+        m_routing_matrix.clear_all_patches();
+    }
+
+    int32_t connect_sidechain(uint32_t src_track_id, uint32_t dst_track_id,
+                              uint32_t dst_slot_idx = 0, float lowpass_hz = 0.0f,
+                              routing::TapPoint tap = routing::TapPoint::Input) noexcept {
+        routing::RoutingPatch p{};
+        p.source_type = routing::RoutingSourceType::TrackAudio;
+        p.source_id = src_track_id;
+        p.tap_point = tap;
+        p.source_channel = routing::RouteChannel::MonoSum;
+        p.dest_type = routing::RoutingDestType::TrackSidechain;
+        p.dest_id = dst_track_id;
+        p.dest_slot = dst_slot_idx;
+        p.dest_channel = routing::RouteChannel::StereoBoth;
+        if (lowpass_hz > 0.0f) {
+            p.conditioning.filter_mode = routing::ConditionerFilterMode::Lowpass;
+            p.conditioning.cutoff_hz = lowpass_hz;
+        } else {
+            p.conditioning.filter_mode = routing::ConditionerFilterMode::Bypass;
+        }
+        return m_routing_matrix.add_patch(p);
+    }
+
+    int32_t connect_network_sidechain(uint16_t dante_ch, uint32_t dst_track_id,
+                                      uint32_t dst_slot_idx = 0, float gain = 1.0f) noexcept {
+        routing::RoutingPatch p{};
+        p.source_type = routing::RoutingSourceType::NetworkAoip;
+        p.source_id = dante_ch;
+        p.source_channel = routing::RouteChannel::Left;
+        p.dest_type = routing::RoutingDestType::TrackSidechain;
+        p.dest_id = dst_track_id;
+        p.dest_slot = dst_slot_idx;
+        p.dest_channel = routing::RouteChannel::StereoBoth;
+        p.conditioning.filter_mode = routing::ConditionerFilterMode::Bypass;
+        p.conditioning.gain = gain;
+        return m_routing_matrix.add_patch(p);
+    }
+
+    void feed_dante_channel(uint16_t channel, const float* samples, uint32_t frames) noexcept {
+        m_routing_matrix.feed_network_channel(channel, samples, frames);
+    }
 
     // Ingest incoming AoIP network frames into all mapped active tracks
     void ingest_aoip(network::AoipReceiver& receiver, uint32_t frames) noexcept {
@@ -906,7 +978,61 @@ public:
             }
         }
 
-        // 3. Parallel Track Processing (Inserts, Console Encode, Meters, Taps)
+        // 2b. Universal Routing Matrix: Prepare destination buffers and evaluate Network AoIP routes
+        m_routing_matrix.prepare_block(frames);
+
+        for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
+            const auto& patch = m_routing_matrix.patches()[r];
+            if (!patch.active) continue;
+            if (patch.source_type == routing::RoutingSourceType::NetworkAoip) {
+                m_routing_matrix.process_route(r, nullptr, nullptr, frames);
+            }
+        }
+
+        // 3. Track Processing & Universal Routing Matrix Passes
+        // Phase 3a: Track input rendering (Clips / Sequencers) & Pre-FX Taps
+        for (auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            bool trk_muted = is_track_effectively_muted(track.get());
+            bool trk_solo = is_track_effectively_solo(track.get());
+            if (trk_muted || (any_solo && !trk_solo && !track->is_solo_safe())) {
+                track->reset_meters();
+                continue;
+            }
+
+            // Fill from active clip or step-sequencer
+            track->render_input(frames, m_clock, boundary_events);
+
+            const Sample* raw_l = track->buffer().view().channel(0);
+            const Sample* raw_r = track->buffer().view().channel(1);
+
+            // Pre-FX Tap for Sampler
+            for (auto& tap : m_taps) {
+                if (tap && tap->is_active()) {
+                    auto src = tap->source();
+                    if (src.type == sampling::TapSourceType::TrackInput && src.source_id == track->id()) {
+                        tap->record(raw_l, raw_r, frames, &boundary_events);
+                    }
+                }
+            }
+        }
+
+        // Phase 3b: Evaluate Pre-Insert / Input tap routes (e.g. Track 2 Lowpass Sidechain)
+        for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
+            const auto& patch = m_routing_matrix.patches()[r];
+            if (!patch.active) continue;
+            if (patch.source_type == routing::RoutingSourceType::TrackAudio &&
+                (patch.tap_point == routing::TapPoint::Input || patch.tap_point == routing::TapPoint::PreInsert)) {
+                Track* src_trk = get_track(patch.source_id);
+                if (src_trk && src_trk->is_active()) {
+                    const Sample* in_l = src_trk->buffer().view().channel(0);
+                    const Sample* in_r = src_trk->buffer().view().channel(1);
+                    m_routing_matrix.process_route(r, in_l, in_r, frames);
+                }
+            }
+        }
+
+        // Phase 3c: Parallel Track Channel Strip Processing (Inserts with Routing Matrix Sidechains + Console)
         struct TrackRenderCtx {
             MixerGraph* self;
             uint32_t frames;
@@ -931,28 +1057,11 @@ public:
             bool trk_muted = ctx->self->is_track_effectively_muted(track);
             bool trk_solo = ctx->self->is_track_effectively_solo(track);
             if (trk_muted || (ctx->any_solo && !trk_solo && !track->is_solo_safe())) {
-                track->reset_meters();
                 return;
             }
 
-            // Fill from active clip or step-sequencer
-            track->render_input(ctx->frames, *ctx->clock, *ctx->events);
-
-            const Sample* raw_l = track->buffer().view().channel(0);
-            const Sample* raw_r = track->buffer().view().channel(1);
-
-            // Pre-FX Tap
-            for (auto& tap : ctx->self->m_taps) {
-                if (tap && tap->is_active()) {
-                    auto src = tap->source();
-                    if (src.type == sampling::TapSourceType::TrackInput && src.source_id == track->id()) {
-                        tap->record(raw_l, raw_r, ctx->frames, ctx->events);
-                    }
-                }
-            }
-
-            // In-line Channel Strip processing (Inserts + Console)
-            track->process_channel_strip(ctx->frames);
+            // In-line Channel Strip processing with Routing Matrix sidechain access!
+            track->process_channel_strip(ctx->frames, &ctx->self->m_routing_matrix);
 
             const Sample* trk_l = track->buffer().view().channel(0);
             const Sample* trk_r = track->buffer().view().channel(1);
@@ -967,6 +1076,21 @@ public:
                 }
             }
         });
+
+        // Phase 3d: Evaluate Post-Insert & Post-Fader routes
+        for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
+            const auto& patch = m_routing_matrix.patches()[r];
+            if (!patch.active) continue;
+            if (patch.source_type == routing::RoutingSourceType::TrackAudio &&
+                (patch.tap_point == routing::TapPoint::PostInsert || patch.tap_point == routing::TapPoint::PostFader)) {
+                Track* src_trk = get_track(patch.source_id);
+                if (src_trk && src_trk->is_active()) {
+                    const Sample* post_l = src_trk->buffer().view().channel(0);
+                    const Sample* post_r = src_trk->buffer().view().channel(1);
+                    m_routing_matrix.process_route(r, post_l, post_r, frames);
+                }
+            }
+        }
 
         // 3b. Vectorized Bus & Master Accumulation (SIMD linear reduction)
         for (auto& track : m_tracks) {
@@ -1050,7 +1174,7 @@ public:
                 continue;
             }
 
-            bus->process_buss_strip(frames);
+            bus->process_buss_strip(frames, &m_routing_matrix);
 
             const float bus_gain = bus->gain();
             const Sample* b_l = bus->buffer().view().channel(0);
@@ -1099,7 +1223,7 @@ public:
         }
 
         // 5. Process Master Bus Strip (Console Decode + Master Inserts + Peak Safety)
-        m_master_bus.process_buss_strip(frames);
+        m_master_bus.process_buss_strip(frames, &m_routing_matrix);
 
         const float master_gain = m_master_bus.gain();
         const Sample* final_l = m_master_bus.buffer().view().channel(0);
@@ -1354,6 +1478,7 @@ private:
     std::array<std::unique_ptr<sampling::SampleTap>, kMaxSampleTaps> m_taps;
     clock::TimelineClock m_clock{48000, 120.0};
     threading::AudioWorkerPool m_worker_pool;
+    routing::UniversalRoutingMatrix m_routing_matrix;
 };
 
 } // namespace audio_core
