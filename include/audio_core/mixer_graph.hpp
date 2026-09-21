@@ -36,6 +36,16 @@ struct MeterLevels {
 };
 
 // ============================================================================
+// Track Input Mode (Zähl AM1 Routing / Bridge to PipeWire & Network)
+// ============================================================================
+enum class TrackInputMode : uint8_t {
+    InternalClip = 0,    // Pure internal clip / sequencer playback
+    PipeWireStream = 1,  // External PipeWire audio input replaces clip
+    MergeAll = 2,        // Sum internal clip + external PipeWire stream
+    NetworkAoip = 3      // Stream from AoIP / Dante network channel
+};
+
+// ============================================================================
 // Track: A single audio/instrument channel in the Mixer Graph
 // Pre-allocated in fixed pool; zero allocations during playback
 // ============================================================================
@@ -245,11 +255,47 @@ public:
         return m_sequencer_enabled.load(std::memory_order_relaxed) && (m_sequencer != nullptr);
     }
 
+    void set_input_mode(TrackInputMode mode) noexcept { m_input_mode.store(mode, std::memory_order_relaxed); }
+    [[nodiscard]] TrackInputMode input_mode() const noexcept { return m_input_mode.load(std::memory_order_relaxed); }
+
     // Called inside RT render loop before channel strip processing
     void render_input(uint32_t frames, const clock::TimelineClock& clock,
                       const clock::BlockBoundaryEvents& boundary_events) noexcept {
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
+
+        auto mode = m_input_mode.load(std::memory_order_relaxed);
+        if (mode == TrackInputMode::PipeWireStream || mode == TrackInputMode::NetworkAoip) {
+            // Buffer already populated by external stream before mixer render
+            return;
+        }
+
+        if (mode == TrackInputMode::MergeAll) {
+            // Additive summing: render internal clip/sequencer and sum into existing external audio
+            Sample tmp_l[2048];
+            Sample tmp_r[2048];
+            const uint32_t f_proc = std::min(frames, 2048u);
+            if (is_sequencer_enabled()) {
+                m_sequencer->render(tmp_l, tmp_r, f_proc, clock, boundary_events);
+                for (uint32_t f = 0; f < f_proc; ++f) {
+                    left[f] += tmp_l[f];
+                    right[f] += tmp_r[f];
+                }
+            } else if (m_clip) {
+                if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
+                    // Stopped transport: no clip addition
+                } else {
+                    double ph = m_clip_playhead.load(std::memory_order_relaxed);
+                    m_clip->read_resampled(ph, clock.sample_rate(), tmp_l, tmp_r, f_proc, m_clip_loop.load(std::memory_order_relaxed));
+                    m_clip_playhead.store(ph, std::memory_order_relaxed);
+                    for (uint32_t f = 0; f < f_proc; ++f) {
+                        left[f] += tmp_l[f];
+                        right[f] += tmp_r[f];
+                    }
+                }
+            }
+            return;
+        }
 
         if (is_sequencer_enabled()) {
             m_sequencer->render(left, right, frames, clock, boundary_events);
@@ -359,6 +405,7 @@ private:
     std::atomic<bool> m_clip_loop{true};
     std::atomic<double> m_clip_playhead{0.0};
     std::atomic<bool> m_sync_to_transport{false};
+    std::atomic<TrackInputMode> m_input_mode{TrackInputMode::InternalClip};
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
@@ -678,10 +725,25 @@ public:
     // Ingest incoming AoIP network frames into all mapped active tracks
     void ingest_aoip(network::AoipReceiver& receiver, uint32_t frames) noexcept {
         for (auto& track : m_tracks) {
-            if (track->is_active() && !track->has_clip()) {
+            if (!track->is_active()) continue;
+            auto mode = track->input_mode();
+            if (mode == TrackInputMode::NetworkAoip || (!track->has_clip() && mode != TrackInputMode::PipeWireStream)) {
                 Sample* l = track->buffer().view().channel(0);
                 Sample* r = track->buffer().view().channel(1);
                 receiver.read_track_frames(track->id(), l, r, frames);
+            } else if (mode == TrackInputMode::MergeAll) {
+                Sample tmp_l[2048];
+                Sample tmp_r[2048];
+                const uint32_t f_to_read = std::min(frames, 2048u);
+                uint32_t popped = receiver.read_track_frames(track->id(), tmp_l, tmp_r, f_to_read);
+                if (popped > 0) {
+                    Sample* l = track->buffer().view().channel(0);
+                    Sample* r = track->buffer().view().channel(1);
+                    for (uint32_t f = 0; f < popped; ++f) {
+                        l[f] += tmp_l[f];
+                        r[f] += tmp_r[f];
+                    }
+                }
             }
         }
     }

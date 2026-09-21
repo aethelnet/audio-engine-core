@@ -1003,6 +1003,60 @@ void test_pipewire_backend_integration() {
     std::cout << "  -> PipeWire Native Backend: PASSED (Node registered, virtual sinks & master outs created, clean shutdown)" << std::endl;
 }
 
+void test_pipewire_stream_discovery_and_linking() {
+    std::cout << "[TEST] Running PipeWire Stream Discovery, Dynamic Patching & AoIP Ingest Test..." << std::endl;
+    using namespace audio_core;
+
+    MixerGraph mixer(256);
+    Track* trk1 = mixer.allocate_track("Live Stream In");
+    TEST_CHECK(trk1 != nullptr);
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::InternalClip);
+
+    PipeWireBackend pw(mixer);
+    bool inited = pw.init("Aethel Discovery Test", 48000);
+    TEST_CHECK(inited);
+
+    // 1. Discovery Refresh
+    pw.refresh_discovery();
+    auto sources = pw.get_available_sources();
+    auto sinks = pw.get_available_sinks();
+    std::cout << "  -> Discovered " << sources.size() << " external PipeWire sources and "
+              << sinks.size() << " sinks on system" << std::endl;
+
+    // 2. Linking Mock Stream to Track
+    DiscoveredStreamPair mock_stream{};
+    mock_stream.node_name = "test_player";
+    mock_stream.display_name = "Mock Media Player";
+    mock_stream.port_l = "test_player:out_L";
+    mock_stream.port_r = "test_player:out_R";
+
+    // Attempt link: mode updates to PipeWireStream
+    pw.link_source_to_track(mock_stream, trk1->id());
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::PipeWireStream);
+
+    // Unlink: mode restores to InternalClip
+    pw.unlink_source_from_track(mock_stream, trk1->id());
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::InternalClip);
+
+    // 3. AoIP Receiver Integration
+    network::AoipReceiver aoip_rx(14849);
+    pw.set_aoip_receiver(&aoip_rx);
+    TEST_CHECK(pw.aoip_receiver() == &aoip_rx);
+
+    // 4. Test TrackInputMode transitions: MergeAll and NetworkAoip
+    trk1->set_input_mode(TrackInputMode::NetworkAoip);
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::NetworkAoip);
+
+    trk1->set_input_mode(TrackInputMode::MergeAll);
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::MergeAll);
+
+    // Unlink all restores to InternalClip
+    pw.unlink_all_for_track(trk1->id());
+    TEST_CHECK(trk1->input_mode() == TrackInputMode::InternalClip);
+
+    std::cout << "  -> PipeWire Stream Discovery & Patching: PASSED (Crawler executed, modes verified, AoIP connected)" << std::endl;
+}
+
 void test_aoip_network_streaming_and_unpacking() {
     std::cout << "[TEST] Running AoIP Network Streaming & Multi-Channel Unpacking Test..." << std::endl;
     using namespace audio_core;
@@ -4784,6 +4838,7 @@ int main() {
     test_channel_strip_insert_slots();
     test_nested_bus_topological_routing();
     test_pipewire_backend_integration();
+    test_pipewire_stream_discovery_and_linking();
     test_aoip_network_streaming_and_unpacking();
     test_universal_sampling_and_bounce_tap();
     test_timeline_clock_and_link_bridge_master_authority();

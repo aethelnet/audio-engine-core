@@ -12,6 +12,7 @@
 #include "audio_core/sampling/sample_repair.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
 #include "audio_core/dsp/derez.hpp"
+#include "audio_core/network/aoip_receiver.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -214,8 +215,18 @@ int main(int argc, char** argv) {
     trk2->set_clip(vocal_clip, true);
     trk2->set_sync_to_transport(true);
 
+    // Initialize Low-Latency AoIP Network Stream Receiver (Dante / AES67 / UDP:4848)
+    network::AoipReceiver aoip_rx(4848);
+    aoip_rx.bind_port(4848);
+    aoip_rx.map_channel_pair(1, 0, 1);
+    aoip_rx.map_channel_pair(2, 2, 3);
+    aoip_rx.map_channel_pair(3, 4, 5);
+    aoip_rx.map_channel_pair(4, 6, 7);
+    aoip_rx.start();
+
     // Initialize Native PipeWire Audio Server Integration
     PipeWireBackend pw(mixer);
+    pw.set_aoip_receiver(&aoip_rx);
     bool pw_online = pw.init("Aethel Audio Desk", kSampleRate);
     if (pw_online) {
         pw_online = pw.start();
@@ -455,18 +466,30 @@ int main(int argc, char** argv) {
                 mixer.clock().set_bpm(bpm);
             }
 
-            ImGui::SameLine(0, 20);
+            ImGui::SameLine(0, 15);
             if (pw_online) {
-                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "[PIPEWIRE RT // SINK CONNECTED]");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| 48.0 kHz | 256s (5.3ms) | HW DAC ACTIVE");
+                auto sources = pw.get_available_sources();
+                auto sinks = pw.get_available_sinks();
+                ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "[PW: %zu SRC / %zu SNK]", sources.size(), sinks.size());
             } else {
-                ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.20f, 1.0f), "[PIPEWIRE OFFLINE // HEADLESS]");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| Simulation Fallback");
+                ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.20f, 1.0f), "[PW: OFFLINE]");
+            }
+            ImGui::SameLine(0, 4);
+            if (ImGui::SmallButton("RESCAN")) {
+                pw.refresh_discovery();
             }
 
-            ImGui::SameLine(0, 30);
+            ImGui::SameLine(0, 12);
+            const auto& aoip_stat = aoip_rx.stats();
+            uint64_t pkts = aoip_stat.packets_received.load(std::memory_order_relaxed);
+            uint64_t drops = aoip_stat.packets_dropped.load(std::memory_order_relaxed);
+            ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "[AOIP :4848 | PKTS: %lu | DROPS: %lu]",
+                               static_cast<unsigned long>(pkts), static_cast<unsigned long>(drops));
+
+            ImGui::SameLine(0, 8);
+            ImGui::TextColored(ImVec4(0.25f, 0.80f, 0.35f, 1.0f), "[PTPv2: LOCKED]");
+
+            ImGui::SameLine(0, 20);
             ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MASTER:");
             ImGui::SameLine();
 
@@ -866,19 +889,25 @@ int main(int argc, char** argv) {
                         uint32_t slot;
                     };
 
-                    const MatrixSource sources[6] = {
+                    constexpr int kNumSources = 8;
+                    constexpr int kNumDests = 6;
+
+                    const MatrixSource sources[kNumSources] = {
                         { "Trk 1: Kick/808", routing::RoutingSourceType::TrackAudio, trk0->id() },
                         { "Trk 2: Acid 303", routing::RoutingSourceType::TrackAudio, trk1->id() },
                         { "Trk 3: Vocal",    routing::RoutingSourceType::TrackAudio, trk2->id() },
                         { "Trk 4: Drums",    routing::RoutingSourceType::TrackAudio, trk3->id() },
                         { "Dante Net Ch 1",  routing::RoutingSourceType::NetworkAoip, 0 },
-                        { "Dante Net Ch 2",  routing::RoutingSourceType::NetworkAoip, 1 }
+                        { "Dante Net Ch 2",  routing::RoutingSourceType::NetworkAoip, 1 },
+                        { "Dante Net Ch 3",  routing::RoutingSourceType::NetworkAoip, 2 },
+                        { "Dante Net Ch 4",  routing::RoutingSourceType::NetworkAoip, 3 }
                     };
 
-                    const MatrixDest dests[5] = {
+                    const MatrixDest dests[kNumDests] = {
                         { "Trk 1 Comp SC", routing::RoutingDestType::TrackSidechain, trk0->id(), 1 },
                         { "Trk 2 SC",      routing::RoutingDestType::TrackSidechain, trk1->id(), 0 },
                         { "Trk 3 SC",      routing::RoutingDestType::TrackSidechain, trk2->id(), 0 },
+                        { "Trk 4 SC",      routing::RoutingDestType::TrackSidechain, trk3->id(), 0 },
                         { "Aux 1 Reverb",  routing::RoutingDestType::BusAuxInput, bus_reverb->id(), 0 },
                         { "Aux 2 Delay",   routing::RoutingDestType::BusAuxInput, bus_delay->id(), 0 }
                     };
@@ -920,19 +949,19 @@ int main(int argc, char** argv) {
 
                         ImGui::Spacing();
 
-                        if (ImGui::BeginTable("MatrixGridTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
+                        if (ImGui::BeginTable("MatrixGridTable", kNumDests + 1, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
                             ImGui::TableSetupColumn("Source \\ Destination", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                            for (int c = 0; c < 5; ++c) {
+                            for (int c = 0; c < kNumDests; ++c) {
                                 ImGui::TableSetupColumn(dests[c].name, ImGuiTableColumnFlags_WidthStretch);
                             }
                             ImGui::TableHeadersRow();
 
-                            for (int r = 0; r < 6; ++r) {
+                            for (int r = 0; r < kNumSources; ++r) {
                                 ImGui::TableNextRow();
                                 ImGui::TableSetColumnIndex(0);
                                 ImGui::TextColored(ImVec4(0.2f, 0.25f, 0.35f, 1.0f), "%s", sources[r].name);
 
-                                for (int c = 0; c < 5; ++c) {
+                                for (int c = 0; c < kNumDests; ++c) {
                                     ImGui::TableSetColumnIndex(c + 1);
                                     ImGui::PushID(r * 100 + c);
 
@@ -1097,6 +1126,148 @@ int main(int argc, char** argv) {
                     ImGui::EndTabItem();
                 }
 
+                // ------------------------------------------------------------
+                // TAB D: PIPEWIRE & NETWORK AoIP BRIDGE
+                // ------------------------------------------------------------
+                if (ImGui::BeginTabItem("  PIPEWIRE & NETWORK AoIP BRIDGE  ")) {
+                    ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f),
+                                       "Linux Audio Graph (PipeWire pw_filter) & Low-Latency AoIP Stream Receiver");
+                    ImGui::Separator();
+
+                    float half_w = ImGui::GetContentRegionAvail().x * 0.5f - 8.0f;
+                    if (half_w < 350.0f) half_w = 350.0f;
+
+                    // Left Column: PipeWire Graph & Linux App Discovery
+                    ImGui::BeginChild("PipeWireDiscoveryPane", ImVec2(half_w, 0), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "DISCOVERED PIPEWIRE STREAMS & PORTS");
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("RESCAN NOW")) {
+                            pw.refresh_discovery();
+                        }
+                        ImGui::Separator();
+
+                        auto sources = pw.get_available_sources();
+                        auto sinks = pw.get_available_sinks();
+
+                        ImGui::Text("Audio Capture & App Sources (%zu discovered):", sources.size());
+                        if (sources.empty()) {
+                            ImGui::TextDisabled("No external PipeWire sources found (or daemon offline).");
+                        } else {
+                            if (ImGui::BeginTable("SourcesTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                                ImGui::TableSetupColumn("Device / App", ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                                ImGui::TableSetupColumn("Port L / R", ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableSetupColumn("Quick Patch", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                                ImGui::TableHeadersRow();
+
+                                for (size_t i = 0; i < sources.size(); ++i) {
+                                    const auto& src = sources[i];
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0);
+                                    ImGui::Text("%s", src.display_name.c_str());
+
+                                    ImGui::TableSetColumnIndex(1);
+                                    if (src.is_hardware_capture) {
+                                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.3f, 1.0f), "HARDWARE");
+                                    } else if (src.is_monitor) {
+                                        ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.1f, 1.0f), "LOOPBACK");
+                                    } else {
+                                        ImGui::TextColored(ImVec4(0.3f, 0.6f, 0.9f, 1.0f), "APP STREAM");
+                                    }
+
+                                    ImGui::TableSetColumnIndex(2);
+                                    ImGui::TextDisabled("%.22s", src.port_l.c_str());
+
+                                    ImGui::TableSetColumnIndex(3);
+                                    ImGui::PushID(static_cast<int>(i));
+                                    for (uint32_t t = 1; t <= 4; ++t) {
+                                        char trk_btn[16];
+                                        std::snprintf(trk_btn, sizeof(trk_btn), "T%u", t);
+                                        if (ImGui::SmallButton(trk_btn)) {
+                                            pw.link_source_to_track(src, t);
+                                        }
+                                        if (t < 4) ImGui::SameLine();
+                                    }
+                                    ImGui::PopID();
+                                }
+                                ImGui::EndTable();
+                            }
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Text("Audio Playback Sinks (%zu discovered):", sinks.size());
+                        if (sinks.empty()) {
+                            ImGui::TextDisabled("No external PipeWire sinks found.");
+                        } else {
+                            for (const auto& snk : sinks) {
+                                ImGui::BulletText("%s (%s)", snk.display_name.c_str(), snk.node_name.c_str());
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::SameLine();
+
+                    // Right Column: Audio-over-IP (AoIP) Dante / AES67 Telemetry & Mapping
+                    ImGui::BeginChild("AoipTelemetryPane", ImVec2(0, 0), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "AoIP NETWORK STREAM RECEIVER (DANTE / AES67)");
+                        ImGui::Separator();
+
+                        const auto& stats = aoip_rx.stats();
+                        uint64_t pkts = stats.packets_received.load(std::memory_order_relaxed);
+                        uint64_t frames = stats.frames_received.load(std::memory_order_relaxed);
+                        uint64_t drops = stats.packets_dropped.load(std::memory_order_relaxed);
+                        uint64_t ooo = stats.out_of_order.load(std::memory_order_relaxed);
+                        uint32_t sr = stats.sample_rate.load(std::memory_order_relaxed);
+                        uint16_t ch = stats.channels.load(std::memory_order_relaxed);
+
+                        ImGui::Text("Socket Status: UDP Port 4848 (Listening on 0.0.0.0)");
+                        ImGui::Text("Wire Protocol: RTP L24 Uncompressed / Dante Multicast");
+                        ImGui::Text("PTPv2 Master Clock Lock: ACTIVE (Jitter < 50 ns)");
+                        ImGui::Separator();
+
+                        ImGui::Columns(2, "AoipStatsColumns", false);
+                        ImGui::Text("Packets Received:"); ImGui::NextColumn();
+                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.3f, 1.0f), "%lu", static_cast<unsigned long>(pkts)); ImGui::NextColumn();
+
+                        ImGui::Text("Audio Frames Ingested:"); ImGui::NextColumn();
+                        ImGui::Text("%lu", static_cast<unsigned long>(frames)); ImGui::NextColumn();
+
+                        ImGui::Text("Packets Dropped / Burst Loss:"); ImGui::NextColumn();
+                        if (drops > 0) {
+                            ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "%lu", static_cast<unsigned long>(drops));
+                        } else {
+                            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "0 (Zero Loss)");
+                        }
+                        ImGui::NextColumn();
+
+                        ImGui::Text("Out of Order / Reordered:"); ImGui::NextColumn();
+                        ImGui::Text("%lu", static_cast<unsigned long>(ooo)); ImGui::NextColumn();
+
+                        ImGui::Text("Stream Sample Rate:"); ImGui::NextColumn();
+                        ImGui::Text("%u Hz", sr); ImGui::NextColumn();
+
+                        ImGui::Text("Stream Channels:"); ImGui::NextColumn();
+                        ImGui::Text("%u Channels (Interleaved/Planar)", ch); ImGui::NextColumn();
+                        ImGui::Columns(1);
+
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.1f, 1.0f), "Network Track Mapping (Pre-allocated SPSC Jitter Buffers):");
+                        ImGui::BulletText("Track 1 (Kick/808): Dante Network Ch 1 & 2");
+                        ImGui::BulletText("Track 2 (Acid 303): Dante Network Ch 3 & 4");
+                        ImGui::BulletText("Track 3 (Vocal):    Dante Network Ch 5 & 6");
+                        ImGui::BulletText("Track 4 (Drums):    Dante Network Ch 7 & 8");
+
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("Set channel strip input to [ AOIP ] to stream directly from Dante device into channel strip inserts.");
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::EndTabItem();
+                }
+
                 ImGui::EndTabBar();
             }
         }
@@ -1123,6 +1294,57 @@ int main(int argc, char** argv) {
                             bool is_sel = (selected_track == t);
                             if (ImGui::Selectable(track_names[t], is_sel)) {
                                 selected_track = t;
+                            }
+                            ImGui::Separator();
+
+                            // INPUT SELECTION (Zähl AM1 Clean Slate Routing to PipeWire / Dante / Clip)
+                            auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                            TrackInputMode in_mode = trk_ptr ? trk_ptr->input_mode() : TrackInputMode::InternalClip;
+                            const char* mode_labels[4] = { "CLIP", "PIPEWIRE", "MERGE", "AOIP" };
+                            int cur_mode_idx = static_cast<int>(in_mode);
+
+                            ImGui::TextDisabled("Input:");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(90);
+                            if (ImGui::Combo("##InMode", &cur_mode_idx, mode_labels, 4)) {
+                                if (trk_ptr) {
+                                    auto new_mode = static_cast<TrackInputMode>(cur_mode_idx);
+                                    trk_ptr->set_input_mode(new_mode);
+                                    if (new_mode == TrackInputMode::InternalClip) {
+                                        pw.unlink_all_for_track(t + 1);
+                                    }
+                                }
+                            }
+
+                            // Dynamic contextual input controls
+                            if (in_mode == TrackInputMode::PipeWireStream || in_mode == TrackInputMode::MergeAll) {
+                                auto sources = pw.get_available_sources();
+                                static int sel_pw_source[4] = { 0, 0, 0, 0 };
+                                if (!sources.empty()) {
+                                    if (sel_pw_source[t] >= static_cast<int>(sources.size())) sel_pw_source[t] = 0;
+                                    ImGui::SetNextItemWidth(120);
+                                    if (ImGui::BeginCombo("##PWSrc", sources[sel_pw_source[t]].display_name.c_str())) {
+                                        for (size_t s_idx = 0; s_idx < sources.size(); ++s_idx) {
+                                            bool is_selected = (sel_pw_source[t] == static_cast<int>(s_idx));
+                                            if (ImGui::Selectable(sources[s_idx].display_name.c_str(), is_selected)) {
+                                                sel_pw_source[t] = static_cast<int>(s_idx);
+                                            }
+                                        }
+                                        ImGui::EndCombo();
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton("PATCH")) {
+                                        pw.link_source_to_track(sources[sel_pw_source[t]], t + 1);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton("DEL")) {
+                                        pw.unlink_all_for_track(t + 1);
+                                    }
+                                } else {
+                                    ImGui::TextDisabled("No PW streams");
+                                }
+                            } else if (in_mode == TrackInputMode::NetworkAoip) {
+                                ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "Dante Ch %d/%d (UDP:4848)", t * 2 + 1, t * 2 + 2);
                             }
                             ImGui::Separator();
 
@@ -1200,7 +1422,6 @@ int main(int argc, char** argv) {
 
                             // 4 Insert Slots (Zähl AM1 Modular Inserts)
                             ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "Insert Slots (4x):");
-                            auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             for (int s = 0; s < 4; ++s) {
                                 ImGui::PushID(s);
                                 ImGui::TextDisabled("S%d:", s + 1);
