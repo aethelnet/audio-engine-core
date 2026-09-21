@@ -70,6 +70,7 @@ public:
         }
         m_clip.reset();
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
+        m_sync_to_transport.store(false, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
         m_active.store(true, std::memory_order_release);
@@ -87,6 +88,7 @@ public:
         }
         m_clip.reset();
         m_clip_playhead.store(0.0, std::memory_order_relaxed);
+        m_sync_to_transport.store(false, std::memory_order_relaxed);
         m_buffer.clear();
         reset_meters();
     }
@@ -219,6 +221,14 @@ public:
         m_clip_playhead.store(playhead, std::memory_order_relaxed);
     }
 
+    void set_sync_to_transport(bool sync) noexcept {
+        m_sync_to_transport.store(sync, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool sync_to_transport() const noexcept {
+        return m_sync_to_transport.load(std::memory_order_relaxed);
+    }
+
     void set_sequencer(std::shared_ptr<sequencer::StepSequencer> seq) noexcept {
         m_sequencer = std::move(seq);
         m_sequencer_enabled.store(m_sequencer != nullptr, std::memory_order_relaxed);
@@ -243,9 +253,14 @@ public:
         if (is_sequencer_enabled()) {
             m_sequencer->render(left, right, frames, clock, boundary_events);
         } else if (m_clip) {
-            double ph = m_clip_playhead.load(std::memory_order_relaxed);
-            m_clip->read_resampled(ph, clock.sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
-            m_clip_playhead.store(ph, std::memory_order_relaxed);
+            if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
+                std::memset(left, 0, frames * sizeof(Sample));
+                std::memset(right, 0, frames * sizeof(Sample));
+            } else {
+                double ph = m_clip_playhead.load(std::memory_order_relaxed);
+                m_clip->read_resampled(ph, clock.sample_rate(), left, right, frames, m_clip_loop.load(std::memory_order_relaxed));
+                m_clip_playhead.store(ph, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -342,6 +357,7 @@ private:
     std::shared_ptr<sampling::AudioClip> m_clip{nullptr};
     std::atomic<bool> m_clip_loop{true};
     std::atomic<double> m_clip_playhead{0.0};
+    std::atomic<bool> m_sync_to_transport{false};
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
@@ -570,6 +586,10 @@ public:
 
     [[nodiscard]] uint32_t sample_rate() const noexcept {
         return m_clock.sample_rate();
+    }
+
+    [[nodiscard]] uint32_t buffer_frames() const noexcept {
+        return m_buffer_frames;
     }
 
     void set_worker_threads(uint32_t num_threads) {

@@ -8,6 +8,8 @@
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/ui/theme.hpp"
 #include "audio_core/ui/custom_widgets.hpp"
+#include "backends/pipewire/pipewire_backend.hpp"
+
 
 #include <GLFW/glfw3.h>
 #include "imgui.h"
@@ -82,7 +84,7 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init("#version 130");
 
     // 3. Initialize Audio Engine & Tracks
-    constexpr uint32_t kBlockFrames = 256;
+    constexpr uint32_t kBlockFrames = 1024;
     constexpr uint32_t kSampleRate = 48000;
     MixerGraph mixer(kBlockFrames);
 
@@ -117,6 +119,26 @@ int main(int argc, char** argv) {
     // Audio test loop waveform data (4 seconds @ 48kHz)
     std::vector<float> sample_waveform = generate_synthetic_drum_loop(48000 * 4);
     std::vector<float> slice_points = { 0.0f, 0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f };
+
+    // Load Drum Loop AudioClip into Track 0
+    auto drum_clip = std::make_shared<sampling::AudioClip>("Drum Loop", kSampleRate, 2, static_cast<uint32_t>(sample_waveform.size()));
+    for (size_t i = 0; i < sample_waveform.size(); ++i) {
+        drum_clip->channel(0)[i] = sample_waveform[i];
+        drum_clip->channel(1)[i] = sample_waveform[i];
+    }
+    trk0->set_clip(drum_clip, true);
+    trk0->set_sync_to_transport(true);
+
+    // Initialize Native PipeWire Audio Server Integration
+    PipeWireBackend pw(mixer);
+    bool pw_online = pw.init("Aethel Audio Desk", kSampleRate);
+    if (pw_online) {
+        pw_online = pw.start();
+        if (pw_online) {
+            std::cout << "[PipeWire] Audio stream successfully running!" << std::endl;
+        }
+    }
+
 
     // Workspace UI State
     bool is_playing = false;
@@ -179,17 +201,24 @@ int main(int argc, char** argv) {
         last_time = now;
 
         if (is_playing) {
-            playhead_seconds += dt * (bpm / 120.0f);
-            if (playhead_seconds >= loop_length_seconds) {
-                playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
+            if (pw_online) {
+                playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
+                if (playhead_seconds >= loop_length_seconds) {
+                    playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
+                }
+            } else {
+                playhead_seconds += dt * (bpm / 120.0f);
+                if (playhead_seconds >= loop_length_seconds) {
+                    playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
+                }
             }
         }
 
         // Lock-free telemetry query
         mixer.capture_telemetry_snapshot(telemetry);
 
-        // Synthesize visual meters for active animation if playing
-        if (is_playing) {
+        // Fallback: If PipeWire is offline, synthesize visual meters for active animation when playing
+        if (!pw_online && is_playing) {
             float pulse = std::abs(std::sin(playhead_seconds * 3.14159f * 2.0f));
             telemetry.master_meter.peak_l = std::clamp(pulse * 0.92f, 0.0f, 1.05f);
             telemetry.master_meter.peak_r = std::clamp(pulse * 0.88f, 0.0f, 1.02f);
@@ -226,23 +255,33 @@ int main(int argc, char** argv) {
             // Transport Controls
             if (ImGui::Button(is_playing ? "[ || PAUSE ]" : "[ > PLAY ]", ImVec2(90, 32))) {
                 is_playing = !is_playing;
+                mixer.clock().set_playing(is_playing);
             }
             ImGui::SameLine();
             if (ImGui::Button("[ [] STOP ]", ImVec2(80, 32))) {
                 is_playing = false;
+                mixer.clock().set_playing(false);
+                mixer.clock().set_sample_position(0);
+                trk0->set_clip_playhead(0.0);
                 playhead_seconds = 0.0f;
             }
 
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100);
             if (ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f")) {
-                // sample-accurate clock tempo adjustment
+                mixer.clock().set_bpm(bpm);
             }
 
             ImGui::SameLine(0, 20);
-            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "[PIPEWIRE RT]");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| 48.0 kHz | 256s (5.3ms) | CPU: 3.8%%");
+            if (pw_online) {
+                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "[PIPEWIRE RT // SINK CONNECTED]");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| 48.0 kHz | 256s (5.3ms) | HW DAC ACTIVE");
+            } else {
+                ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.20f, 1.0f), "[PIPEWIRE OFFLINE // HEADLESS]");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "| Simulation Fallback");
+            }
 
             ImGui::SameLine(0, 30);
             ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MASTER:");

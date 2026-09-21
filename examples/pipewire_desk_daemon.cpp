@@ -27,7 +27,7 @@ int main() {
     std::cout << "  AETHEL PIPEWIRE MULTITRACK CONSOLE DESK (AIRWINDOWS DSP)" << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    constexpr uint32_t kFrames = 256;
+    constexpr uint32_t kFrames = 1024;
     constexpr uint32_t kSampleRate = 48000;
 
     audio_core::MixerGraph mixer(kFrames);

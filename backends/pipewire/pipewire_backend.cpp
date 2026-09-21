@@ -10,6 +10,9 @@
 #include <array>
 #include <cstring>
 #include <atomic>
+#include <thread>
+#include <chrono>
+#include <cstdio>
 
 namespace audio_core {
 
@@ -48,6 +51,9 @@ struct PipeWireBackend::Impl {
             n_samples = 1024;
         }
 
+        const uint32_t engine_max = self->mixer.buffer_frames();
+        const uint32_t frames_to_process = std::min(n_samples, engine_max);
+
         // 1. Pull audio from Virtual Input Sinks (external apps patched into tracks)
         for (size_t i = 0; i < MixerGraph::kMaxTracks; ++i) {
             auto* track = self->mixer.get_track(static_cast<uint32_t>(i + 1));
@@ -60,25 +66,24 @@ struct PipeWireBackend::Impl {
                 const auto* src_l = static_cast<const float*>(pw_filter_get_dsp_buffer(ports.port_in_l, n_samples));
                 const auto* src_r = static_cast<const float*>(pw_filter_get_dsp_buffer(ports.port_in_r, n_samples));
 
-                Sample* dst_l = track->buffer().view().channel(0);
-                Sample* dst_r = track->buffer().view().channel(1);
+                // Only copy if external ports are actively providing buffers
+                if (src_l || src_r) {
+                    Sample* dst_l = track->buffer().view().channel(0);
+                    Sample* dst_r = track->buffer().view().channel(1);
+                    uint32_t track_max = std::min(frames_to_process, track->buffer().num_frames());
 
-                if (src_l) {
-                    std::memcpy(dst_l, src_l, n_samples * sizeof(float));
-                } else {
-                    std::memset(dst_l, 0, n_samples * sizeof(float));
-                }
-
-                if (src_r) {
-                    std::memcpy(dst_r, src_r, n_samples * sizeof(float));
-                } else {
-                    std::memset(dst_r, 0, n_samples * sizeof(float));
+                    if (src_l) {
+                        std::memcpy(dst_l, src_l, track_max * sizeof(float));
+                    }
+                    if (src_r) {
+                        std::memcpy(dst_r, src_r, track_max * sizeof(float));
+                    }
                 }
             }
         }
 
         // 2. Execute Real-Time Channel Strips, Inserts, DAG Submixes & Master Summing
-        auto master_view = self->master_buffer.view_frames(n_samples);
+        auto master_view = self->master_buffer.view_frames(frames_to_process);
         self->mixer.render(master_view);
 
         // 3. Push Master Output to PipeWire Master Out Ports
@@ -90,10 +95,16 @@ struct PipeWireBackend::Impl {
             const Sample* m_r = master_view.channel(1);
 
             if (dst_l) {
-                std::memcpy(dst_l, m_l, n_samples * sizeof(float));
+                std::memcpy(dst_l, m_l, frames_to_process * sizeof(float));
+                if (n_samples > frames_to_process) {
+                    std::memset(dst_l + frames_to_process, 0, (n_samples - frames_to_process) * sizeof(float));
+                }
             }
             if (dst_r) {
-                std::memcpy(dst_r, m_r, n_samples * sizeof(float));
+                std::memcpy(dst_r, m_r, frames_to_process * sizeof(float));
+                if (n_samples > frames_to_process) {
+                    std::memset(dst_r + frames_to_process, 0, (n_samples - frames_to_process) * sizeof(float));
+                }
             }
         }
     }
@@ -175,7 +186,7 @@ bool PipeWireBackend::init(const std::string& node_name, uint32_t sample_rate) {
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     struct spa_audio_info_dsp info{};
-    info.format = SPA_AUDIO_FORMAT_F32;
+    info.format = SPA_AUDIO_FORMAT_DSP_F32;
     const struct spa_pod* params[1];
     params[0] = spa_format_audio_dsp_build(&b, SPA_PARAM_EnumFormat, &info);
 
@@ -237,6 +248,35 @@ bool PipeWireBackend::start() {
     }
 
     m_impl->running.store(true, std::memory_order_relaxed);
+
+    // Auto-connect Master Output to system physical playback sinks in background
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        FILE* fp = popen("pw-link -i", "r");
+        if (!fp) return;
+        char line[256];
+        std::string sink_l, sink_r;
+        while (fgets(line, sizeof(line), fp)) {
+            std::string s(line);
+            if (!s.empty() && s.back() == '\n') s.pop_back();
+            if (s.find("playback_FL") != std::string::npos || s.find("playback_0") != std::string::npos || s.find("playback_1") != std::string::npos) {
+                if (sink_l.empty()) sink_l = s;
+            } else if (s.find("playback_FR") != std::string::npos || s.find("playback_2") != std::string::npos) {
+                if (sink_r.empty()) sink_r = s;
+            }
+        }
+        pclose(fp);
+
+        if (!sink_l.empty()) {
+            std::string cmd = "pw-link \"aethel_mixer_graph:Master Out L\" \"" + sink_l + "\" 2>/dev/null";
+            (void)system(cmd.c_str());
+        }
+        if (!sink_r.empty()) {
+            std::string cmd = "pw-link \"aethel_mixer_graph:Master Out R\" \"" + sink_r + "\" 2>/dev/null";
+            (void)system(cmd.c_str());
+        }
+    }).detach();
+
     return true;
 }
 
