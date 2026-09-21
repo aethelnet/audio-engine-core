@@ -1244,7 +1244,7 @@ int main(int argc, char** argv) {
                     };
 
                     constexpr int kNumSources = 8;
-                    constexpr int kNumDests = 6;
+                    constexpr int kNumDests = 10;
 
                     const MatrixSource sources[kNumSources] = {
                         { "Trk 1: Kick/808", routing::RoutingSourceType::TrackAudio, trk0->id() },
@@ -1263,7 +1263,11 @@ int main(int argc, char** argv) {
                         { "Trk 3 SC",      routing::RoutingDestType::TrackSidechain, trk2->id(), 0 },
                         { "Trk 4 SC",      routing::RoutingDestType::TrackSidechain, trk3->id(), 0 },
                         { "Aux 1 Reverb",  routing::RoutingDestType::BusAuxInput, bus_reverb->id(), 0 },
-                        { "Aux 2 Delay",   routing::RoutingDestType::BusAuxInput, bus_delay->id(), 0 }
+                        { "Aux 2 Delay",   routing::RoutingDestType::BusAuxInput, bus_delay->id(), 0 },
+                        { "Trk 1 AudioIn", routing::RoutingDestType::TrackAudioInput, trk0->id(), 0 },
+                        { "Trk 2 AudioIn", routing::RoutingDestType::TrackAudioInput, trk1->id(), 0 },
+                        { "Trk 4 DrumBus", routing::RoutingDestType::TrackAudioInput, trk3->id(), 0 },
+                        { "AoIP Tx 1-2",   routing::RoutingDestType::NetworkAoipSink, 0, 0 }
                     };
 
                     float left_w = ImGui::GetContentRegionAvail().x - 330.0f;
@@ -1279,20 +1283,22 @@ int main(int argc, char** argv) {
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("+ Vocal->Reverb")) {
-                            routing::RoutingPatch p{};
-                            p.source_type = routing::RoutingSourceType::TrackAudio;
-                            p.source_id = trk2->id();
-                            p.dest_type = routing::RoutingDestType::BusAuxInput;
-                            p.dest_id = bus_reverb->id();
-                            p.tap_point = routing::TapPoint::PostInsert;
-                            p.conditioning.gain = 0.5f;
-                            p.tag = "Vocal -> Aux 1 Reverb";
-                            int32_t pid = mixer.add_route(p);
+                            int32_t pid = mixer.connect_aux_send(trk2->id(), bus_reverb->id(), 0.5f, routing::TapPoint::PostInsert);
+                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("+ Kick->DrumBus")) {
+                            int32_t pid = mixer.connect_track_audio(trk0->id(), trk3->id(), 1.0f, routing::TapPoint::Input);
                             if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("+ Dante Ch1->Trk3")) {
                             int32_t pid = mixer.connect_network_sidechain(0, trk2->id(), 0, 1.0f);
+                            if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("+ Master->AoIP Tx")) {
+                            int32_t pid = mixer.connect_aoip_transmit(0, true, 0, routing::RouteChannel::StereoBoth);
                             if (pid > 0) selected_patch_id = static_cast<uint32_t>(pid);
                         }
                         ImGui::SameLine();

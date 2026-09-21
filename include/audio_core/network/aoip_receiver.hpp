@@ -63,6 +63,10 @@ public:
     }
 
     ~AoipReceiver() {
+        close();
+    }
+
+    void close() noexcept {
         stop();
         close_socket();
     }

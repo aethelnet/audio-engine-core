@@ -5430,6 +5430,122 @@ void test_ptp_boundary_clock_and_master_sync_daemon() {
               << "PI Servo sub-microsecond lock verified | Socket loopback & timestamping engine verified)" << std::endl;
 }
 
+void test_universal_routing_matrix_audio_and_aoip_transmission() {
+    std::cout << "[TEST] Running Universal Routing Matrix Audio Busing, Aux Summing & AoIP Transmit Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::routing;
+    using namespace audio_core::network;
+
+    constexpr uint32_t kFrames = 512;
+    MixerGraph mixer(kFrames);
+    mixer.clock().set_sample_rate(48000);
+    mixer.clock().set_bpm(120.0);
+    mixer.clock().set_playing(true);
+
+    // 1. Setup Tracks: Track 1 (Kick), Track 2 (Vocal), Track 3 (Submix Destination)
+    Track* trk1 = mixer.add_track("Kick");
+    Track* trk2 = mixer.add_track("Vocal");
+    Track* trk3 = mixer.add_track("StemSubmix");
+    TEST_CHECK(trk1 != nullptr && trk2 != nullptr && trk3 != nullptr);
+
+    // Submix Aux Bus (e.g. Reverb)
+    AudioBus* aux_reverb = mixer.add_submix_bus("AuxReverb");
+    TEST_CHECK(aux_reverb != nullptr);
+
+    // Populate Track 1 with a looping clip (100Hz sine)
+    auto clip1 = std::make_shared<sampling::AudioClip>("KickClip", 48000, 2, kFrames * 4);
+    for (uint32_t i = 0; i < kFrames * 4; ++i) {
+        float val = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 100.0f * static_cast<float>(i) / 48000.0f);
+        clip1->channel(0)[i] = val;
+        clip1->channel(1)[i] = val;
+    }
+    trk1->set_clip(clip1, true);
+
+    // Populate Track 2 with a looping clip (440Hz sine)
+    auto clip2 = std::make_shared<sampling::AudioClip>("VocalClip", 48000, 2, kFrames * 4);
+    for (uint32_t i = 0; i < kFrames * 4; ++i) {
+        float val = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / 48000.0f);
+        clip2->channel(0)[i] = val;
+        clip2->channel(1)[i] = val;
+    }
+    trk2->set_clip(clip2, true);
+
+    // 2. Test BusAuxInput Routing: Route Track 2 (Vocal) -> AuxReverb with gain 0.5f
+    int32_t r_aux = mixer.connect_aux_send(trk2->id(), aux_reverb->id(), 0.5f, TapPoint::PostInsert, RouteChannel::StereoBoth);
+    TEST_CHECK(r_aux > 0);
+
+    // 3. Test TrackAudioInput: Route Track 1 (Kick) -> Track 3 (StemSubmix) with gain 1.0f
+    int32_t r_trk = mixer.connect_track_audio(trk1->id(), trk3->id(), 1.0f, TapPoint::Input, RouteChannel::StereoBoth);
+    TEST_CHECK(r_trk > 0);
+
+    // 4. Test AoIP Transmit Routing: Route Track 1 -> AoIP Network Channel 0 & 1
+    int32_t r_tx = mixer.connect_aoip_transmit(trk1->id(), false, 0, RouteChannel::StereoBoth);
+    TEST_CHECK(r_tx > 0);
+
+    // Set up AoIP Receiver on loopback port 16888 and open Transmitter to it
+    AoipReceiver receiver(16888);
+    TEST_CHECK(receiver.bind_port(16888, "127.0.0.1"));
+
+    AoipTransmitter tx;
+    TEST_CHECK(tx.open("127.0.0.1", 16888));
+    mixer.set_aoip_transmitter(&tx);
+    TEST_CHECK(mixer.aoip_transmitter() == &tx);
+
+    // Render block
+    AudioBuffer master_out(2, kFrames);
+    auto view = master_out.view();
+    mixer.render(view);
+
+    // Verify BusAuxInput: AuxReverb should contain Vocal audio scaled by 0.5
+    float aux_rms = 0.0f;
+    const float* aux_l = aux_reverb->buffer().view().channel(0);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        aux_rms += aux_l[i] * aux_l[i];
+    }
+    aux_rms = std::sqrt(aux_rms / kFrames);
+    TEST_CHECK(aux_rms > 0.15f && aux_rms < 0.25f);
+
+    // Verify TrackAudioInput: Track 3 should contain Kick audio
+    float trk3_rms = 0.0f;
+    const float* trk3_l = trk3->buffer().view().channel(0);
+    for (uint32_t i = 0; i < kFrames; ++i) {
+        trk3_rms += trk3_l[i] * trk3_l[i];
+    }
+    trk3_rms = std::sqrt(trk3_rms / kFrames);
+    TEST_CHECK(trk3_rms > 0.40f && trk3_rms < 0.70f);
+
+    // Verify AoIP Transmission over loopback
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    uint32_t pkts = receiver.poll_available_packets();
+    TEST_CHECK(pkts >= 1);
+    TEST_CHECK(receiver.stats().packets_received.load() >= 1);
+
+    // 5. Test Cyclic Routing & Z^-1 Feedback Decoupling
+    // Track 1 -> Track 3 (already connected)
+    // Now connect Track 3 -> Track 1: forms cycle Track 1 <-> Track 3
+    int32_t r_cycle = mixer.connect_track_audio(trk3->id(), trk1->id(), 0.5f, TapPoint::PostInsert, RouteChannel::StereoBoth);
+    TEST_CHECK(r_cycle > 0);
+
+    auto* patch_cycle = mixer.routing_matrix().get_patch(static_cast<uint32_t>(r_cycle));
+    TEST_CHECK(patch_cycle != nullptr);
+    TEST_CHECK(patch_cycle->is_feedback);
+
+    // Render 4 blocks through cycle to ensure Z^-1 stability without explosion
+    for (int b = 0; b < 4; ++b) {
+        mixer.render(view);
+    }
+    TEST_CHECK(!std::isnan(trk1->buffer().view().channel(0)[0]));
+    TEST_CHECK(!std::isinf(trk1->buffer().view().channel(0)[0]));
+
+    tx.close();
+    receiver.close();
+
+    std::cout << "  -> Universal Routing Matrix Audio & AoIP Transmission: PASSED ("
+              << "BusAuxInput RMS=" << aux_rms << " | TrackAudioInput RMS=" << trk3_rms
+              << " | AoIP Pkts=" << receiver.stats().packets_received.load()
+              << " | Cyclic Feedback Z^-1 Decoupled & A-Stable)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -5480,6 +5596,7 @@ int main() {
     test_sample_tap_quantized_bounce_and_commit();
     test_step_sequencer_midi_pattern_clips_and_arranger();
     test_ptp_boundary_clock_and_master_sync_daemon();
+    test_universal_routing_matrix_audio_and_aoip_transmission();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

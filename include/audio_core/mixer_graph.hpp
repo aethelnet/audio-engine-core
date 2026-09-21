@@ -8,6 +8,7 @@
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/sampling/sample_tap.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
+#include "audio_core/network/aoip_transmitter.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
@@ -718,6 +719,59 @@ public:
         return m_routing_matrix.add_patch(p);
     }
 
+    int32_t connect_aux_send(uint32_t src_track_id, uint32_t dst_bus_id, float send_gain = 1.0f,
+                             routing::TapPoint tap = routing::TapPoint::PostInsert,
+                             routing::RouteChannel channel = routing::RouteChannel::StereoBoth) noexcept {
+        routing::RoutingPatch p{};
+        p.source_type = routing::RoutingSourceType::TrackAudio;
+        p.source_id = src_track_id;
+        p.tap_point = tap;
+        p.source_channel = channel;
+        p.dest_type = routing::RoutingDestType::BusAuxInput;
+        p.dest_id = dst_bus_id;
+        p.dest_channel = channel;
+        p.conditioning.filter_mode = routing::ConditionerFilterMode::Bypass;
+        p.conditioning.gain = send_gain;
+        return m_routing_matrix.add_patch(p);
+    }
+
+    int32_t connect_track_audio(uint32_t src_track_id, uint32_t dst_track_id, float gain = 1.0f,
+                                routing::TapPoint tap = routing::TapPoint::Input,
+                                routing::RouteChannel channel = routing::RouteChannel::StereoBoth) noexcept {
+        routing::RoutingPatch p{};
+        p.source_type = routing::RoutingSourceType::TrackAudio;
+        p.source_id = src_track_id;
+        p.tap_point = tap;
+        p.source_channel = channel;
+        p.dest_type = routing::RoutingDestType::TrackAudioInput;
+        p.dest_id = dst_track_id;
+        p.dest_channel = channel;
+        p.conditioning.filter_mode = routing::ConditionerFilterMode::Bypass;
+        p.conditioning.gain = gain;
+        return m_routing_matrix.add_patch(p);
+    }
+
+    int32_t connect_aoip_transmit(uint32_t src_track_or_bus_id, bool is_bus, uint16_t dst_tx_channel,
+                                  routing::RouteChannel channel = routing::RouteChannel::StereoBoth) noexcept {
+        routing::RoutingPatch p{};
+        p.source_type = is_bus ? routing::RoutingSourceType::BusAudio : routing::RoutingSourceType::TrackAudio;
+        p.source_id = src_track_or_bus_id;
+        p.tap_point = routing::TapPoint::PostInsert;
+        p.source_channel = channel;
+        p.dest_type = routing::RoutingDestType::NetworkAoipSink;
+        p.dest_id = dst_tx_channel;
+        p.dest_channel = channel;
+        p.conditioning.filter_mode = routing::ConditionerFilterMode::Bypass;
+        p.conditioning.gain = 1.0f;
+        return m_routing_matrix.add_patch(p);
+    }
+
+    void set_aoip_transmitter(network::AoipTransmitter* transmitter) noexcept {
+        m_aoip_transmitter = transmitter;
+    }
+    [[nodiscard]] network::AoipTransmitter* aoip_transmitter() noexcept { return m_aoip_transmitter; }
+    [[nodiscard]] const network::AoipTransmitter* aoip_transmitter() const noexcept { return m_aoip_transmitter; }
+
     void feed_dante_channel(uint16_t channel, const float* samples, uint32_t frames) noexcept {
         m_routing_matrix.feed_network_channel(channel, samples, frames);
     }
@@ -1115,7 +1169,7 @@ public:
             }
         }
 
-        // Phase 3b: Evaluate Pre-Insert / Input tap routes (e.g. Track 2 Lowpass Sidechain)
+        // Phase 3b: Evaluate Pre-Insert / Input tap routes (e.g. Track 2 Lowpass Sidechain / Track Audio In)
         for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
             const auto& patch = m_routing_matrix.patches()[r];
             if (!patch.active) continue;
@@ -1126,6 +1180,26 @@ public:
                     const Sample* in_l = src_trk->buffer().view().channel(0);
                     const Sample* in_r = src_trk->buffer().view().channel(1);
                     m_routing_matrix.process_route(r, in_l, in_r, frames);
+                }
+            }
+        }
+
+        // Phase 3b2: Accumulate matrix-routed audio input (TrackAudioInput)
+        for (auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            if (m_routing_matrix.has_track_input(track->id())) {
+                const float* in_l = m_routing_matrix.track_input_l(track->id());
+                const float* in_r = m_routing_matrix.track_input_r(track->id());
+                Sample* raw_l = track->buffer().view().channel(0);
+                Sample* raw_r = track->buffer().view().channel(1);
+                if (!track->has_clip() && !track->is_sequencer_enabled() && track->input_mode() != TrackInputMode::MergeAll) {
+                    std::copy_n(in_l, frames, raw_l);
+                    std::copy_n(in_r, frames, raw_r);
+                } else {
+                    for (uint32_t i = 0; i < frames; ++i) {
+                        raw_l[i] += in_l[i];
+                        raw_r[i] += in_r[i];
+                    }
                 }
             }
         }
@@ -1272,11 +1346,32 @@ public:
                 continue;
             }
 
+            // Accumulate matrix-routed aux input (BusAuxInput)
+            if (m_routing_matrix.has_bus_aux(bus->id())) {
+                const float* aux_l = m_routing_matrix.bus_aux_l(bus->id());
+                const float* aux_r = m_routing_matrix.bus_aux_r(bus->id());
+                Sample* dst_l = bus->buffer().view().channel(0);
+                Sample* dst_r = bus->buffer().view().channel(1);
+                for (uint32_t i = 0; i < frames; ++i) {
+                    dst_l[i] += aux_l[i];
+                    dst_r[i] += aux_r[i];
+                }
+            }
+
             bus->process_buss_strip(frames, &m_routing_matrix);
 
             const float bus_gain = bus->gain();
             const Sample* b_l = bus->buffer().view().channel(0);
             const Sample* b_r = bus->buffer().view().channel(1);
+
+            // Evaluate routes with BusAudio as source (Submix Bus)
+            for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
+                const auto& patch = m_routing_matrix.patches()[r];
+                if (!patch.active) continue;
+                if (patch.source_type == routing::RoutingSourceType::BusAudio && patch.source_id == bus->id()) {
+                    m_routing_matrix.process_route(r, b_l, b_r, frames);
+                }
+            }
 
             // Tap Submix Bus output (e.g. processed drum bus bounce!)
             for (auto& tap : m_taps) {
@@ -1327,6 +1422,16 @@ public:
         const Sample* final_l = m_master_bus.buffer().view().channel(0);
         const Sample* final_r = m_master_bus.buffer().view().channel(1);
 
+        // Evaluate routes with BusAudio as source for Master Bus
+        for (size_t r = 0; r < routing::UniversalRoutingMatrix::kMaxRoutes; ++r) {
+            const auto& patch = m_routing_matrix.patches()[r];
+            if (!patch.active) continue;
+            if (patch.source_type == routing::RoutingSourceType::BusAudio &&
+                (patch.source_id == 0 || static_cast<int32_t>(patch.source_id) == kStereoMasterBusId)) {
+                m_routing_matrix.process_route(r, final_l, final_r, frames);
+            }
+        }
+
         // Tap Master Output (full mix bounce)
         for (auto& tap : m_taps) {
             if (tap && tap->is_active()) {
@@ -1364,6 +1469,25 @@ public:
 
         // Update Kinetic ODE & Airwindows Hit Record Meter on Master Output
         m_kinetic_meter.process_block(out_l, (out_master.num_channels() > 1 ? out_r : out_l), frames);
+
+        // 6. Network AoIP Transmitter Egress (Broadcast active matrix channels to network)
+        if (m_aoip_transmitter && m_aoip_transmitter->is_open()) {
+            uint16_t highest_ch = 0;
+            bool has_tx = false;
+            for (uint16_t ch = 0; ch < routing::UniversalRoutingMatrix::kMaxNetworkChannels; ++ch) {
+                if (m_routing_matrix.has_network_tx(ch)) {
+                    highest_ch = ch + 1;
+                    has_tx = true;
+                }
+            }
+            if (has_tx && highest_ch > 0) {
+                const float* channel_ptrs[routing::UniversalRoutingMatrix::kMaxNetworkChannels]{};
+                for (uint16_t ch = 0; ch < highest_ch; ++ch) {
+                    channel_ptrs[ch] = m_routing_matrix.network_tx_channel(ch);
+                }
+                m_aoip_transmitter->send_multichannel(channel_ptrs, highest_ch, static_cast<uint16_t>(frames), m_clock.sample_rate(), true);
+            }
+        }
     }
 
     void drain_commands() noexcept {
@@ -1581,6 +1705,7 @@ private:
     threading::AudioWorkerPool m_worker_pool;
     routing::UniversalRoutingMatrix m_routing_matrix;
     dsp::KineticMeter m_kinetic_meter{48000};
+    network::AoipTransmitter* m_aoip_transmitter{nullptr};
 };
 
 } // namespace audio_core
