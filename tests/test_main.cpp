@@ -47,6 +47,7 @@
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/sampling/wsola_streamer.hpp"
 #include "audio_core/sampling/disk_streamer.hpp"
+#include "audio_core/sampling/waveform_overview.hpp"
 #include "audio_core/engine.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/network/websocket_bridge.hpp"
@@ -7939,6 +7940,203 @@ void test_faster_than_realtime_offline_wav_bounce() {
     std::remove(test_wav_path.c_str());
 }
 
+void test_waveform_overview_and_long_stem_mipmapping() {
+    std::cout << "[TEST] Running Waveform Overview & Long Stem Multi-Resolution Peak Mipmapping Test..." << std::endl;
+
+    // 1. Axiomatic Mathematical Reduction Verification
+    // Create a deterministic 256-sample buffer with specific peaks and known RMS
+    std::vector<float> test_ch(256, 0.0f);
+    // Block 0 (frames 0..63): positive impulse peak +0.8f at frame 10, negative -0.4f at frame 20
+    test_ch[10] = 0.8f;
+    test_ch[20] = -0.4f;
+    // Block 1 (frames 64..127): square wave +/-0.5f
+    for (int i = 64; i < 128; ++i) {
+        test_ch[i] = (i % 2 == 0) ? 0.5f : -0.5f;
+    }
+    // Block 2 (frames 128..191): silence 0.0f
+    // Block 3 (frames 192..255): negative spike -0.95f at frame 210, positive +0.95f at 220
+    test_ch[210] = -0.95f;
+    test_ch[220] = 0.95f;
+
+    audio_core::sampling::WaveformOverview overview;
+    std::vector<std::vector<float>> ch_data = {test_ch};
+    bool ok = overview.build_synchronous(ch_data, 48000);
+    TEST_CHECK(ok);
+    TEST_CHECK(overview.is_ready());
+    TEST_CHECK(overview.total_frames() == 256);
+    TEST_CHECK(overview.num_channels() == 1);
+    TEST_CHECK(overview.sample_rate() == 48000);
+
+    // Verify Level 0 (1:64) has 4 blocks
+    TEST_CHECK(overview.num_peaks(0, 0) == 4);
+    const auto& l0 = overview.peaks(0, 0);
+    TEST_CHECK(std::abs(l0[0].max_val - 0.8f) < 1e-6f);
+    TEST_CHECK(std::abs(l0[0].min_val - (-0.4f)) < 1e-6f);
+    TEST_CHECK(std::abs(l0[1].max_val - 0.5f) < 1e-6f);
+    TEST_CHECK(std::abs(l0[1].min_val - (-0.5f)) < 1e-6f);
+    TEST_CHECK(std::abs(l0[1].rms - 0.5f) < 1e-4f); // Square wave RMS = amplitude
+    TEST_CHECK(std::abs(l0[2].max_val - 0.0f) < 1e-6f);
+    TEST_CHECK(std::abs(l0[2].min_val - 0.0f) < 1e-6f);
+    TEST_CHECK(std::abs(l0[3].max_val - 0.95f) < 1e-6f);
+    TEST_CHECK(std::abs(l0[3].min_val - (-0.95f)) < 1e-6f);
+
+    // Verify Level 1 (1:256) has 1 block combining all 4 Level 0 blocks
+    TEST_CHECK(overview.num_peaks(0, 1) == 1);
+    const auto& l1 = overview.peaks(0, 1);
+    TEST_CHECK(std::abs(l1[0].max_val - 0.95f) < 1e-6f);
+    TEST_CHECK(std::abs(l1[0].min_val - (-0.95f)) < 1e-6f);
+    std::cout << "  -> Multi-Scale Pyramid Reduction & Exact Extrema: PASSED (L0: 4 peaks, L1: 1 peak, Extrema [-0.95, +0.95] strictly preserved)" << std::endl;
+
+    // 2. Multi-Minute Long Stem Simulation & High-Speed Build
+    // Simulate a 5-minute stereo audio stem: 5 * 60 * 48000 = 14,400,000 frames
+    const uint64_t stem_frames = 48000 * 300; // 5 minutes
+    std::vector<std::vector<float>> stem_ch(2);
+    stem_ch[0].resize(stem_frames);
+    stem_ch[1].resize(stem_frames);
+
+    // Populate with periodic bursts & transients
+    for (uint64_t f = 0; f < stem_frames; ++f) {
+        float t = static_cast<float>(f) / 48000.0f;
+        float base_tone = 0.3f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * t);
+        // Inject a snare/transient spike every 1 second
+        if (f % 48000 == 0) {
+            base_tone = 0.98f;
+        } else if (f % 48000 == 24000) {
+            base_tone = -0.92f;
+        }
+        stem_ch[0][f] = base_tone;
+        stem_ch[1][f] = base_tone * 0.85f;
+    }
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    audio_core::sampling::WaveformOverview stem_overview;
+    bool stem_ok = stem_overview.build_synchronous(stem_ch, 48000);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double build_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+
+    TEST_CHECK(stem_ok);
+    TEST_CHECK(stem_overview.is_ready());
+    TEST_CHECK(stem_overview.total_frames() == stem_frames);
+    TEST_CHECK(stem_overview.num_channels() == 2);
+
+    // Verify all 6 mipmap level reductions
+    // Level 0 (1:64): 14,400,000 / 64 = 225,000
+    // Level 1 (1:256): 225,000 / 4 = 56,250
+    // Level 2 (1:1024): 56,250 / 4 = 14,063
+    // Level 3 (1:4096): 14,063 / 4 = 3,516
+    // Level 4 (1:16384): 3,516 / 4 = 879
+    // Level 5 (1:65536): 879 / 4 = 220
+    TEST_CHECK(stem_overview.num_peaks(0, 0) == 225000);
+    TEST_CHECK(stem_overview.num_peaks(0, 1) == 56250);
+    TEST_CHECK(stem_overview.num_peaks(0, 2) == 14063);
+    TEST_CHECK(stem_overview.num_peaks(0, 3) == 3516);
+    TEST_CHECK(stem_overview.num_peaks(0, 4) == 879);
+    TEST_CHECK(stem_overview.num_peaks(0, 5) == 220);
+
+    std::cout << "  -> 5-Minute Stereo Stem Mipmap Pyramid Built in " << build_ms << " ms (L0: "
+              << stem_overview.num_peaks(0, 0) << " peaks -> L5: "
+              << stem_overview.num_peaks(0, 5) << " peaks)" << std::endl;
+
+    // 3. O(W) Viewport Querying Across Multiple Zoom Scales
+    constexpr size_t kViewportWidth = 1024; // 1024 pixel wide display
+    std::vector<audio_core::sampling::ViewportPeak> viewport_peaks;
+
+    // Zoom Level A: Whole Song Overview (0 to 14,400,000 frames)
+    auto q_start = std::chrono::high_resolution_clock::now();
+    stem_overview.query_peaks(0, 0, stem_frames, kViewportWidth, viewport_peaks);
+    auto q_end = std::chrono::high_resolution_clock::now();
+    double q_us_song = std::chrono::duration<double, std::micro>(q_end - q_start).count();
+
+    TEST_CHECK(viewport_peaks.size() == kViewportWidth);
+    // Across the whole song, maximum transients (+0.98f) must be caught without omission!
+    float song_max = -1.0f;
+    float song_min = 1.0f;
+    for (const auto& p : viewport_peaks) {
+        if (p.max_val > song_max) song_max = p.max_val;
+        if (p.min_val < song_min) song_min = p.min_val;
+    }
+    TEST_CHECK(std::abs(song_max - 0.98f) < 1e-4f);
+    TEST_CHECK(std::abs(song_min - (-0.92f)) < 1e-4f);
+
+    // Zoom Level B: 4-Bar Zoom (e.g. 96,000 frames)
+    q_start = std::chrono::high_resolution_clock::now();
+    stem_overview.query_peaks(0, 48000, 48000 + 96000, kViewportWidth, viewport_peaks);
+    q_end = std::chrono::high_resolution_clock::now();
+    double q_us_bars = std::chrono::duration<double, std::micro>(q_end - q_start).count();
+
+    TEST_CHECK(viewport_peaks.size() == kViewportWidth);
+
+    // Zoom Level C: Sub-Beat Zoom (<64 frames per pixel, e.g. 2,048 frames = 2 frames/pixel)
+    q_start = std::chrono::high_resolution_clock::now();
+    stem_overview.query_peaks(0, 48000, 48000 + 2048, kViewportWidth, viewport_peaks);
+    q_end = std::chrono::high_resolution_clock::now();
+    double q_us_beat = std::chrono::duration<double, std::micro>(q_end - q_start).count();
+
+    TEST_CHECK(viewport_peaks.size() == kViewportWidth);
+    std::cout << "  -> O(W) Viewport Query Performance: PASSED (Whole Song: " << q_us_song
+              << " us | 4-Bar Zoom: " << q_us_bars
+              << " us | Sub-Beat Zoom: " << q_us_beat << " us | Transients [-0.92, +0.98] captured)" << std::endl;
+
+    // 4. Binary Overview File (.aov) Persistence Roundtrip
+    const std::string aov_test_file = "/tmp/aethel_test_stem.aov";
+    bool save_ok = stem_overview.save_to_file(aov_test_file);
+    TEST_CHECK(save_ok);
+
+    audio_core::sampling::WaveformOverview reloaded_overview;
+    bool load_ok = reloaded_overview.load_from_file(aov_test_file);
+    TEST_CHECK(load_ok);
+    TEST_CHECK(reloaded_overview.is_ready());
+    TEST_CHECK(reloaded_overview.total_frames() == stem_overview.total_frames());
+    TEST_CHECK(reloaded_overview.sample_rate() == stem_overview.sample_rate());
+    TEST_CHECK(reloaded_overview.num_channels() == stem_overview.num_channels());
+
+    // Verify all peaks across all 6 levels match bit-exact
+    for (size_t lvl = 0; lvl < audio_core::sampling::WaveformOverview::kNumLevels; ++lvl) {
+        TEST_CHECK(reloaded_overview.num_peaks(0, lvl) == stem_overview.num_peaks(0, lvl));
+        const auto& orig = stem_overview.peaks(0, lvl);
+        const auto& loaded = reloaded_overview.peaks(0, lvl);
+        for (size_t i = 0; i < orig.size(); ++i) {
+            TEST_CHECK(orig[i].min_val == loaded[i].min_val);
+            TEST_CHECK(orig[i].max_val == loaded[i].max_val);
+            TEST_CHECK(orig[i].rms == loaded[i].rms);
+        }
+    }
+    std::remove(aov_test_file.c_str());
+    std::cout << "  -> Binary (.aov) Overview Disk Serialization & Bit-Exact Reload: PASSED" << std::endl;
+
+    // 5. Asynchronous Background Worker Builder
+    audio_core::sampling::WaveformOverview async_overview;
+    async_overview.build_async(stem_ch, 48000);
+    size_t poll_count = 0;
+    while (!async_overview.is_ready() && poll_count < 200) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        poll_count++;
+    }
+    TEST_CHECK(async_overview.is_ready());
+    TEST_CHECK(async_overview.progress() == 1.0f);
+    TEST_CHECK(async_overview.num_peaks(0, 0) == stem_overview.num_peaks(0, 0));
+    std::cout << "  -> Asynchronous Background Worker & Non-Blocking Progress: PASSED (Completed in " << poll_count * 5 << " ms)" << std::endl;
+
+    // 6. AudioClip & DiskStreamer Integration
+    auto clip = std::make_shared<audio_core::sampling::AudioClip>("TestClip", 48000, 2, 48000);
+    for (uint32_t i = 0; i < 48000; ++i) {
+        clip->channel(0)[i] = (i % 100 == 0) ? 0.75f : 0.1f;
+        clip->channel(1)[i] = (i % 100 == 0) ? -0.75f : -0.1f;
+    }
+    clip->rebuild_overview();
+    TEST_CHECK(clip->overview() != nullptr);
+    TEST_CHECK(clip->overview()->is_ready());
+    TEST_CHECK(clip->overview()->total_frames() == 48000);
+
+    // Normalize clip and verify overview updates automatically
+    clip->normalize_peak(0.98855f);
+    TEST_CHECK(clip->overview()->is_ready());
+    const auto& clip_l0 = clip->overview()->peaks(0, 0);
+    TEST_CHECK(clip_l0.size() == (48000 + 63) / 64);
+    TEST_CHECK(std::abs(clip_l0[0].max_val - 0.98855f) < 1e-4f);
+    std::cout << "  -> AudioClip Auto-Mipmapping & Normalization Sync: PASSED (Peak=" << clip_l0[0].max_val << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -8007,6 +8205,7 @@ int main() {
     test_step_sequencer_slice_marker_mapping();
     test_websocket_bridge_and_remote_control();
     test_faster_than_realtime_offline_wav_bounce();
+    test_waveform_overview_and_long_stem_mipmapping();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

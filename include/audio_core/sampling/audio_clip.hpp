@@ -2,11 +2,13 @@
 
 #include "audio_core/dsp/resampler.hpp"
 #include "audio_core/sampling/wav_reader.hpp"
+#include "audio_core/sampling/waveform_overview.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <memory>
 #include <span>
 
 namespace audio_core::sampling {
@@ -32,7 +34,11 @@ public:
           m_sample_rate(sample_rate),
           m_channels(channels),
           m_frames(frames),
-          m_data(channels, std::vector<float>(frames, 0.0f)) {}
+          m_data(channels, std::vector<float>(frames, 0.0f)) {
+        if (m_frames > 0 && m_channels > 0) {
+            build_overview(false);
+        }
+    }
 
     [[nodiscard]] const std::string& name() const noexcept { return m_name; }
     void set_name(std::string name) noexcept { m_name = std::move(name); }
@@ -43,6 +49,29 @@ public:
 
     [[nodiscard]] double bpm() const noexcept { return m_bpm; }
     void set_bpm(double bpm) noexcept { m_bpm = bpm; }
+
+    [[nodiscard]] std::shared_ptr<WaveformOverview> overview() const noexcept {
+        return m_overview;
+    }
+
+    void build_overview(bool async = false) {
+        if (!m_overview) {
+            m_overview = std::make_shared<WaveformOverview>();
+        }
+        if (m_channels == 0 || m_frames == 0) {
+            m_overview->clear();
+            return;
+        }
+        if (async) {
+            m_overview->build_async(m_data, m_sample_rate);
+        } else {
+            m_overview->build_synchronous(m_data, m_sample_rate);
+        }
+    }
+
+    void rebuild_overview() {
+        build_overview(false);
+    }
 
     [[nodiscard]] float* channel(uint32_t ch) noexcept {
         return (ch < m_channels) ? m_data[ch].data() : nullptr;
@@ -333,6 +362,7 @@ public:
         // Extract base filename for clip name
         size_t last_slash = filepath.find_last_of("/\\");
         m_name = (last_slash != std::string::npos) ? filepath.substr(last_slash + 1) : filepath;
+        build_overview(false);
         return true;
     }
 
@@ -365,6 +395,7 @@ public:
                 src[i] *= gain;
             }
         }
+        rebuild_overview();
     }
 
     // RMS Loudness Normalization: scales clip to target RMS dBFS (e.g. -14 dBFS for K-14)
@@ -409,6 +440,7 @@ public:
                 src[i] *= gain;
             }
         }
+        rebuild_overview();
     }
 
     // Remove DC Offset: subtract channel mean to center waveform at 0.0
@@ -425,6 +457,7 @@ public:
                 src[i] -= dc;
             }
         }
+        rebuild_overview();
     }
 
 private:
@@ -435,6 +468,7 @@ private:
     double m_bpm{120.0};
     std::vector<std::vector<float>> m_data;
     std::vector<AudioSlice> m_slices;
+    std::shared_ptr<WaveformOverview> m_overview;
 };
 
 } // namespace audio_core::sampling

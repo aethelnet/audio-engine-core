@@ -2,6 +2,7 @@
 
 #include "audio_core/ring_buffer.hpp"
 #include "audio_core/sampling/wav_reader.hpp"
+#include "audio_core/sampling/waveform_overview.hpp"
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -49,6 +50,7 @@ public:
             m_preroll_frames = other.m_preroll_frames;
             m_preroll_l = std::move(other.m_preroll_l);
             m_preroll_r = std::move(other.m_preroll_r);
+            m_overview = std::move(other.m_overview);
             m_is_looping.store(other.m_is_looping.load());
             // Re-open if needed
         }
@@ -97,6 +99,15 @@ public:
         }
         m_disk_read_frame.store(prime_count, std::memory_order_relaxed);
 
+        // Build or load multi-resolution waveform overview
+        m_overview = std::make_shared<WaveformOverview>();
+        std::string aov_path = path + ".aov";
+        if (!m_overview->load_from_file(aov_path)) {
+            std::vector<std::vector<float>> ch_data = {tmp_l, tmp_r};
+            m_overview->build_synchronous(ch_data, sr);
+            m_overview->save_to_file(aov_path);
+        }
+
         m_playhead_frame.store(0, std::memory_order_relaxed);
         m_seek_target.store(-1, std::memory_order_relaxed);
         m_underruns.store(0, std::memory_order_relaxed);
@@ -105,6 +116,10 @@ public:
         // Start background I/O prefetcher thread
         m_worker = std::thread(&DiskStreamer::worker_loop, this);
         return true;
+    }
+
+    [[nodiscard]] std::shared_ptr<WaveformOverview> overview() const noexcept {
+        return m_overview;
     }
 
     void set_loop(bool loop) noexcept {
@@ -243,6 +258,7 @@ private:
 
     std::vector<float> m_preroll_l;
     std::vector<float> m_preroll_r;
+    std::shared_ptr<WaveformOverview> m_overview;
 
     std::unique_ptr<RingBuffer<float>> m_ring_l;
     std::unique_ptr<RingBuffer<float>> m_ring_r;

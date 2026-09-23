@@ -2965,13 +2965,19 @@ int main(int argc, char** argv) {
                                             cur_clip->sample_rate(), cur_clip->num_channels(), clip_dur, clip_dur / 2.0f);
                     }
 
-                    // High-Resolution Waveform Display
+                    // High-Resolution Waveform Display with Multi-Resolution Peak Mipmapping
                     ImVec2 wf_pos = ImGui::GetCursorScreenPos();
                     ImVec2 wf_size(ImGui::GetContentRegionAvail().x, 100);
                     float play_ratio = playhead_seconds / loop_length_seconds;
-                    ui::DrawWaveformDisplay(ImGui::GetWindowDrawList(), wf_pos, wf_size,
-                                           sample_waveform.data(), sample_waveform.size(),
-                                           play_ratio, slice_points, active_slice);
+                    if (cur_clip && cur_clip->overview()) {
+                        ui::DrawWaveformDisplay(ImGui::GetWindowDrawList(), wf_pos, wf_size,
+                                               cur_clip->overview().get(), 0, 0, cur_clip->num_frames(),
+                                               play_ratio, slice_points, active_slice);
+                    } else {
+                        ui::DrawWaveformDisplay(ImGui::GetWindowDrawList(), wf_pos, wf_size,
+                                               sample_waveform.data(), sample_waveform.size(),
+                                               play_ratio, slice_points, active_slice);
+                    }
                     ImGui::Dummy(wf_size);
 
                     // Processing Control Groups (4 Panels)

@@ -3,6 +3,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "audio_core/protocol/telemetry_packet.hpp"
+#include "audio_core/sampling/waveform_overview.hpp"
 #include <cmath>
 #include <vector>
 #include <string>
@@ -256,6 +257,108 @@ inline void DrawWaveformDisplay(ImDrawList* draw_list, ImVec2 pos, ImVec2 size,
     }
 
     // 4. Precision Playhead Needle (Drafting Black Needle)
+    if (playhead_ratio >= 0.0f && playhead_ratio <= 1.0f) {
+        float play_x = x + (playhead_ratio * w);
+        draw_list->AddLine(ImVec2(play_x, y), ImVec2(play_x, y + h), ImColor(20, 25, 35, 255), 1.5f);
+        draw_list->AddTriangleFilled(ImVec2(play_x - 5.0f, y),
+                                     ImVec2(play_x + 5.0f, y),
+                                     ImVec2(play_x, y + 8.0f), ImColor(20, 25, 35, 255));
+    }
+}
+
+// ============================================================================
+// Multi-Resolution Waveform Peak Mipmap Display
+// O(W) Constant-time peak & RMS rendering for multi-minute stems
+// ============================================================================
+inline void DrawWaveformDisplay(ImDrawList* draw_list, ImVec2 pos, ImVec2 size,
+                                const sampling::WaveformOverview* overview,
+                                uint32_t channel,
+                                uint64_t start_frame, uint64_t end_frame,
+                                float playhead_ratio,
+                                const std::vector<float>& slice_points_ratio,
+                                int active_slice_idx = -1) {
+    const float x = pos.x;
+    const float y = pos.y;
+    const float w = size.x;
+    const float h = size.y;
+    const float mid_y = y + h * 0.5f;
+
+    // 1. Pure White Vellum Background Canvas
+    draw_list->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(255, 255, 255, 255), 2.0f);
+    draw_list->AddRect(pos, ImVec2(x + w, y + h), ImColor(190, 196, 206, 255), 2.0f);
+
+    // Subtle technical grid lines (Drafting millimeter paper)
+    for (float gx = x + 40.0f; gx < x + w; gx += 40.0f) {
+        draw_list->AddLine(ImVec2(gx, y), ImVec2(gx, y + h), ImColor(240, 243, 248, 255), 1.0f);
+    }
+
+    // Center zero graphite line
+    draw_list->AddLine(ImVec2(x, mid_y), ImVec2(x + w, mid_y), ImColor(200, 208, 220, 255), 1.0f);
+
+    if (!overview || overview->total_frames() == 0) {
+        const char* msg = "[ NO AUDIO SAMPLE LOADED ]";
+        ImVec2 msg_size = ImGui::CalcTextSize(msg);
+        draw_list->AddText(ImVec2(x + (w - msg_size.x) * 0.5f, mid_y - msg_size.y * 0.5f),
+                           ImColor(130, 140, 155, 255), msg);
+        return;
+    }
+
+    if (!overview->is_ready()) {
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "[ ANALYZING STEM PEAKS: %3.0f%% ]", overview->progress() * 100.0f);
+        ImVec2 msg_size = ImGui::CalcTextSize(msg);
+        draw_list->AddText(ImVec2(x + (w - msg_size.x) * 0.5f, mid_y - msg_size.y * 0.5f - 8.0f),
+                           ImColor(31, 97, 217, 255), msg);
+
+        float bar_w = std::min(w * 0.6f, 200.0f);
+        float bar_x = x + (w - bar_w) * 0.5f;
+        float bar_y = mid_y + 10.0f;
+        draw_list->AddRect(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + 6.0f), ImColor(190, 196, 206, 255));
+        draw_list->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w * overview->progress(), bar_y + 6.0f), ImColor(31, 97, 217, 255));
+        return;
+    }
+
+    // 2. Query O(W) Mipmap Peaks across screen columns
+    const int num_columns = static_cast<int>(w);
+    if (num_columns <= 0) return;
+
+    static thread_local std::vector<sampling::ViewportPeak> s_peaks;
+    overview->query_peaks(channel, start_frame, end_frame, static_cast<size_t>(num_columns), s_peaks);
+
+    // 3. Render Peak Columns with Blueprint Cobalt Ink & RMS Solid Core
+    for (int px = 0; px < num_columns; ++px) {
+        const auto& pk = s_peaks[px];
+
+        float y_top = mid_y - (pk.max_val * (h * 0.46f));
+        float y_bot = mid_y - (pk.min_val * (h * 0.46f));
+        if (y_bot - y_top < 1.0f) y_bot = y_top + 1.0f;
+
+        // Architectural Blueprint Cobalt outer peak wave
+        draw_list->AddLine(ImVec2(x + px, y_top), ImVec2(x + px, y_bot), ImColor(31, 97, 217, 180), 1.0f);
+
+        // Deep Navy RMS musical energy inner core
+        if (pk.rms > 0.001f) {
+            float rms_top = mid_y - (pk.rms * (h * 0.46f));
+            float rms_bot = mid_y + (pk.rms * (h * 0.46f));
+            draw_list->AddLine(ImVec2(x + px, rms_top), ImVec2(x + px, rms_bot), ImColor(15, 45, 110, 240), 1.0f);
+        }
+    }
+
+    // 4. Render Slicing Markers (Drafting Ochre / Amber)
+    for (size_t i = 0; i < slice_points_ratio.size(); ++i) {
+        float slice_x = x + (slice_points_ratio[i] * w);
+        bool is_active = (static_cast<int>(i) == active_slice_idx);
+        ImU32 col_slice = is_active ? ImColor(217, 119, 6, 255) : ImColor(217, 119, 6, 180);
+
+        draw_list->AddLine(ImVec2(slice_x, y), ImVec2(slice_x, y + h), col_slice, is_active ? 2.0f : 1.0f);
+
+        // Marker tag at top
+        draw_list->AddTriangleFilled(ImVec2(slice_x - 4.0f, y),
+                                     ImVec2(slice_x + 4.0f, y),
+                                     ImVec2(slice_x, y + 7.0f), col_slice);
+    }
+
+    // 5. Precision Playhead Needle (Drafting Black Needle)
     if (playhead_ratio >= 0.0f && playhead_ratio <= 1.0f) {
         float play_x = x + (playhead_ratio * w);
         draw_list->AddLine(ImVec2(play_x, y), ImVec2(play_x, y + h), ImColor(20, 25, 35, 255), 1.5f);
