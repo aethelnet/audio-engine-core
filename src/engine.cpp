@@ -13,7 +13,8 @@ Engine::Engine(uint32_t sample_rate, uint32_t buffer_size)
       m_buffer_size(buffer_size),
       m_mixer(buffer_size),
       m_clock(sample_rate),
-      m_planar_buffer(kDefaultChannels, buffer_size) {
+      m_planar_buffer(kDefaultChannels, buffer_size),
+      m_synth_buffer(kDefaultChannels, buffer_size) {
     m_synth_graph.init(sample_rate);
     m_mixer.set_sample_rate(sample_rate);
     m_mixer.set_parameter_ramping_enabled(true);
@@ -33,6 +34,7 @@ bool Engine::init(uint32_t sample_rate, uint32_t buffer_size) {
     m_mixer.set_sample_rate(sample_rate);
     m_clock.set_sample_rate(sample_rate);
     m_planar_buffer.resize(kDefaultChannels, buffer_size);
+    m_synth_buffer.resize(kDefaultChannels, buffer_size);
 
     if (m_backend) {
         return m_backend->init(sample_rate, kDefaultChannels, buffer_size);
@@ -207,10 +209,15 @@ void Engine::process_interleaved(Sample* output, uint32_t num_frames, uint32_t c
     Sample* left = view.channel(0);
     Sample* right = (view.num_channels() > 1) ? view.channel(1) : left;
 
-    // 4. If SynthGraph has active voices, accumulate them into the mix
+    // 4. If SynthGraph has active voices, render and accumulate them into the mix
     if (m_synth_graph.active_voice_count() > 0) {
+        auto synth_view = m_synth_buffer.view_frames(num_frames);
+        m_synth_graph.render(synth_view);
+        const Sample* s_left = synth_view.channel(0);
+        const Sample* s_right = (synth_view.num_channels() > 1) ? synth_view.channel(1) : s_left;
         for (uint32_t f = 0; f < num_frames; ++f) {
-            // Synth voices can be rendered into temporary block and added
+            left[f] += s_left[f];
+            right[f] += s_right[f];
         }
     }
 

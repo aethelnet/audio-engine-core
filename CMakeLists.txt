@@ -133,6 +133,12 @@ add_executable(golden_master_tool
 )
 target_link_libraries(golden_master_tool PRIVATE audio_core)
 
+# Standalone WebMixer Daemon & Remote WebSocket Bridge
+add_executable(webmixer_daemon
+    examples/webmixer_daemon.cpp
+)
+target_link_libraries(webmixer_daemon PRIVATE audio_core)
+
 # ============================================================================
 # Dear ImGui & Desktop UI Workstation (aethel_desk)
 # ============================================================================

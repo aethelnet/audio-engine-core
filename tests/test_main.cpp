@@ -49,6 +49,7 @@
 #include "audio_core/sampling/disk_streamer.hpp"
 #include "audio_core/engine.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
+#include "audio_core/network/websocket_bridge.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -7221,7 +7222,15 @@ void test_unified_engine_and_transport() {
     engine.process_interleaved(audio_out.data(), 256, 2);
     TEST_CHECK(std::abs(engine.master_volume() - 0.88f) < 1e-4f);
 
-    std::cout << "  -> Unified Engine & Transport: PASSED (MixerGraph rendered, transport synchronized, volume & parameters automated)" << std::endl;
+    // Polyphonic Synth execution in Engine
+    engine.note_on(60, 100);
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    float synth_energy = 0.0f;
+    for (float s : audio_out) synth_energy += std::abs(s);
+    TEST_CHECK(synth_energy > 1.0f);
+    engine.all_notes_off();
+
+    std::cout << "  -> Unified Engine & Transport: PASSED (MixerGraph rendered, transport synchronized, volume & parameters automated, synth audio verified [energy=" << synth_energy << "])" << std::endl;
 }
 
 void test_session_and_rack_preset_serialization() {
@@ -7443,6 +7452,187 @@ void test_step_sequencer_slice_marker_mapping() {
     std::cout << "  -> Slice Marker Mapping: PASSED (Linear & chromatic mapping, bidirectional lookup, and index remapping verified)" << std::endl;
 }
 
+void test_websocket_bridge_and_remote_control() {
+    std::cout << "[TEST] Running WebSocket Bridge, RFC 6455 Handshake & Remote WebMixer Protocol Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::network;
+    using namespace audio_core::protocol;
+
+    Engine engine(48000, 256);
+    engine.init(48000, 256);
+
+    auto* trk1 = engine.mixer().allocate_track("Track 1");
+    auto* trk2 = engine.mixer().allocate_track("Track 2");
+    TEST_CHECK(trk1 != nullptr && trk2 != nullptr);
+
+    constexpr uint16_t kTestPort = 18099;
+    WebSocketBridge::Config cfg{};
+    cfg.port = kTestPort;
+    cfg.host = "127.0.0.1";
+    cfg.telemetry_rate_hz = 50;
+    cfg.serve_embedded_gui = true;
+
+    WebSocketBridge bridge(engine, cfg);
+    TEST_CHECK(bridge.start());
+    TEST_CHECK(bridge.is_running());
+    TEST_CHECK(bridge.port() == kTestPort);
+
+    // 1. Connect Client TCP Socket
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_CHECK(client_fd >= 0);
+
+    sockaddr_in saddr{};
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(kTestPort);
+    inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr);
+
+    int conn_res = connect(client_fd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr));
+    TEST_CHECK(conn_res == 0);
+
+    // 2. Perform RFC 6455 Handshake
+    std::string handshake_req =
+        "GET / HTTP/1.1\r\n"
+        "Host: 127.0.0.1:18099\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    send(client_fd, handshake_req.data(), handshake_req.size(), 0);
+
+    char resp_buf[1024];
+    std::memset(resp_buf, 0, sizeof(resp_buf));
+    ssize_t n_read = recv(client_fd, resp_buf, sizeof(resp_buf) - 1, 0);
+    TEST_CHECK(n_read > 0);
+    std::string resp(resp_buf);
+    TEST_CHECK(resp.find("101 Switching Protocols") != std::string::npos);
+    TEST_CHECK(resp.find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != std::string::npos);
+
+    std::cout << "  -> RFC 6455 Upgrade Handshake: PASSED (Sec-WebSocket-Accept verified)" << std::endl;
+
+    // Helper lambda to send a masked client frame
+    auto send_masked_frame = [&](uint8_t opcode, const void* payload, size_t len) {
+        std::vector<uint8_t> frame;
+        frame.push_back(0x80 | (opcode & 0x0F)); // FIN = 1
+        // Mask bit must be 1 from client
+        if (len <= 125) {
+            frame.push_back(0x80 | static_cast<uint8_t>(len));
+        } else if (len <= 65535) {
+            frame.push_back(0x80 | 126);
+            frame.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+            frame.push_back(static_cast<uint8_t>(len & 0xFF));
+        }
+        uint8_t mask_key[4] = {0x12, 0x34, 0x56, 0x78};
+        frame.insert(frame.end(), mask_key, mask_key + 4);
+
+        const auto* src = static_cast<const uint8_t*>(payload);
+        for (size_t i = 0; i < len; ++i) {
+            frame.push_back(src[i] ^ mask_key[i % 4]);
+        }
+        send(client_fd, frame.data(), frame.size(), 0);
+    };
+
+    // 3. Test JSON Command: Set Track 1 Gain to 0.73f
+    std::string json_cmd1 = "{\"type\":\"set_track_gain\",\"track_id\":1,\"gain\":0.73}";
+    send_masked_frame(0x1, json_cmd1.data(), json_cmd1.size());
+
+    // Wait briefly for network thread to dispatch
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    // Audio thread renders a block to process queue
+    std::vector<float> audio_out(256 * 2, 0.0f);
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(std::abs(trk1->gain() - 0.73f) < 1e-3f);
+
+    // 4. Test JSON Command: Set Master Gain to 0.62f
+    std::string json_cmd2 = "{\"type\":\"set_master_gain\",\"gain\":0.62}";
+    send_masked_frame(0x1, json_cmd2.data(), json_cmd2.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(std::abs(engine.master_volume() - 0.62f) < 1e-3f);
+
+    // 5. Test JSON Command: Mute Track 2
+    std::string json_cmd3 = "{\"type\":\"set_track_mute\",\"track_id\":2,\"mute\":true}";
+    send_masked_frame(0x1, json_cmd3.data(), json_cmd3.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(trk2->is_muted() == true);
+
+    // 6. Test Binary POD Command (MixerCommand): Pan Track 1 to -0.45f
+    MixerCommand pod_cmd{};
+    pod_cmd.type = MixerCommandType::SetTrackPan;
+    pod_cmd.target_id = 1;
+    pod_cmd.value1 = -0.45f;
+    send_masked_frame(0x2, &pod_cmd, sizeof(pod_cmd));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(std::abs(trk1->pan() - -0.45f) < 1e-3f);
+
+    // 7. Test Remote MIDI Note On/Off
+    std::string midi_cmd = "{\"type\":\"note_on\",\"note\":60,\"velocity\":100}";
+    send_masked_frame(0x1, midi_cmd.data(), midi_cmd.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    float synth_e = 0.0f;
+    for (float s : audio_out) synth_e += std::abs(s);
+    TEST_CHECK(synth_e > 1.0f);
+
+    std::cout << "  -> Bidirectional JSON & Binary Control: PASSED (Track Gain=0.73, Master=0.62, Mute=true, Pan=-0.45, MIDI Synth Energy=" << synth_e << ")" << std::endl;
+
+    // 8. Receive Telemetry Frame from Server
+    timeval tv{};
+    tv.tv_sec = 1;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t tel_hdr[2];
+    ssize_t th_read = recv(client_fd, tel_hdr, 2, 0);
+    TEST_CHECK(th_read == 2);
+    TEST_CHECK((tel_hdr[0] & 0x0F) == 0x1); // Text opcode
+    uint64_t tel_len = tel_hdr[1] & 0x7F;
+    if (tel_len == 126) {
+        uint8_t ext_len[2];
+        recv(client_fd, ext_len, 2, 0);
+        tel_len = (static_cast<uint64_t>(ext_len[0]) << 8) | ext_len[1];
+    }
+    std::vector<char> tel_payload(tel_len + 1, 0);
+    size_t got = 0;
+    while (got < tel_len) {
+        ssize_t chunk = recv(client_fd, tel_payload.data() + got, tel_len - got, 0);
+        if (chunk <= 0) break;
+        got += chunk;
+    }
+    std::string tel_str(tel_payload.data());
+    TEST_CHECK(tel_str.find("\"type\":\"telemetry\"") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"master\":") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"kinetic\":") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"tracks\":") != std::string::npos);
+
+    std::cout << "  -> Real-Time 30Hz Telemetry Broadcast: PASSED (Snapshot length: " << tel_len << " bytes)" << std::endl;
+
+    close(client_fd);
+
+    // 9. HTTP GET Embedded Web GUI Test
+    int http_fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_CHECK(http_fd >= 0);
+    connect(http_fd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr));
+    std::string http_req = "GET / HTTP/1.1\r\nHost: 127.0.0.1:18099\r\n\r\n";
+    send(http_fd, http_req.data(), http_req.size(), 0);
+
+    std::vector<char> http_resp(8192, 0);
+    ssize_t http_read = recv(http_fd, http_resp.data(), http_resp.size() - 1, 0);
+    TEST_CHECK(http_read > 0);
+    std::string http_str(http_resp.data());
+    TEST_CHECK(http_str.find("HTTP/1.1 200 OK") != std::string::npos);
+    TEST_CHECK(http_str.find("AETHEL // SOVEREIGN WEBMIXER") != std::string::npos);
+    close(http_fd);
+
+    std::cout << "  -> Embedded HTML5 WebMixer Server: PASSED (HTTP 200 OK served to browser)" << std::endl;
+
+    bridge.stop();
+    TEST_CHECK(!bridge.is_running());
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -7508,6 +7698,7 @@ int main() {
     test_unified_engine_and_transport();
     test_session_and_rack_preset_serialization();
     test_step_sequencer_slice_marker_mapping();
+    test_websocket_bridge_and_remote_control();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -91,6 +91,7 @@ private:
     std::unique_ptr<AudioBackend> m_backend;
 
     AudioBuffer m_planar_buffer;
+    AudioBuffer m_synth_buffer;
     WasmDspPlugin m_master_plugin;
 
     // Lock-Free Queues (SPSC)

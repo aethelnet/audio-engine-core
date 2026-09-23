@@ -4,7 +4,7 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 59/59 Passed](https://img.shields.io/badge/CTest-59%2F59%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 61/61 Passed](https://img.shields.io/badge/CTest-61%2F61%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-orange.svg)](LICENSE)
@@ -80,11 +80,18 @@ Bit-exact mathematical integrity is verified via `GoldenMasterTool`:
 - Computes SHA-256 / 64-bit FNV-1a checksums over 10 distinct DSP signal chains (filters, limiters, compressors, sample-rate converters, mixers).
 - Prevents silent regressions, floating-point drift, or compiler vectorization mismatches across platforms.
 
+### 2.6 Remote Control & Real-Time WebMixer WebSocket Bridge
+Provides ultra-low latency browser & network control surface integration via `WebSocketBridge`:
+- **RFC 6455 Compliant Handshake & Framing**: Standalone zero-dependency SHA-1/Base64 handshake with JSON text & 32-byte POD binary frame decoding.
+- **Embedded WebMixer Single-Page App**: Serves a responsive HTML5 canvas mixer on HTTP GET `/` with real-time VU meters, master/strip faders, mute/solo, and kinetic ODE hit-record visualization.
+- **Lock-Free SPSC Dispatch**: Commands and MIDI note triggers are pushed directly to `Engine` lock-free ringbuffers without touching or stalling the real-time audio thread.
+- **30 Hz Telemetry Streaming**: High-density snapshot broadcasts of master meters, track meters, bus meters, and Poincaré phase-space orbits.
+
 ---
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **59 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **61 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -104,8 +111,10 @@ $ ./build/audio_tests
 [TEST 57]     Airwindows DeRez2 Bit & Sample-Rate Reduction:      PASSED
 [TEST 58]     Airwindows ClipOnly2 Ultrasonic Wavefolding:        PASSED
 [TEST 59]     Interstage Transformer Saturation & Resonance:      PASSED
+[TEST 60]     Session & Rack Preset Serialization (Pure C++20):   PASSED
+[TEST 61]     WebSocket Bridge, RFC 6455 Handshake & WebMixer:    PASSED
 ===============================================================================
-   59 / 59 UNIT TESTS PASSED (100.0% SUCCESS)
+   61 / 61 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 
