@@ -8,6 +8,8 @@
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <filesystem>
+#include <algorithm>
 #include <poll.h>
 
 static std::atomic<bool> g_running{true};
@@ -26,6 +28,7 @@ static void print_usage(const char* prog) {
               << "  --priority2 <val>     BMCA Priority2 [0-255] (default: 128)\n"
               << "  --event-port <port>   UDP Event Port (default: 319)\n"
               << "  --general-port <port> UDP General Port (default: 320)\n"
+              << "  --probe, --audit      Audit interfaces & probe LAN for PTP Grandmasters\n"
               << "  --help                Show this help message\n";
 }
 
@@ -40,10 +43,13 @@ int main(int argc, char* argv[]) {
     uint8_t priority2 = 128;
     uint16_t event_port = audio_core::network::kPtpEventPort;
     uint16_t general_port = audio_core::network::kPtpGeneralPort;
+    bool run_probe_only = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--upstream" && i + 1 < argc) {
+        if (arg == "--probe" || arg == "--audit") {
+            run_probe_only = true;
+        } else if (arg == "--upstream" && i + 1 < argc) {
             upstream_iface = argv[++i];
         } else if (arg == "--downstream" && i + 1 < argc) {
             downstream_iface = argv[++i];
@@ -61,6 +67,86 @@ int main(int argc, char* argv[]) {
             print_usage(argv[0]);
             return 0;
         }
+    }
+
+    if (run_probe_only) {
+        std::cout << "\033[1;36m====================================================================\033[0m\n";
+        std::cout << "\033[1;37m   AETHEL PTPv2 GRANDMASTER HARDWARE AUDIT & LAN PROBE (IEEE 1588)\033[0m\n";
+        std::cout << "\033[1;36m====================================================================\033[0m\n\n";
+
+        std::vector<std::string> ifaces;
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net")) {
+                ifaces.push_back(entry.path().filename().string());
+            }
+        } catch (...) {
+            ifaces = { "lo", "enp2s0", "wlp4s0", "eth0" };
+        }
+        std::sort(ifaces.begin(), ifaces.end());
+
+        std::cout << "\033[1;33m[SECTION 1: NETWORK INTERFACE & TIMESTAMPING CAPABILITY AUDIT]\033[0m\n";
+        for (const auto& iface : ifaces) {
+            auto audit = audio_core::network::audit_interface(iface);
+            std::cout << "  Interface: \033[1;37m" << std::left << std::setw(10) << iface << "\033[0m"
+                      << " | Status: " << (audit.is_up ? "\033[1;32mUP\033[0m  " : "\033[1;31mDOWN\033[0m")
+                      << " | Running: " << (audit.is_running ? "\033[1;32mYES\033[0m" : "\033[1;30mNO \033[0m")
+                      << " | PHC Clock: ";
+            if (audit.phc_index >= 0) {
+                std::cout << "\033[1;32m/dev/ptp" << audit.phc_index << " [HARDWARE PHY]\033[0m";
+            } else {
+                std::cout << "\033[1;30mNone [NO PHC]\033[0m";
+            }
+            std::cout << " | Effective Tier: ";
+            if (audit.highest_capable_tier == audio_core::network::PtpTimestampSource::HardwareNicPhy) {
+                std::cout << "\033[1;32mHARDWARE NIC PHY\033[0m";
+            } else if (audit.highest_capable_tier == audio_core::network::PtpTimestampSource::KernelDriverStack) {
+                std::cout << "\033[1;36mKERNEL DRIVER STACK\033[0m";
+            } else {
+                std::cout << "\033[1;33mUSERSPACE FALLBACK\033[0m";
+            }
+            std::cout << "\n";
+        }
+
+        std::cout << "\n\033[1;33m[SECTION 2: ACTIVE PTPv2 MULTICAST DISCOVERY PROBE (224.0.1.129)]\033[0m\n";
+        bool any_gm_found = false;
+        for (const auto& iface : ifaces) {
+            auto audit = audio_core::network::audit_interface(iface);
+            if (!audit.is_up && iface != "lo") continue;
+
+            std::cout << "  Probing on " << std::left << std::setw(10) << iface << " (Port " << general_port << ", timeout 1.0s)... " << std::flush;
+            auto probe = audio_core::network::probe_grandmaster(iface, general_port, 1000);
+            if (!probe.socket_bound) {
+                std::cout << "\033[1;31mSKIPPED\033[0m (" << probe.error_message << ")\n";
+                continue;
+            }
+
+            if (probe.grandmaster_detected) {
+                any_gm_found = true;
+                std::cout << "\033[1;32mGRANDMASTER DETECTED!\033[0m\n";
+                std::cout << "    -> Clock ID:       " << probe.gm_identity_str << "\n"
+                          << "    -> Clock Class:    " << static_cast<int>(probe.clock_class) << " (" << probe.clock_class_name << ")\n"
+                          << "    -> Clock Accuracy: 0x" << std::hex << static_cast<int>(probe.clock_accuracy) << std::dec << " (" << probe.clock_accuracy_name << ")\n"
+                          << "    -> Time Source:    0x" << std::hex << static_cast<int>(probe.time_source) << std::dec << " (" << probe.time_source_name << ")\n"
+                          << "    -> Priority 1 / 2: " << static_cast<int>(probe.priority1) << " / " << static_cast<int>(probe.priority2) << "\n"
+                          << "    -> Steps Removed:  " << probe.steps_removed << "\n"
+                          << "    -> Grandmaster IP: " << probe.grandmaster_ip << "\n";
+            } else {
+                std::cout << "\033[1;30mNo Grandmaster Announce detected\033[0m\n";
+            }
+        }
+
+        std::cout << "\n\033[1;33m[SECTION 3: CLOCK SYNCHRONIZATION VERDICT]\033[0m\n";
+        if (any_gm_found) {
+            std::cout << "  \033[1;32mRESULT: Active IEEE 1588 / AES67 Grandmaster present on network.\033[0m\n"
+                      << "  Boundary Clock will lock as Slave to upstream Grandmaster and discipline local audio jitter.\n";
+        } else {
+            std::cout << "  \033[1;33mRESULT: No external hardware Grandmaster broadcasting on local network interfaces.\033[0m\n"
+                      << "  Aethel Engine Boundary Clock will deterministically operate as Self-Master (Class 248 / Internal Oscillator)\n"
+                      << "  to discipline and synchronize downstream AES67 / Dante audio endpoints without drift.\n";
+        }
+
+        std::cout << "\033[1;36m====================================================================\033[0m\n";
+        return 0;
     }
 
     std::cout << "\033[1;36m====================================================================\033[0m\n";
@@ -130,6 +216,7 @@ int main(int argc, char* argv[]) {
 
     uint64_t last_t1 = 0;
     uint64_t last_t2 = 0;
+    uint64_t last_t3 = 0;
 
     while (g_running.load()) {
         auto now = std::chrono::steady_clock::now();
@@ -156,12 +243,7 @@ int main(int argc, char* argv[]) {
                     );
                     upstream_sock.send_event(tx_buffer, req_len, t3, t3_src,
                                              audio_core::network::kPtpPrimaryMulticastIp, event_port);
-
-                    // Synthetic or immediate exchange completion for demonstration
-                    uint64_t t4 = t3 + 15'000ULL; // 15 µs nominal wire delay
-                    if (last_t1 > 0 && last_t2 > 0) {
-                        boundary.process_timing_exchange(0, last_t1, last_t2, t3, t4);
-                    }
+                    last_t3 = t3;
                 }
             }
 
@@ -174,6 +256,13 @@ int main(int argc, char* argv[]) {
                         boundary.evaluate_announce(0, parsed.announce_vector);
                     } else if (parsed.type == audio_core::network::PtpMessageType::Follow_Up) {
                         last_t1 = parsed.timestamp_ns;
+                    } else if (parsed.type == audio_core::network::PtpMessageType::Delay_Resp) {
+                        if (parsed.requesting_clock_id == boundary.clock_identity()) {
+                            uint64_t t4 = parsed.timestamp_ns;
+                            if (last_t1 > 0 && last_t2 > 0 && last_t3 > 0 && t4 > 0) {
+                                boundary.process_timing_exchange(0, last_t1, last_t2, last_t3, t4);
+                            }
+                        }
                     }
                 }
             }

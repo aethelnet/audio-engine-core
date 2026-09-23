@@ -15,6 +15,11 @@
 #include <algorithm>
 #include <chrono>
 #include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/sockios.h>
+#include <linux/ethtool.h>
+#include <poll.h>
 
 namespace audio_core::network {
 
@@ -68,6 +73,53 @@ enum class PtpPortState : uint8_t {
     return "Unknown";
 }
 
+[[nodiscard]] inline const char* ptp_clock_class_name(uint8_t clock_class) noexcept {
+    switch (clock_class) {
+        case 6:   return "Primary Reference (GPS / Atomic)";
+        case 7:   return "Primary Reference Holdover (GPS Lost)";
+        case 13:  return "Application Specific (Telecom Primary)";
+        case 14:  return "Application Specific (Telecom Holdover)";
+        case 52:  return "Degraded Primary Reference";
+        case 58:  return "Degraded Telecom Reference";
+        case 187: return "Degraded Holdover";
+        case 248: return "Default Free-Running (AES67 / Dante)";
+        case 255: return "Slave Only Clock";
+        default:  return "Custom / Vendor Specific";
+    }
+}
+
+[[nodiscard]] inline const char* ptp_clock_accuracy_name(uint8_t acc) noexcept {
+    switch (acc) {
+        case 0x20: return "< 25 ns";
+        case 0x21: return "< 100 ns";
+        case 0x22: return "< 250 ns";
+        case 0x23: return "< 1 µs";
+        case 0x24: return "< 2.5 µs";
+        case 0x25: return "< 10 µs";
+        case 0x26: return "< 25 µs";
+        case 0x27: return "< 100 µs";
+        case 0x28: return "< 250 µs";
+        case 0x29: return "< 1 ms";
+        case 0x31: return "> 10 s";
+        case 0xFE: return "Unknown / Uncalibrated";
+        default:   return "Unspecified";
+    }
+}
+
+[[nodiscard]] inline const char* ptp_time_source_name(uint8_t src) noexcept {
+    switch (src) {
+        case 0x10: return "Atomic Clock";
+        case 0x20: return "GPS";
+        case 0x30: return "Terrestrial Radio";
+        case 0x40: return "PTP";
+        case 0x50: return "NTP";
+        case 0x60: return "Handset";
+        case 0x90: return "Other";
+        case 0xA0: return "Internal Oscillator";
+        default:   return "Unknown";
+    }
+}
+
 #pragma pack(push, 1)
 
 struct PtpClockIdentity {
@@ -81,6 +133,13 @@ struct PtpClockIdentity {
     }
     bool operator<(const PtpClockIdentity& other) const noexcept {
         return std::memcmp(id, other.id, 8) < 0;
+    }
+
+    [[nodiscard]] std::string to_string() const {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                      id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
+        return std::string(buf);
     }
 };
 
@@ -831,5 +890,207 @@ private:
     uint8_t m_domain{0};
     PtpSocketTimestampEngine m_ts_engine{};
 };
+
+// ============================================================================
+// Network Interface Hardware Timestamping Audit
+// Queries ETHTOOL_GET_TS_INFO for physical PHC index and socket capabilities
+// ============================================================================
+struct PtpInterfaceAudit {
+    std::string iface_name;
+    bool exists{false};
+    bool is_up{false};
+    bool is_running{false};
+    int phc_index{-1}; // -1 = None, >= 0 = /dev/ptp%d
+    uint32_t so_timestamping_flags{0};
+    bool hardware_tx_capable{false};
+    bool hardware_rx_capable{false};
+    bool kernel_sw_capable{false};
+    PtpTimestampSource highest_capable_tier{PtpTimestampSource::UserspaceMonotonic};
+};
+
+inline PtpInterfaceAudit audit_interface(const std::string& iface) noexcept {
+    PtpInterfaceAudit res{};
+    res.iface_name = iface;
+
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return res;
+
+    // Check interface flags (UP, RUNNING)
+    struct ifreq ifr{};
+    std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+    if (::ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) {
+        res.exists = true;
+        res.is_up = (ifr.ifr_flags & IFF_UP) != 0;
+        res.is_running = (ifr.ifr_flags & IFF_RUNNING) != 0;
+    }
+
+    // Query ethtool ts info
+    struct ethtool_ts_info info{};
+    info.cmd = ETHTOOL_GET_TS_INFO;
+    ifr.ifr_data = reinterpret_cast<char*>(&info);
+    if (::ioctl(fd, SIOCETHTOOL, &ifr) == 0) {
+        res.phc_index = info.phc_index;
+        res.so_timestamping_flags = info.so_timestamping;
+        res.hardware_rx_capable = (info.so_timestamping & SOF_TIMESTAMPING_RX_HARDWARE) != 0;
+        res.hardware_tx_capable = (info.so_timestamping & SOF_TIMESTAMPING_TX_HARDWARE) != 0;
+        res.kernel_sw_capable   = (info.so_timestamping & SOF_TIMESTAMPING_RX_SOFTWARE) != 0 ||
+                                  (info.so_timestamping & SOF_TIMESTAMPING_SOFTWARE) != 0;
+
+        if (res.hardware_rx_capable || res.phc_index >= 0) {
+            res.highest_capable_tier = PtpTimestampSource::HardwareNicPhy;
+        } else if (res.kernel_sw_capable) {
+            res.highest_capable_tier = PtpTimestampSource::KernelDriverStack;
+        } else {
+            res.highest_capable_tier = PtpTimestampSource::UserspaceMonotonic;
+        }
+    } else {
+        if (iface == "lo") {
+            res.highest_capable_tier = PtpTimestampSource::KernelDriverStack;
+            res.kernel_sw_capable = true;
+        }
+    }
+
+    ::close(fd);
+    return res;
+}
+
+// ============================================================================
+// IEEE 1588-2008 PTPv2 Grandmaster Probe & Diagnostics
+// Listens for external Grandmaster Announce frames on multicast 224.0.1.129
+// ============================================================================
+struct PtpGrandmasterProbeResult {
+    std::string interface_name;
+    bool socket_bound{false};
+    std::string error_message;
+    bool grandmaster_detected{false};
+    PtpClockIdentity gm_identity{};
+    std::string gm_identity_str;
+    uint8_t priority1{128};
+    uint8_t priority2{128};
+    uint8_t clock_class{248};
+    std::string clock_class_name;
+    uint8_t clock_accuracy{0xFE};
+    std::string clock_accuracy_name;
+    uint16_t offset_scaled_log_variance{0xFFFF};
+    uint16_t steps_removed{0};
+    uint8_t time_source{0xA0};
+    std::string time_source_name;
+    int16_t current_utc_offset{37};
+    std::string grandmaster_ip;
+    uint32_t probe_duration_ms{0};
+    size_t announce_packets_received{0};
+};
+
+inline PtpGrandmasterProbeResult probe_grandmaster(const std::string& iface_name,
+                                                   uint16_t general_port = kPtpGeneralPort,
+                                                   uint32_t timeout_ms = 1500) noexcept {
+    PtpGrandmasterProbeResult result{};
+    result.interface_name = iface_name;
+    result.probe_duration_ms = timeout_ms;
+
+    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        result.error_message = "Failed to create socket";
+        return result;
+    }
+
+    int reuse = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+
+    if (!iface_name.empty() && iface_name != "lo") {
+        struct ifreq ifr{};
+        std::strncpy(ifr.ifr_name, iface_name.c_str(), sizeof(ifr.ifr_name) - 1);
+        ::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
+    }
+
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(general_port);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+        int err = errno;
+        char err_buf[128];
+        std::snprintf(err_buf, sizeof(err_buf), "Cannot bind port %u (%s)", general_port, std::strerror(err));
+        result.error_message = err_buf;
+        ::close(fd);
+        return result;
+    }
+    result.socket_bound = true;
+
+    // Join PTP multicast group
+    struct ip_mreqn mreq{};
+    ::inet_pton(AF_INET, kPtpPrimaryMulticastIp, &mreq.imr_multiaddr);
+    mreq.imr_address.s_addr = htonl(INADDR_ANY);
+    if (!iface_name.empty()) {
+        mreq.imr_ifindex = static_cast<int>(::if_nametoindex(iface_name.c_str()));
+        if (iface_name == "lo") {
+            ::inet_pton(AF_INET, "127.0.0.1", &mreq.imr_address);
+        }
+    }
+    ::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+
+    int loop = 1;
+    ::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+
+    auto start_time = std::chrono::steady_clock::now();
+    uint8_t buffer[1024];
+
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
+        if (elapsed >= timeout_ms) break;
+
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+
+        int remain_ms = static_cast<int>(timeout_ms - elapsed);
+        int ret = ::poll(&pfd, 1, std::min(remain_ms, 100));
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            sockaddr_in sender{};
+            socklen_t s_len = sizeof(sender);
+            ssize_t bytes = ::recvfrom(fd, buffer, sizeof(buffer), 0,
+                                       reinterpret_cast<sockaddr*>(&sender), &s_len);
+            if (bytes > 0) {
+                auto msg = PtpBoundaryClock::parse_packet(buffer, static_cast<size_t>(bytes));
+                if (msg.valid && msg.type == PtpMessageType::Announce) {
+                    result.grandmaster_detected = true;
+                    result.announce_packets_received++;
+                    result.gm_identity = msg.announce_vector.identity;
+                    result.gm_identity_str = msg.announce_vector.identity.to_string();
+                    result.priority1 = msg.announce_vector.priority1;
+                    result.priority2 = msg.announce_vector.priority2;
+                    result.clock_class = msg.announce_vector.clock_quality.clock_class;
+                    result.clock_class_name = ptp_clock_class_name(result.clock_class);
+                    result.clock_accuracy = msg.announce_vector.clock_quality.clock_accuracy;
+                    result.clock_accuracy_name = ptp_clock_accuracy_name(result.clock_accuracy);
+                    result.offset_scaled_log_variance = net_to_host16(msg.announce_vector.clock_quality.offset_scaled_log_variance);
+                    result.steps_removed = msg.announce_vector.steps_removed;
+
+                    if (static_cast<size_t>(bytes) >= sizeof(PtpHeader) + sizeof(PtpAnnounceBody)) {
+                        const auto* body = reinterpret_cast<const PtpAnnounceBody*>(buffer + sizeof(PtpHeader));
+                        result.time_source = body->time_source;
+                        result.time_source_name = ptp_time_source_name(body->time_source);
+                        result.current_utc_offset = static_cast<int16_t>(net_to_host16(static_cast<uint16_t>(body->current_utc_offset)));
+                    }
+
+                    char ip_buf[INET_ADDRSTRLEN];
+                    if (::inet_ntop(AF_INET, &sender.sin_addr, ip_buf, sizeof(ip_buf))) {
+                        result.grandmaster_ip = ip_buf;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    ::close(fd);
+    return result;
+}
 
 } // namespace audio_core::network

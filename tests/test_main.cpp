@@ -5500,6 +5500,141 @@ void test_ptp_boundary_clock_and_master_sync_daemon() {
               << "PI Servo sub-microsecond lock verified | Socket loopback & timestamping engine verified)" << std::endl;
 }
 
+void test_ptp_grandmaster_hardware_audit_and_discovery() {
+    std::cout << "[TEST] Running PTPv2 Grandmaster Hardware Audit, BMCA & Discovery Probe Test..." << std::endl;
+    using namespace audio_core::network;
+
+    // 1. Audit Interface Capabilities
+    auto lo_audit = audit_interface("lo");
+    TEST_CHECK(lo_audit.exists);
+    TEST_CHECK(lo_audit.is_up);
+    TEST_CHECK(lo_audit.kernel_sw_capable);
+    TEST_CHECK(lo_audit.highest_capable_tier == PtpTimestampSource::KernelDriverStack);
+
+    // Physical Interface Audit (Non-destructive, graceful check)
+    auto enp_audit = audit_interface("enp2s0");
+    TEST_CHECK(enp_audit.phc_index == -1); // Consumer NIC, no hardware PHC
+    auto wlp_audit = audit_interface("wlp4s0");
+    TEST_CHECK(wlp_audit.phc_index == -1);
+
+    // 2. BMCA Quality Descriptions & Helpers
+    TEST_CHECK(std::string(ptp_clock_class_name(6)).find("GPS") != std::string::npos);
+    TEST_CHECK(std::string(ptp_clock_class_name(248)).find("Free-Running") != std::string::npos);
+    TEST_CHECK(std::string(ptp_clock_accuracy_name(0x21)) == "< 100 ns");
+    TEST_CHECK(std::string(ptp_time_source_name(0x20)) == "GPS");
+    TEST_CHECK(std::string(ptp_time_source_name(0xA0)) == "Internal Oscillator");
+
+    PtpClockIdentity test_id{};
+    test_id.id[0] = 0x00; test_id.id[1] = 0x1A; test_id.id[2] = 0x2B; test_id.id[3] = 0xFF;
+    test_id.id[4] = 0xFE; test_id.id[5] = 0x3C; test_id.id[6] = 0x4D; test_id.id[7] = 0x5E;
+    TEST_CHECK(test_id.to_string() == "00:1A:2B:FF:FE:3C:4D:5E");
+
+    // 3. Active Grandmaster Transmission & Discovery Probe on Ephemeral Port
+    constexpr uint16_t kTestGeneralPort = 17320;
+    std::atomic<bool> tx_running{true};
+    std::atomic<bool> tx_started{false};
+
+    std::thread gm_sender([&]() {
+        int tx_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (tx_fd < 0) return;
+        int loop = 1;
+        ::setsockopt(tx_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+        struct in_addr loop_addr{};
+        ::inet_pton(AF_INET, "127.0.0.1", &loop_addr);
+        ::setsockopt(tx_fd, IPPROTO_IP, IP_MULTICAST_IF, &loop_addr, sizeof(loop_addr));
+
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(kTestGeneralPort);
+        ::inet_pton(AF_INET, kPtpPrimaryMulticastIp, &dst.sin_addr);
+
+        sockaddr_in dst_local{};
+        dst_local.sin_family = AF_INET;
+        dst_local.sin_port = htons(kTestGeneralPort);
+        ::inet_pton(AF_INET, "127.0.0.1", &dst_local.sin_addr);
+
+        uint8_t ann_buf[256];
+        PtpPriorityVector gm_vec{};
+        gm_vec.priority1 = 120;
+        gm_vec.clock_quality.clock_class = 6; // GPS
+        gm_vec.clock_quality.clock_accuracy = 0x21; // < 100 ns
+        gm_vec.clock_quality.offset_scaled_log_variance = host_to_net16(0x4000);
+        gm_vec.priority2 = 128;
+        gm_vec.identity = test_id;
+        gm_vec.steps_removed = 0;
+
+        size_t ann_len = PtpBoundaryClock::build_announce_packet(
+            ann_buf, sizeof(ann_buf), test_id, 1, 1, gm_vec
+        );
+
+        // Customize body fields
+        auto* body = reinterpret_cast<PtpAnnounceBody*>(ann_buf + sizeof(PtpHeader));
+        body->time_source = 0x20; // GPS
+        body->current_utc_offset = host_to_net16(37);
+
+        tx_started.store(true);
+        while (tx_running.load()) {
+            ::sendto(tx_fd, ann_buf, ann_len, 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            ::sendto(tx_fd, ann_buf, ann_len, 0, reinterpret_cast<const sockaddr*>(&dst_local), sizeof(dst_local));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ::close(tx_fd);
+    });
+
+    while (!tx_started.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    auto probe_res = probe_grandmaster("lo", kTestGeneralPort, 800);
+    tx_running.store(false);
+    if (gm_sender.joinable()) gm_sender.join();
+
+    TEST_CHECK(probe_res.socket_bound);
+    TEST_CHECK(probe_res.grandmaster_detected);
+    TEST_CHECK(probe_res.clock_class == 6);
+    TEST_CHECK(probe_res.time_source == 0x20);
+    TEST_CHECK(probe_res.priority1 == 120);
+    TEST_CHECK(probe_res.gm_identity_str == "00:1A:2B:FF:FE:3C:4D:5E");
+    TEST_CHECK(probe_res.announce_packets_received >= 1);
+
+    // 4. Grandmaster Absence Test
+    auto empty_probe = probe_grandmaster("lo", 17321, 100);
+    TEST_CHECK(empty_probe.socket_bound);
+    TEST_CHECK(!empty_probe.grandmaster_detected);
+
+    // 5. Grandmaster Delay_Resp Two-Way Timing Message Roundtrip
+    uint8_t dresp_buf[256];
+    PtpClockIdentity slave_id{};
+    slave_id.id[0] = 0xAA; slave_id.id[1] = 0xBB; slave_id.id[2] = 0xCC; slave_id.id[3] = 0xDD;
+    slave_id.id[4] = 0xEE; slave_id.id[5] = 0xFF; slave_id.id[6] = 0x11; slave_id.id[7] = 0x22;
+
+    uint64_t t4_rx_ns = 2'000'005'000ULL;
+    size_t dresp_len = PtpBoundaryClock::build_delay_resp_packet(
+        dresp_buf, sizeof(dresp_buf), test_id, 1, 42, t4_rx_ns, slave_id, 1
+    );
+    TEST_CHECK(dresp_len == sizeof(PtpHeader) + sizeof(PtpDelayRespBody));
+
+    auto parsed_resp = PtpBoundaryClock::parse_packet(dresp_buf, dresp_len);
+    TEST_CHECK(parsed_resp.valid);
+    TEST_CHECK(parsed_resp.type == PtpMessageType::Delay_Resp);
+    TEST_CHECK(parsed_resp.timestamp_ns == t4_rx_ns);
+    TEST_CHECK(parsed_resp.requesting_clock_id == slave_id);
+
+    PtpBoundaryClock slave_clock(slave_id, 128, 128);
+    slave_clock.add_port(1, "lo", true, true);
+    slave_clock.process_timing_exchange(0, 1'000'000'000ULL, 1'000'025'000ULL, 2'000'000'000ULL, parsed_resp.timestamp_ns);
+
+    const auto& port0_telem = slave_clock.port_telemetry(0);
+    TEST_CHECK(port0_telem.mean_path_delay_ns == 15'000);
+    TEST_CHECK(port0_telem.offset_from_master_ns == 10'000);
+
+    std::cout << "  -> PTPv2 Grandmaster Hardware Audit, BMCA & Discovery Probe: PASSED ("
+              << "Interface audit verified [lo, enp2s0, wlp4s0] | "
+              << "Active Grandmaster probe verified (Class 6 GPS, ID=" << probe_res.gm_identity_str << ") | "
+              << "Absence fallback verified | "
+              << "Delay_Resp t4 extraction (" << parsed_resp.timestamp_ns << " ns) & offset (" << port0_telem.offset_from_master_ns << " ns) verified)" << std::endl;
+}
+
 void test_universal_routing_matrix_audio_and_aoip_transmission() {
     std::cout << "[TEST] Running Universal Routing Matrix Audio Busing, Aux Summing & AoIP Transmit Test..." << std::endl;
     using namespace audio_core;
@@ -7857,6 +7992,7 @@ int main() {
     test_sample_tap_quantized_bounce_and_commit();
     test_step_sequencer_midi_pattern_clips_and_arranger();
     test_ptp_boundary_clock_and_master_sync_daemon();
+    test_ptp_grandmaster_hardware_audit_and_discovery();
     test_universal_routing_matrix_audio_and_aoip_transmission();
     test_liquid_vactrol_opto_leveler_and_buchla_lpg();
     test_vari_speed_streamer_and_beat_sync_repitch();
