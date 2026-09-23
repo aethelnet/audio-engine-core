@@ -50,6 +50,9 @@ public:
     [[nodiscard]] virtual float get_parameter(uint32_t index) const noexcept = 0;
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 
+    // Latency reporting for Plugin Delay Compensation (PDC)
+    [[nodiscard]] virtual uint32_t latency_samples() const noexcept { return 0; }
+
     // Fault reporting for sandboxed plugins (WASM/Circuit Breaker)
     [[nodiscard]] virtual bool has_fault() const noexcept { return false; }
     [[nodiscard]] virtual const char* fault_reason() const noexcept { return nullptr; }
@@ -202,6 +205,14 @@ public:
 
     [[nodiscard]] uint32_t consecutive_faults() const noexcept {
         return m_consecutive_faults.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t latency_samples() const noexcept {
+        if (m_bypass.load(std::memory_order_relaxed) || m_circuit_breaker_tripped.load(std::memory_order_relaxed)) {
+            return 0;
+        }
+        IProcessor* proc = m_active_processor.load(std::memory_order_acquire);
+        return proc ? proc->latency_samples() : 0;
     }
 
     [[nodiscard]] uint64_t audio_block_epoch() const noexcept {

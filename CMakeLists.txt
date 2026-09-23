@@ -127,6 +127,12 @@ add_executable(ptp_boundary_daemon
 )
 target_link_libraries(ptp_boundary_daemon PRIVATE audio_core)
 
+# Automated Golden Master Checksum Tool & Generator
+add_executable(golden_master_tool
+    examples/golden_master_tool.cpp
+)
+target_link_libraries(golden_master_tool PRIVATE audio_core)
+
 # ============================================================================
 # Dear ImGui & Desktop UI Workstation (aethel_desk)
 # ============================================================================

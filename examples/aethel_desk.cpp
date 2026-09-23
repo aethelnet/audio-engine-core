@@ -156,8 +156,14 @@ int main(int argc, char** argv) {
     auto* bus_music  = mixer.allocate_submix_bus("Bus B: Music");
     auto* bus_reverb = mixer.allocate_submix_bus("Aux 1: Reverb");
     auto* bus_delay  = mixer.allocate_submix_bus("Aux 2: Delay");
-    (void)bus_reverb;
-    (void)bus_delay;
+    trk0->set_sequencer_send_a_bus(bus_reverb->id());
+    trk0->set_sequencer_send_b_bus(bus_delay->id());
+    trk1->set_sequencer_send_a_bus(bus_reverb->id());
+    trk1->set_sequencer_send_b_bus(bus_delay->id());
+    trk2->set_sequencer_send_a_bus(bus_reverb->id());
+    trk2->set_sequencer_send_b_bus(bus_delay->id());
+    trk3->set_sequencer_send_a_bus(bus_reverb->id());
+    trk3->set_sequencer_send_b_bus(bus_delay->id());
 
     // Route tracks to Submix buses by default:
     // Track 1 (Kick/808) -> Bus A (Drums)
@@ -993,6 +999,24 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine();
                             }
 
+                            // Voice Mode: Monophonic (all-choke classic) vs Polyphonic 16-Voice with Choke Groups
+                            bool is_poly = (seq->voice_mode() == sequencer::VoiceMode::Polyphonic);
+                            if (is_poly) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.58f, 0.32f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            }
+                            if (ImGui::SmallButton(is_poly ? "VOICE: POLY (16)##vm" : "VOICE: MONO (CHOKE)##vm")) {
+                                seq->set_voice_mode(is_poly ? sequencer::VoiceMode::Monophonic : sequencer::VoiceMode::Polyphonic);
+                            }
+                            ImGui::PopStyleColor(2);
+
+                            ImGui::SameLine(0, 6);
+                            ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[%u/16 VOICES]", seq->active_voice_count());
+
+                            ImGui::SameLine(0, 12);
                             // Pattern Switch Mode (Quantized)
                             auto cur_mode = seq->switch_mode();
                             const char* mode_str = (cur_mode == sequencer::PatternSwitchMode::BarQuantized) ? "BAR-SYNC" :
@@ -1016,6 +1040,55 @@ int main(int argc, char** argv) {
                             if (ImGui::SmallButton("EUCLID 8##pat")) {
                                 pat.clear();
                                 for (int st = 0; st < 16; st += 2) pat.set_step(st, (st % 4 == 0) ? 0 : 2, 0.85f);
+                            }
+
+                            // Auto-Chop & Slice-to-MIDI Groove Action
+                            ImGui::SameLine(0, 12);
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.35f, 0.08f, 0.90f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            if (ImGui::SmallButton("⚡ AUTO-CHOP & GROOVE##pat")) {
+                                seq->auto_chop_and_groove(0.5f, pattern_editor_pat_idx);
+                            }
+                            ImGui::PopStyleColor(2);
+
+                            // Pattern Swing Slider
+                            ImGui::SameLine(0, 12);
+                            ImGui::SetNextItemWidth(75);
+                            int swing_pct = static_cast<int>(std::round(pat.swing * 100.0f));
+                            if (ImGui::SliderInt("Swing##pat", &swing_pct, 0, 100, "%d%%")) {
+                                pat.swing = static_cast<float>(swing_pct) / 100.0f;
+                            }
+
+                            // Whole-Pattern Quick Quantize
+                            ImGui::SameLine(0, 8);
+                            if (ImGui::SmallButton("SNAP 100%##all")) {
+                                pat.quantize_all(1.0f);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("RAW 0%##all")) {
+                                pat.quantize_all(0.0f);
+                            }
+
+                            // Parameter Automation Lane Selector (Elektron / Bitwig Style)
+                            static int s_seq_auto_lane_target = 0; // 0=Vel, 1=Cutoff, 2=Decay, 3=Drive, 4=Rev A, 5=Dly B, 6=Pitch, 7=Pan, 8=Micro, 9=Prob
+                            ImGui::Spacing();
+                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "AUTOMATION LANE:");
+                            ImGui::SameLine(0, 8);
+                            const char* auto_lane_names[] = { "Vel", "Cutoff", "Decay", "Drive", "Rev A", "Dly B", "Pitch", "Pan", "Micro", "Prob" };
+                            for (int al = 0; al < 10; ++al) {
+                                if (al > 0) ImGui::SameLine(0, 4);
+                                bool is_al_sel = (s_seq_auto_lane_target == al);
+                                if (is_al_sel) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.94f, 0.96f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+                                }
+                                if (ImGui::SmallButton(auto_lane_names[al])) {
+                                    s_seq_auto_lane_target = al;
+                                }
+                                ImGui::PopStyleColor(2);
                             }
 
                             // Row 2: 16-Step Button Grid with Live Step Playhead LED
@@ -1058,9 +1131,153 @@ int main(int argc, char** argv) {
                                 }
                                 ImGui::PopStyleColor(2);
 
-                                // Mini velocity indicator bar
-                                float vel = st_active ? pat.steps[st].velocity : 0.0f;
-                                ImGui::ProgressBar(vel, ImVec2(34, 4), "");
+                                // 16-Step Interactive Parameter Automation Bar (Elektron / Bitwig style)
+                                ImDrawList* dlist = ImGui::GetWindowDrawList();
+                                ImVec2 bar_sz(34.0f, 26.0f);
+                                ImVec2 b_p0 = ImGui::GetCursorScreenPos();
+                                ImVec2 b_p1 = ImVec2(b_p0.x + bar_sz.x, b_p0.y + bar_sz.y);
+
+                                char bar_btn_id[32];
+                                std::snprintf(bar_btn_id, sizeof(bar_btn_id), "##al_bar_%d", st);
+                                ImGui::InvisibleButton(bar_btn_id, bar_sz);
+
+                                bool b_hovered = ImGui::IsItemHovered();
+                                bool b_active = ImGui::IsItemActive();
+
+                                auto& sref = pat.steps[st];
+                                if (b_active) {
+                                    pattern_editor_step_idx = st;
+                                    float my = ImGui::GetIO().MousePos.y;
+                                    float drag_norm = std::clamp(1.0f - (my - b_p0.y) / bar_sz.y, 0.0f, 1.0f);
+
+                                    if (s_seq_auto_lane_target == 0) { // Velocity
+                                        sref.velocity = drag_norm;
+                                        if (!sref.active && drag_norm > 0.05f) sref.active = true;
+                                    } else if (s_seq_auto_lane_target == 1) { // Cutoff
+                                        sref.filter_cutoff = (drag_norm >= 0.98f) ? 20000.0f : 40.0f * std::pow(500.0f, drag_norm);
+                                    } else if (s_seq_auto_lane_target == 2) { // Decay
+                                        sref.decay_ms = (drag_norm >= 0.98f) ? 0.0f : drag_norm * 1500.0f;
+                                    } else if (s_seq_auto_lane_target == 3) { // Drive
+                                        sref.drive = drag_norm;
+                                    } else if (s_seq_auto_lane_target == 4) { // Rev A
+                                        sref.send_a = drag_norm;
+                                    } else if (s_seq_auto_lane_target == 5) { // Dly B
+                                        sref.send_b = drag_norm;
+                                    } else if (s_seq_auto_lane_target == 6) { // Pitch
+                                        float bi = (drag_norm - 0.5f) * 2.0f;
+                                        sref.pitch_ratio = std::pow(2.0f, bi);
+                                    } else if (s_seq_auto_lane_target == 7) { // Pan
+                                        sref.pan = (drag_norm - 0.5f) * 2.0f;
+                                    } else if (s_seq_auto_lane_target == 8) { // Micro
+                                        sref.micro_timing = (drag_norm - 0.5f);
+                                    } else if (s_seq_auto_lane_target == 9) { // Prob
+                                        sref.probability = static_cast<uint8_t>(std::round(drag_norm * 100.0f));
+                                    }
+                                }
+
+                                // Background
+                                dlist->AddRectFilled(b_p0, b_p1, IM_COL32(236, 239, 244, 255), 2.0f);
+
+                                // Compute display values & color
+                                float norm_fill = 0.0f;
+                                float bi_fill = 0.0f;
+                                bool is_bi = false;
+                                ImU32 fill_col = IM_COL32(31, 97, 217, 220); // Default Blue
+                                char val_txt[16] = "";
+
+                                const auto& cur_s = pat.steps[st];
+                                if (s_seq_auto_lane_target == 0) { // Velocity
+                                    norm_fill = cur_s.active ? cur_s.velocity : 0.0f;
+                                    fill_col = IM_COL32(31, 97, 217, 220);
+                                    std::snprintf(val_txt, sizeof(val_txt), "%d", static_cast<int>(std::round(cur_s.velocity * 100.0f)));
+                                } else if (s_seq_auto_lane_target == 1) { // Cutoff
+                                    norm_fill = std::clamp(std::log(cur_s.filter_cutoff / 40.0f) / std::log(20000.0f / 40.0f), 0.0f, 1.0f);
+                                    fill_col = IM_COL32(217, 123, 13, 220);
+                                    if (cur_s.filter_cutoff >= 19900.0f) std::snprintf(val_txt, sizeof(val_txt), "BYP");
+                                    else if (cur_s.filter_cutoff >= 1000.0f) std::snprintf(val_txt, sizeof(val_txt), "%.1fk", cur_s.filter_cutoff * 0.001f);
+                                    else std::snprintf(val_txt, sizeof(val_txt), "%.0f", cur_s.filter_cutoff);
+                                } else if (s_seq_auto_lane_target == 2) { // Decay
+                                    norm_fill = (cur_s.decay_ms <= 0.01f) ? 1.0f : std::clamp(cur_s.decay_ms / 1500.0f, 0.0f, 1.0f);
+                                    fill_col = IM_COL32(16, 163, 127, 220);
+                                    if (cur_s.decay_ms <= 0.01f) std::snprintf(val_txt, sizeof(val_txt), "FULL");
+                                    else std::snprintf(val_txt, sizeof(val_txt), "%.0fm", cur_s.decay_ms);
+                                } else if (s_seq_auto_lane_target == 3) { // Drive
+                                    norm_fill = cur_s.drive;
+                                    fill_col = IM_COL32(220, 53, 69, 220);
+                                    if (cur_s.drive < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.drive * 100.0f)));
+                                } else if (s_seq_auto_lane_target == 4) { // Rev A
+                                    norm_fill = cur_s.send_a;
+                                    fill_col = IM_COL32(138, 75, 232, 220);
+                                    if (cur_s.send_a < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_a * 100.0f)));
+                                } else if (s_seq_auto_lane_target == 5) { // Dly B
+                                    norm_fill = cur_s.send_b;
+                                    fill_col = IM_COL32(14, 165, 233, 220);
+                                    if (cur_s.send_b < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_b * 100.0f)));
+                                } else if (s_seq_auto_lane_target == 6) { // Pitch
+                                    is_bi = true;
+                                    bi_fill = std::clamp(std::log2(cur_s.pitch_ratio), -1.0f, 1.0f);
+                                    fill_col = IM_COL32(99, 102, 241, 220);
+                                    std::snprintf(val_txt, sizeof(val_txt), "%.2fx", cur_s.pitch_ratio);
+                                } else if (s_seq_auto_lane_target == 7) { // Pan
+                                    is_bi = true;
+                                    bi_fill = cur_s.pan;
+                                    fill_col = IM_COL32(249, 115, 22, 220);
+                                    if (std::abs(cur_s.pan) < 0.05f) std::snprintf(val_txt, sizeof(val_txt), "C");
+                                    else if (cur_s.pan < 0.0f) std::snprintf(val_txt, sizeof(val_txt), "L%.0f", -cur_s.pan * 100.0f);
+                                    else std::snprintf(val_txt, sizeof(val_txt), "R%.0f", cur_s.pan * 100.0f);
+                                } else if (s_seq_auto_lane_target == 8) { // Micro
+                                    is_bi = true;
+                                    bi_fill = cur_s.micro_timing * 2.0f;
+                                    fill_col = IM_COL32(234, 88, 12, 220);
+                                    std::snprintf(val_txt, sizeof(val_txt), "%+.0f%%", cur_s.micro_timing * 100.0f);
+                                } else if (s_seq_auto_lane_target == 9) { // Prob
+                                    norm_fill = static_cast<float>(cur_s.probability) / 100.0f;
+                                    fill_col = IM_COL32(100, 116, 139, 220);
+                                    std::snprintf(val_txt, sizeof(val_txt), "%d%%", cur_s.probability);
+                                }
+
+                                // Inactive step dimming
+                                if (!cur_s.active) {
+                                    fill_col = (fill_col & 0x00FFFFFF) | 0x40000000; // 25% alpha
+                                }
+
+                                // Draw bar geometry
+                                if (is_bi) {
+                                    float mid_y = b_p0.y + bar_sz.y * 0.5f;
+                                    dlist->AddLine(ImVec2(b_p0.x, mid_y), ImVec2(b_p1.x, mid_y), IM_COL32(180, 185, 195, 255), 1.0f);
+                                    float h = -bi_fill * (bar_sz.y * 0.45f);
+                                    if (bi_fill > 0.01f) {
+                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y + h), ImVec2(b_p1.x - 2, mid_y), fill_col, 1.0f);
+                                    } else if (bi_fill < -0.01f) {
+                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y), ImVec2(b_p1.x - 2, mid_y + h), fill_col, 1.0f);
+                                    }
+                                } else {
+                                    float fill_h = norm_fill * (bar_sz.y - 2.0f);
+                                    if (fill_h > 1.0f) {
+                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, b_p1.y - 1.0f - fill_h), ImVec2(b_p1.x - 2, b_p1.y - 1.0f), fill_col, 1.0f);
+                                    }
+                                }
+
+                                // Border highlight
+                                ImU32 brd_col = b_hovered ? IM_COL32(31, 97, 217, 255) :
+                                               (pattern_editor_step_idx == st ? IM_COL32(217, 123, 13, 255) : IM_COL32(200, 205, 215, 255));
+                                dlist->AddRect(b_p0, b_p1, brd_col, 2.0f);
+
+                                // Centered value text
+                                ImVec2 txt_sz = ImGui::CalcTextSize(val_txt);
+                                ImVec2 txt_pos(b_p0.x + (bar_sz.x - txt_sz.x) * 0.5f, b_p0.y + (bar_sz.y - txt_sz.y) * 0.5f);
+                                ImU32 txt_col = cur_s.active ? IM_COL32(26, 30, 40, 255) : IM_COL32(140, 145, 155, 255);
+                                dlist->AddText(txt_pos, txt_col, val_txt);
+
+                                // Slice & micro info under step
+                                if (cur_s.active) {
+                                    ImGui::TextColored(ImVec4(0.20f, 0.45f, 0.85f, 0.9f), "S%u", cur_s.slice_id);
+                                } else {
+                                    ImGui::TextDisabled(" -- ");
+                                }
 
                                 ImGui::EndGroup();
                             }
@@ -1069,36 +1286,183 @@ int main(int argc, char** argv) {
                             ImGui::Spacing();
                             ImGui::Separator();
 
-                            // Left sub-pane: Step properties for pattern_editor_step_idx
+                            // Left sub-pane: Comprehensive Note Inspector for pattern_editor_step_idx
                             ImGui::BeginGroup();
                             {
-                                ImGui::TextColored(ImVec4(0.20f, 0.25f, 0.35f, 1.0f), "Step %d Properties:", pattern_editor_step_idx + 1);
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "NOTE INSPECTOR [Step %d]:", pattern_editor_step_idx + 1);
                                 ImGui::SameLine();
                                 auto& step_ref = pat.steps[pattern_editor_step_idx];
                                 bool s_act = step_ref.active;
                                 if (ImGui::Checkbox("Active##StepProp", &s_act)) {
                                     step_ref.active = s_act;
                                 }
-                                ImGui::SameLine(0, 15);
+                                ImGui::SameLine(0, 10);
                                 int s_slice = static_cast<int>(step_ref.slice_id);
-                                ImGui::SetNextItemWidth(70);
-                                if (ImGui::SliderInt("Slice##StepProp", &s_slice, 0, 7)) {
+                                ImGui::SetNextItemWidth(60);
+                                if (ImGui::SliderInt("Slice##StepProp", &s_slice, 0, 15)) {
                                     step_ref.slice_id = static_cast<uint32_t>(s_slice);
                                 }
-                                ImGui::SameLine(0, 15);
-                                ImGui::SetNextItemWidth(80);
-                                ImGui::SliderFloat("Vel##StepProp", &step_ref.velocity, 0.0f, 1.0f, "%.2f");
-                                ImGui::SameLine(0, 15);
-                                ImGui::SetNextItemWidth(80);
-                                ImGui::SliderFloat("Pitch##StepProp", &step_ref.pitch_ratio, 0.25f, 2.0f, "%.2fx");
-                                ImGui::SameLine(0, 15);
-                                int prob = static_cast<int>(step_ref.probability);
+                                ImGui::SameLine(0, 10);
                                 ImGui::SetNextItemWidth(70);
+                                ImGui::SliderFloat("Vel##StepProp", &step_ref.velocity, 0.0f, 1.0f, "%.2f");
+                                ImGui::SameLine(0, 10);
+                                ImGui::SetNextItemWidth(75);
+                                char pan_buf[16];
+                                if (std::abs(step_ref.pan) < 0.01f) {
+                                    std::snprintf(pan_buf, sizeof(pan_buf), "C");
+                                } else if (step_ref.pan < 0.0f) {
+                                    std::snprintf(pan_buf, sizeof(pan_buf), "%.0f%% L", -step_ref.pan * 100.0f);
+                                } else {
+                                    std::snprintf(pan_buf, sizeof(pan_buf), "%.0f%% R", step_ref.pan * 100.0f);
+                                }
+                                ImGui::SliderFloat("Pan##StepProp", &step_ref.pan, -1.0f, 1.0f, pan_buf);
+                                ImGui::SameLine(0, 10);
+                                ImGui::SetNextItemWidth(70);
+                                ImGui::SliderFloat("Pitch##StepProp", &step_ref.pitch_ratio, 0.25f, 2.0f, "%.2fx");
+                                ImGui::SameLine(0, 10);
+                                int prob = static_cast<int>(step_ref.probability);
+                                ImGui::SetNextItemWidth(60);
                                 if (ImGui::SliderInt("Prob%##StepProp", &prob, 0, 100)) {
                                     step_ref.probability = static_cast<uint8_t>(prob);
                                 }
+                                ImGui::SameLine(0, 10);
+                                ImGui::Checkbox("Rev##StepProp", &step_ref.reverse);
+
+                                // Second line in Inspector: Micro-Timing Offset & Per-Note Quantization
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.55f, 1.0f), "Micro-Timing:");
+                                ImGui::SameLine(0, 6);
+                                ImGui::SetNextItemWidth(125);
+                                int micro_int = static_cast<int>(std::round(step_ref.micro_timing * 100.0f));
+                                char micro_str[32];
+                                if (micro_int == 0) {
+                                    std::snprintf(micro_str, sizeof(micro_str), "Grid (0%%)");
+                                } else if (micro_int < 0) {
+                                    std::snprintf(micro_str, sizeof(micro_str), "Rush (%d%%)", micro_int);
+                                } else {
+                                    std::snprintf(micro_str, sizeof(micro_str), "Late (+%d%%)", micro_int);
+                                }
+                                if (ImGui::SliderInt("##MicroSlider", &micro_int, -50, 50, micro_str)) {
+                                    step_ref.micro_timing = static_cast<float>(micro_int) / 100.0f;
+                                }
+
                                 ImGui::SameLine(0, 15);
-                                ImGui::Checkbox("Reverse##StepProp", &step_ref.reverse);
+                                ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.55f, 1.0f), "Quantize:");
+                                ImGui::SameLine(0, 6);
+                                ImGui::SetNextItemWidth(80);
+                                int q_int = static_cast<int>(std::round(step_ref.quantize_pct * 100.0f));
+                                if (ImGui::SliderInt("##QuantizePct", &q_int, 0, 100, "%d%%")) {
+                                    step_ref.quantize_pct = static_cast<float>(q_int) / 100.0f;
+                                }
+                                ImGui::SameLine(0, 6);
+                                if (ImGui::SmallButton("RAW 0%##nt")) {
+                                    step_ref.quantize_pct = 0.0f;
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("50%##nt")) {
+                                    step_ref.quantize_pct = 0.5f;
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("SNAP 100%##nt")) {
+                                    step_ref.quantize_pct = 1.0f;
+                                }
+
+                                // Third line in Inspector: Per-Step Parameter Locks (Filter, Envelope, Saturation, Choke Group)
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.15f, 1.0f), "P-LOCKS:");
+                                ImGui::SameLine(0, 8);
+
+                                // Choke Group selector: 0=Poly/Off, 1..4=Group 1..4
+                                ImGui::SetNextItemWidth(88);
+                                const char* choke_labels[] = { "Choke: Off", "Choke: G1", "Choke: G2", "Choke: G3", "Choke: G4" };
+                                int cur_cg = static_cast<int>(step_ref.choke_group);
+                                if (cur_cg > 4) cur_cg = 4;
+                                if (ImGui::Combo("##ChokeGrp", &cur_cg, choke_labels, 5)) {
+                                    step_ref.choke_group = static_cast<uint8_t>(cur_cg);
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                // Filter Cutoff Slider (20 Hz - 20000 Hz, logarithmic feel)
+                                ImGui::SetNextItemWidth(95);
+                                char cut_str[24];
+                                if (step_ref.filter_cutoff >= 19900.0f) {
+                                    std::snprintf(cut_str, sizeof(cut_str), "Cut: BYPASS");
+                                } else {
+                                    std::snprintf(cut_str, sizeof(cut_str), "Cut: %.0fHz", step_ref.filter_cutoff);
+                                }
+                                if (ImGui::SliderFloat("##CutoffLock", &step_ref.filter_cutoff, 40.0f, 20000.0f, cut_str, ImGuiSliderFlags_Logarithmic)) {
+                                    // Cutoff updated
+                                }
+
+                                ImGui::SameLine(0, 6);
+                                // Filter Resonance Q (0.1 - 8.0)
+                                ImGui::SetNextItemWidth(65);
+                                ImGui::SliderFloat("##ResLock", &step_ref.filter_res, 0.1f, 8.0f, "Q: %.2f");
+
+                                ImGui::SameLine(0, 6);
+                                // Filter Type (LP, HP, BP, Notch)
+                                ImGui::SetNextItemWidth(65);
+                                const char* ftype_names[] = { "LP", "HP", "BP", "Notch" };
+                                int ftype_idx = static_cast<int>(step_ref.filter_type);
+                                if (ftype_idx < 0 || ftype_idx > 3) ftype_idx = 0;
+                                if (ImGui::Combo("##FilterTypeLock", &ftype_idx, ftype_names, 4)) {
+                                    step_ref.filter_type = static_cast<dsp::FilterType>(ftype_idx);
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                // Decay Envelope Slider (0 ms = Full, up to 1500 ms)
+                                ImGui::SetNextItemWidth(90);
+                                char decay_str[24];
+                                if (step_ref.decay_ms <= 0.01f) {
+                                    std::snprintf(decay_str, sizeof(decay_str), "Dec: FULL");
+                                } else {
+                                    std::snprintf(decay_str, sizeof(decay_str), "Dec: %.0fms", step_ref.decay_ms);
+                                }
+                                if (ImGui::SliderFloat("##DecayLock", &step_ref.decay_ms, 0.0f, 1500.0f, decay_str)) {
+                                    // Decay updated
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                // Analog Drive / Soft Saturation Slider (0% - 100%)
+                                ImGui::SetNextItemWidth(80);
+                                int drive_pct = static_cast<int>(std::round(step_ref.drive * 100.0f));
+                                char drive_str[24];
+                                if (drive_pct == 0) {
+                                    std::snprintf(drive_str, sizeof(drive_str), "Sat: OFF");
+                                } else {
+                                    std::snprintf(drive_str, sizeof(drive_str), "Sat: %d%%", drive_pct);
+                                }
+                                if (ImGui::SliderInt("##DriveLock", &drive_pct, 0, 100, drive_str)) {
+                                    step_ref.drive = static_cast<float>(drive_pct) / 100.0f;
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                // Aux Send A (Reverb) Slider (0% - 100%)
+                                ImGui::SetNextItemWidth(75);
+                                int send_a_pct = static_cast<int>(std::round(step_ref.send_a * 100.0f));
+                                char send_a_str[24];
+                                if (send_a_pct == 0) {
+                                    std::snprintf(send_a_str, sizeof(send_a_str), "Rev: OFF");
+                                } else {
+                                    std::snprintf(send_a_str, sizeof(send_a_str), "Rev: %d%%", send_a_pct);
+                                }
+                                if (ImGui::SliderInt("##SendALock", &send_a_pct, 0, 100, send_a_str)) {
+                                    step_ref.send_a = static_cast<float>(send_a_pct) / 100.0f;
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                // Aux Send B (Delay) Slider (0% - 100%)
+                                ImGui::SetNextItemWidth(75);
+                                int send_b_pct = static_cast<int>(std::round(step_ref.send_b * 100.0f));
+                                char send_b_str[24];
+                                if (send_b_pct == 0) {
+                                    std::snprintf(send_b_str, sizeof(send_b_str), "Dly: OFF");
+                                } else {
+                                    std::snprintf(send_b_str, sizeof(send_b_str), "Dly: %d%%", send_b_pct);
+                                }
+                                if (ImGui::SliderInt("##SendBLock", &send_b_pct, 0, 100, send_b_str)) {
+                                    step_ref.send_b = static_cast<float>(send_b_pct) / 100.0f;
+                                }
                             }
                             ImGui::EndGroup();
 
@@ -2140,6 +2504,206 @@ int main(int argc, char** argv) {
                                         telemetry.master_meter.peak_l >= 1.0f);
                         ImGui::Dummy(ImVec2(26, 110));
                         ImGui::Text("%.1f dB", ui::linear_to_db(master_gain));
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopID();
+
+                    // Render Selected Track Modular DSP Rack Inspector (Eurorack / 500-Series Style)
+                    ImGui::SameLine();
+                    ImGui::PushID(900);
+                    ImGui::BeginChild("TrackDspRack_Inspector", ImVec2(340, 0), true);
+                    {
+                        // Header
+                        const char* cur_trk_name = track_names[selected_track];
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "DSP RACK: TRACK %d", selected_track + 1);
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", cur_trk_name);
+                        ImGui::Separator();
+
+                        auto* sel_trk = (selected_track == 0) ? trk0 : ((selected_track == 1) ? trk1 : ((selected_track == 2) ? trk2 : trk3));
+
+                        // 4 Modular Rack Units
+                        for (int s = 0; s < 4; ++s) {
+                            ImGui::PushID(s);
+                            bool has_p = (sel_trk && sel_trk->slot(s).processor() != nullptr);
+                            auto* proc = has_p ? sel_trk->slot(s).processor() : nullptr;
+                            bool is_by = has_p ? sel_trk->slot(s).is_bypassed() : true;
+
+                            ImVec4 frame_bg = has_p ? (is_by ? ImVec4(0.94f, 0.94f, 0.96f, 1.0f) : ImVec4(0.91f, 0.94f, 0.98f, 1.0f))
+                                                    : ImVec4(0.96f, 0.96f, 0.97f, 1.0f);
+                            ImGui::PushStyleColor(ImGuiCol_ChildBg, frame_bg);
+                            char frame_id[32];
+                            std::snprintf(frame_id, sizeof(frame_id), "RackSlot_%d", s + 1);
+                            ImGui::BeginChild(frame_id, ImVec2(0, 100), true);
+                            {
+                                // Unit Faceplate Top Bar
+                                ImGui::TextColored(has_p ? ImVec4(0.12f, 0.38f, 0.85f, 1.0f) : ImVec4(0.50f, 0.55f, 0.60f, 1.0f),
+                                                   "S%d: %s", s + 1, has_p ? proc->name() : "[EMPTY]");
+
+                                if (has_p) {
+                                    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70);
+                                    if (ImGui::SmallButton(is_by ? "OFF##by" : "ON##by")) {
+                                        sel_trk->slot(s).set_bypass(!is_by);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton("X##ej")) {
+                                        sel_trk->slot(s).set_processor(nullptr);
+                                    }
+                                    ImGui::Separator();
+
+                                    // Detailed DSP Controls based on Processor Name
+                                    std::string pname = proc->name();
+                                    if (pname.find("Baxandall") != std::string::npos) {
+                                        float bass = proc->get_parameter(0);
+                                        float treble = proc->get_parameter(1);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Bass##bax", &bass, -12.0f, 12.0f, "%.1f dB")) {
+                                            proc->set_parameter(0, bass);
+                                        }
+                                        ImGui::SameLine(0, 10);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Treble##bax", &treble, -12.0f, 12.0f, "%.1f dB")) {
+                                            proc->set_parameter(1, treble);
+                                        }
+                                        ImGui::TextDisabled("C^inf Smooth Baxandall Tone Stack");
+                                    } else if (pname.find("ButterComp2") != std::string::npos) {
+                                        float comp = proc->get_parameter(0);
+                                        float out = proc->get_parameter(1);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Comp##bc", &comp, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(0, comp);
+                                        }
+                                        ImGui::SameLine(0, 10);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Out##bc", &out, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(1, out);
+                                        }
+                                        float est_gr = comp * 0.7f;
+                                        ImGui::ProgressBar(est_gr, ImVec2(-1, 6), "");
+                                        ImGui::TextDisabled("Butterworth Dynamics & Master Glue");
+                                    } else if (pname.find("PurestDrive") != std::string::npos) {
+                                        float drv = proc->get_parameter(0);
+                                        ImGui::SetNextItemWidth(180);
+                                        if (ImGui::SliderFloat("Drive##pdrv", &drv, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(0, drv);
+                                        }
+                                        ImGui::SameLine();
+                                        ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.10f, 1.0f), "%.0f%% Sat", drv * 100.0f);
+                                        ImGui::TextDisabled("Pure Non-Linear Console Saturation");
+                                    } else if (pname.find("DeRez") != std::string::npos) {
+                                        float rate = proc->get_parameter(0);
+                                        float res = proc->get_parameter(1);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Rate##drz", &rate, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(0, rate);
+                                        }
+                                        ImGui::SameLine(0, 10);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Res##drz", &res, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(1, res);
+                                        }
+                                        ImGui::TextDisabled("Vintage Sampler Variable-Clock & Mu-Law");
+                                    } else if (pname.find("Vactrol") != std::string::npos || pname.find("LA-2A") != std::string::npos || pname.find("Buchla") != std::string::npos) {
+                                        float pr = proc->get_parameter(0);
+                                        float mk = proc->get_parameter(1);
+                                        float hf = proc->get_parameter(4);
+                                        ImGui::SetNextItemWidth(100);
+                                        if (ImGui::SliderFloat("Red##vac", &pr, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(0, pr);
+                                        }
+                                        ImGui::SameLine(0, 8);
+                                        ImGui::SetNextItemWidth(90);
+                                        if (ImGui::SliderFloat("Gain##vac", &mk, -6.0f, 18.0f, "%.1fdB")) {
+                                            proc->set_parameter(1, mk);
+                                        }
+                                        ImGui::SameLine(0, 8);
+                                        ImGui::SetNextItemWidth(65);
+                                        if (ImGui::SliderFloat("R37##vac", &hf, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(4, hf);
+                                        }
+                                        float opto_gr = pr * 0.85f;
+                                        ImGui::ProgressBar(opto_gr, ImVec2(-1, 6), "");
+                                        ImGui::TextDisabled("Optical CdS Dark Memory Photocell Leveler");
+                                    } else {
+                                        float p0 = proc->get_parameter(0);
+                                        float p1 = proc->get_parameter(1);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Param 1##gen", &p0, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(0, p0);
+                                        }
+                                        ImGui::SameLine(0, 10);
+                                        ImGui::SetNextItemWidth(120);
+                                        if (ImGui::SliderFloat("Param 2##gen", &p1, 0.0f, 1.0f, "%.2f")) {
+                                            proc->set_parameter(1, p1);
+                                        }
+                                        ImGui::TextDisabled("Real-Time IProcessor DSP Module");
+                                    }
+                                } else {
+                                    ImGui::Separator();
+                                    ImGui::Spacing();
+                                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 30);
+                                    if (ImGui::Button("+ LOAD DSP MODULE...", ImVec2(240, 26))) {
+                                        ImGui::OpenPopup("RackSlotLoadPopup");
+                                    }
+                                    if (ImGui::BeginPopup("RackSlotLoadPopup")) {
+                                        ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "LOAD MODULE INTO SLOT %d", s + 1);
+                                        ImGui::Separator();
+                                        if (ImGui::MenuItem("Airwindows Baxandall EQ")) {
+                                            auto p = std::make_shared<dsp::Baxandall>();
+                                            p->init(kSampleRate);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Airwindows ButterComp2")) {
+                                            auto p = std::make_shared<dsp::ButterComp2>();
+                                            p->init(kSampleRate);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Airwindows PurestDrive")) {
+                                            auto p = std::make_shared<dsp::PurestDrive>();
+                                            p->init(kSampleRate);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Airwindows DeRez2 Crunch")) {
+                                            auto p = std::make_shared<dsp::DeRez>();
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.90f);
+                                            p->set_parameter(1, 0.80f);
+                                            p->set_parameter(2, 0.0f);
+                                            p->set_parameter(3, 1.0f);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Liquid Vactrol Leveler (LA-2A Opto)")) {
+                                            auto p = std::make_shared<dsp::LiquidVactrolProcessor>(kSampleRate);
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.60f);
+                                            p->set_parameter(1, 0.0f);
+                                            p->set_parameter(2, 0.0f);
+                                            p->set_parameter(3, 0.75f);
+                                            p->set_parameter(4, 0.50f);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Buchla 292 LPG (Vactrol Gate)")) {
+                                            auto p = std::make_shared<dsp::LiquidVactrolProcessor>(kSampleRate);
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, 0.75f);
+                                            p->set_parameter(1, 0.0f);
+                                            p->set_parameter(2, 2.0f);
+                                            p->set_parameter(6, 0.35f);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Sovereign MultiHead ODE Compressor")) {
+                                            auto p = std::make_shared<dsp::MultiHeadOdeProcessor>(kSampleRate, 4);
+                                            p->init(kSampleRate);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        ImGui::EndPopup();
+                                    }
+                                }
+                            }
+                            ImGui::EndChild();
+                            ImGui::PopStyleColor();
+                            ImGui::PopID();
+                        }
                     }
                     ImGui::EndChild();
                     ImGui::PopID();

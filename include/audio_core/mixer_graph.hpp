@@ -79,6 +79,8 @@ public:
         m_dca_mask.store(0, std::memory_order_relaxed);
         m_mute_group_mask.store(0, std::memory_order_relaxed);
         m_target_bus.store(-1, std::memory_order_relaxed);
+        m_seq_send_a_bus.store(-1, std::memory_order_relaxed);
+        m_seq_send_b_bus.store(-1, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -88,7 +90,10 @@ public:
         m_streamer.reset();
         m_launcher.stop_immediate();
         m_buffer.clear();
-        reset_meters();
+        m_pdc_buffer.clear();
+        m_pdc_write_pos = 0;
+        m_pdc_delay_samples.store(0, std::memory_order_relaxed);
+        m_has_previous_gain = false;
         m_active.store(true, std::memory_order_release);
     }
 
@@ -99,6 +104,8 @@ public:
         m_solo_safe.store(false, std::memory_order_relaxed);
         m_dca_mask.store(0, std::memory_order_relaxed);
         m_mute_group_mask.store(0, std::memory_order_relaxed);
+        m_seq_send_a_bus.store(-1, std::memory_order_relaxed);
+        m_seq_send_b_bus.store(-1, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -109,17 +116,29 @@ public:
         m_launcher.stop_immediate();
         m_buffer.clear();
         reset_meters();
+        m_pdc_buffer.clear();
+        m_pdc_write_pos = 0;
+        m_pdc_delay_samples.store(0, std::memory_order_relaxed);
+        m_has_previous_gain = false;
     }
 
-    void set_gain(float gain) noexcept { m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
+    void snap_parameters() noexcept {
+        m_has_previous_gain = false;
+    }
+
+    void set_gain(float gain, bool snap = false) noexcept {
+        m_gain.store(std::max(0.0f, gain), std::memory_order_relaxed);
+        if (snap) snap_parameters();
+    }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
 
-    void set_pan(float pan) noexcept {
+    void set_pan(float pan, bool snap = false) noexcept {
         float p = std::clamp(pan, -1.0f, 1.0f);
         m_pan.store(p, std::memory_order_relaxed);
         if (!m_custom_azimuth.load(std::memory_order_relaxed)) {
             m_azimuth.store(p * std::numbers::pi_v<float> * 0.5f, std::memory_order_relaxed);
         }
+        if (snap) snap_parameters();
     }
     [[nodiscard]] float pan() const noexcept { return m_pan.load(std::memory_order_relaxed); }
 
@@ -293,6 +312,12 @@ public:
         return m_sequencer_enabled.load(std::memory_order_relaxed) && (m_sequencer != nullptr);
     }
 
+    void set_sequencer_send_a_bus(int32_t bus_id) noexcept { m_seq_send_a_bus.store(bus_id, std::memory_order_relaxed); }
+    [[nodiscard]] int32_t sequencer_send_a_bus() const noexcept { return m_seq_send_a_bus.load(std::memory_order_relaxed); }
+
+    void set_sequencer_send_b_bus(int32_t bus_id) noexcept { m_seq_send_b_bus.store(bus_id, std::memory_order_relaxed); }
+    [[nodiscard]] int32_t sequencer_send_b_bus() const noexcept { return m_seq_send_b_bus.load(std::memory_order_relaxed); }
+
     // Clip Launcher Integration
     [[nodiscard]] sequencer::ClipLauncher& clip_launcher() noexcept { return m_launcher; }
     [[nodiscard]] const sequencer::ClipLauncher& clip_launcher() const noexcept { return m_launcher; }
@@ -446,10 +471,62 @@ public:
     };
     [[nodiscard]] const std::array<SendInfo, kMaxTrackSends>& sends() const noexcept { return m_sends; }
 
+    // Plugin Delay Compensation (PDC) Query & Delay Application
+    [[nodiscard]] uint32_t latency_samples() const noexcept {
+        uint32_t lat = 0;
+        for (const auto& slot : m_slots) {
+            lat += slot.latency_samples();
+        }
+        return lat;
+    }
+
+    void set_pdc_delay_samples(uint32_t delay) noexcept {
+        m_pdc_delay_samples.store(std::min(delay, static_cast<uint32_t>(m_pdc_buffer.capacity() - 1)), std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t pdc_delay_samples() const noexcept {
+        return m_pdc_delay_samples.load(std::memory_order_relaxed);
+    }
+
+    void apply_pdc_delay(uint32_t frames) noexcept {
+        const uint32_t delay = m_pdc_delay_samples.load(std::memory_order_relaxed);
+        if (delay == 0) return;
+
+        Sample* left = m_buffer.view().channel(0);
+        Sample* right = m_buffer.view().channel(1);
+        Sample* pdc_l = m_pdc_buffer.channel(0);
+        Sample* pdc_r = m_pdc_buffer.channel(1);
+        const size_t cap = m_pdc_buffer.capacity();
+
+        for (uint32_t i = 0; i < frames; ++i) {
+            const size_t w_pos = m_pdc_write_pos;
+            const size_t r_pos = (w_pos + cap - delay) % cap;
+
+            const float in_l = left[i];
+            const float in_r = right[i];
+
+            pdc_l[w_pos] = in_l;
+            pdc_r[w_pos] = in_r;
+
+            left[i] = pdc_l[r_pos];
+            right[i] = pdc_r[r_pos];
+
+            m_pdc_write_pos = (w_pos + 1) % cap;
+        }
+    }
+
+    // Sample-accurate parameter ramping state
+    float m_gain_l_ramp_start{0.7071f};
+    float m_gain_r_ramp_start{0.7071f};
+    bool m_has_previous_gain{false};
+
 private:
     uint32_t m_id;
     std::string m_name;
     AudioBuffer m_buffer;
+    AudioBuffer m_pdc_buffer{2, 16384};
+    size_t m_pdc_write_pos{0};
+    std::atomic<uint32_t> m_pdc_delay_samples{0};
 
     std::atomic<bool> m_active{false};
     std::atomic<float> m_gain{1.0f};
@@ -462,6 +539,8 @@ private:
     std::atomic<uint8_t> m_dca_mask{0};
     std::atomic<uint8_t> m_mute_group_mask{0};
     std::atomic<int32_t> m_target_bus{-1}; // -1 = Direct to Master, -2 = Spatial Bus
+    std::atomic<int32_t> m_seq_send_a_bus{-1}; // Bus ID for Sequencer Send A (e.g. Reverb)
+    std::atomic<int32_t> m_seq_send_b_bus{-1}; // Bus ID for Sequencer Send B (e.g. Delay)
 
     std::array<InsertSlot, kMaxTrackInsertSlots> m_slots;
     std::array<SendInfo, kMaxTrackSends> m_sends{};
@@ -912,6 +991,41 @@ public:
         }
     }
 
+    void set_parameter_ramping_enabled(bool enabled) noexcept {
+        m_parameter_ramping_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_parameter_ramping_enabled() const noexcept {
+        return m_parameter_ramping_enabled.load(std::memory_order_relaxed);
+    }
+
+    // ========================================================================
+    // Plugin Delay Compensation (PDC) Architecture
+    // ========================================================================
+    void update_pdc_delay_compensation() noexcept {
+        uint32_t max_master_lat = 0;
+        std::array<uint32_t, kMaxBuses + 1> max_bus_lat{};
+
+        for (const auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            const uint32_t lat = track->latency_samples();
+            const int32_t tgt = track->target_bus();
+            if (tgt <= 0) {
+                if (lat > max_master_lat) max_master_lat = lat;
+            } else if (static_cast<size_t>(tgt) < max_bus_lat.size()) {
+                if (lat > max_bus_lat[tgt]) max_bus_lat[tgt] = lat;
+            }
+        }
+
+        for (auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            const uint32_t lat = track->latency_samples();
+            const int32_t tgt = track->target_bus();
+            const uint32_t target_max = (tgt <= 0) ? max_master_lat :
+                (static_cast<size_t>(tgt) < max_bus_lat.size() ? max_bus_lat[tgt] : 0);
+            track->set_pdc_delay_samples(target_max >= lat ? (target_max - lat) : 0);
+        }
+    }
+
     bool set_bus_target_bus(uint32_t bus_id, int32_t target_bus_id) noexcept {
         if (bus_id < 1 || bus_id > kMaxBuses) return false;
         if (target_bus_id == static_cast<int32_t>(bus_id)) return false; // Self-loop cycle
@@ -1317,6 +1431,9 @@ public:
             bool any_solo;
         };
 
+        // Evaluate Plugin Delay Compensation (PDC) across active buses
+        update_pdc_delay_compensation();
+
         TrackRenderCtx trk_ctx{
             .self = this,
             .frames = frames,
@@ -1338,6 +1455,9 @@ public:
 
             // In-line Channel Strip processing with Routing Matrix sidechain access!
             track->process_channel_strip(ctx->frames, &ctx->self->m_routing_matrix);
+
+            // Apply Plugin Delay Compensation (PDC) sample-exact alignment
+            track->apply_pdc_delay(ctx->frames);
 
             const Sample* trk_l = track->buffer().view().channel(0);
             const Sample* trk_r = track->buffer().view().channel(1);
@@ -1368,7 +1488,7 @@ public:
             }
         }
 
-        // 3b. Vectorized Bus & Master Accumulation (SIMD linear reduction)
+        // 3b. Vectorized Bus & Master Accumulation with Sample-Accurate Parameter Ramping
         for (auto& track : m_tracks) {
             if (!track->is_active()) continue;
             bool trk_muted = is_track_effectively_muted(track.get());
@@ -1378,10 +1498,23 @@ public:
             const Sample* trk_l = track->buffer().view().channel(0);
             const Sample* trk_r = track->buffer().view().channel(1);
 
-            const float gain = compute_track_effective_gain(track.get());
+            const float target_gain = compute_track_effective_gain(track.get());
             const auto [pan_l, pan_r] = calculate_pan_gains(track->pan());
-            const float left_gain = gain * pan_l;
-            const float right_gain = gain * pan_r;
+            const float target_left_gain = target_gain * pan_l;
+            const float target_right_gain = target_gain * pan_r;
+
+            if (!track->m_has_previous_gain) {
+                track->m_gain_l_ramp_start = target_left_gain;
+                track->m_gain_r_ramp_start = target_right_gain;
+                track->m_has_previous_gain = true;
+            }
+
+            const float start_l = track->m_gain_l_ramp_start;
+            const float start_r = track->m_gain_r_ramp_start;
+            const bool ramping_enabled = m_parameter_ramping_enabled.load(std::memory_order_relaxed);
+            const bool is_ramping = ramping_enabled &&
+                                    ((std::abs(target_left_gain - start_l) > 1e-5f) ||
+                                     (std::abs(target_right_gain - start_r) > 1e-5f));
 
             // Routing destination: Spatial Master Bus, Submix bus or Master
             const int32_t target_id = track->target_bus();
@@ -1392,7 +1525,7 @@ public:
                 for (uint32_t i = 0; i < frames; ++i) {
                     scratch_mono[i] = 0.5f * (trk_l[i] + trk_r[i]);
                 }
-                m_spatial_master_bus.pan_mono_circular(scratch_mono, gain, track->azimuth(), frames);
+                m_spatial_master_bus.pan_mono_circular(scratch_mono, target_gain, track->azimuth(), frames);
             } else {
                 AudioBus* target_bus = (target_id > 0) ? get_bus(static_cast<uint32_t>(target_id)) : &m_master_bus;
                 if (!target_bus) target_bus = &m_master_bus;
@@ -1400,14 +1533,31 @@ public:
                 Sample* dst_l = target_bus->buffer().view().channel(0);
                 Sample* dst_r = target_bus->buffer().view().channel(1);
 
-                #if defined(__GNUC__) || defined(__clang__)
-                #pragma GCC ivdep
-                #endif
-                for (uint32_t i = 0; i < frames; ++i) {
-                    dst_l[i] += trk_l[i] * left_gain;
-                    dst_r[i] += trk_r[i] * right_gain;
+                if (is_ramping) {
+                    const float step_l = (target_left_gain - start_l) / static_cast<float>(frames);
+                    const float step_r = (target_right_gain - start_r) / static_cast<float>(frames);
+                    #if defined(__GNUC__) || defined(__clang__)
+                    #pragma GCC ivdep
+                    #endif
+                    for (uint32_t i = 0; i < frames; ++i) {
+                        const float cur_l = start_l + step_l * static_cast<float>(i + 1);
+                        const float cur_r = start_r + step_r * static_cast<float>(i + 1);
+                        dst_l[i] += trk_l[i] * cur_l;
+                        dst_r[i] += trk_r[i] * cur_r;
+                    }
+                } else {
+                    #if defined(__GNUC__) || defined(__clang__)
+                    #pragma GCC ivdep
+                    #endif
+                    for (uint32_t i = 0; i < frames; ++i) {
+                        dst_l[i] += trk_l[i] * target_left_gain;
+                        dst_r[i] += trk_r[i] * target_right_gain;
+                    }
                 }
             }
+
+            track->m_gain_l_ramp_start = target_left_gain;
+            track->m_gain_r_ramp_start = target_right_gain;
 
             // Auxiliary Sends (e.g. Reverb / Delay Busses)
             for (const auto& send : track->sends()) {
@@ -1416,13 +1566,55 @@ public:
                 if (send_bus) {
                     Sample* s_l = send_bus->buffer().view().channel(0);
                     Sample* s_r = send_bus->buffer().view().channel(1);
-                    float s_gain = send.pre_fader ? send.amount : (gain * send.amount);
+                    float s_gain = send.pre_fader ? send.amount : (target_gain * send.amount);
                     #if defined(__GNUC__) || defined(__clang__)
                     #pragma GCC ivdep
                     #endif
                     for (uint32_t i = 0; i < frames; ++i) {
                         s_l[i] += trk_l[i] * s_gain * pan_l;
                         s_r[i] += trk_r[i] * s_gain * pan_r;
+                    }
+                }
+            }
+
+            // Sequencer Per-Voice Aux Sends (Send A & Send B)
+            if (track->is_sequencer_enabled()) {
+                auto* seq = track->sequencer();
+                if (seq) {
+                    const int32_t s_a_id = track->sequencer_send_a_bus();
+                    if (s_a_id >= 0) {
+                        AudioBus* s_bus_a = get_bus(static_cast<uint32_t>(s_a_id));
+                        if (s_bus_a) {
+                            Sample* b_l = s_bus_a->buffer().view().channel(0);
+                            Sample* b_r = s_bus_a->buffer().view().channel(1);
+                            const Sample* sa_l = seq->send_a_buffer().channel(0);
+                            const Sample* sa_r = seq->send_a_buffer().channel(1);
+                            #if defined(__GNUC__) || defined(__clang__)
+                            #pragma GCC ivdep
+                            #endif
+                            for (uint32_t i = 0; i < frames; ++i) {
+                                b_l[i] += sa_l[i] * target_gain;
+                                b_r[i] += sa_r[i] * target_gain;
+                            }
+                        }
+                    }
+
+                    const int32_t s_b_id = track->sequencer_send_b_bus();
+                    if (s_b_id >= 0) {
+                        AudioBus* s_bus_b = get_bus(static_cast<uint32_t>(s_b_id));
+                        if (s_bus_b) {
+                            Sample* b_l = s_bus_b->buffer().view().channel(0);
+                            Sample* b_r = s_bus_b->buffer().view().channel(1);
+                            const Sample* sb_l = seq->send_b_buffer().channel(0);
+                            const Sample* sb_r = seq->send_b_buffer().channel(1);
+                            #if defined(__GNUC__) || defined(__clang__)
+                            #pragma GCC ivdep
+                            #endif
+                            for (uint32_t i = 0; i < frames; ++i) {
+                                b_l[i] += sb_l[i] * target_gain;
+                                b_r[i] += sb_r[i] * target_gain;
+                            }
+                        }
                     }
                 }
             }
@@ -1854,6 +2046,7 @@ private:
     uint32_t m_buffer_frames;
     std::atomic<uint64_t> m_render_cycle{0};
     std::atomic<bool> m_limiter_enabled{true};
+    std::atomic<bool> m_parameter_ramping_enabled{false};
     RingBuffer<protocol::MixerCommand> m_command_queue{512};
     std::array<std::unique_ptr<Track>, kMaxTracks> m_tracks;
     std::array<std::unique_ptr<AudioBus>, kMaxBuses> m_buses;

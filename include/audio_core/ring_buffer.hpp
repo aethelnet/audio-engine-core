@@ -68,6 +68,28 @@ public:
         return (tail >= head) ? (tail - head) : 0;
     }
 
+    [[nodiscard]] size_t available_read() const noexcept {
+        return size();
+    }
+
+    [[nodiscard]] size_t available_write() const noexcept {
+        const size_t s = size();
+        return (s < m_capacity) ? (m_capacity - s) : 0;
+    }
+
+    bool push(const T& item) noexcept {
+        return try_push(item);
+    }
+
+    bool pop(T& item) noexcept {
+        return try_pop(item);
+    }
+
+    void clear() noexcept {
+        const size_t tail = m_tail.load(std::memory_order_relaxed);
+        m_head.store(tail, std::memory_order_release);
+    }
+
     [[nodiscard]] bool empty() const noexcept {
         return m_head.load(std::memory_order_relaxed) == m_tail.load(std::memory_order_relaxed);
     }

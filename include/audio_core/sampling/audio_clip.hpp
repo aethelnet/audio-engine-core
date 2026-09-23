@@ -16,6 +16,7 @@ struct AudioSlice {
     uint32_t start_frame{0};
     uint32_t end_frame{0};
     float gain{1.0f};
+    uint8_t choke_group{0}; // 0 = polyphonic / no choke, 1..15 = exclusive choke group
 };
 
 // ============================================================================

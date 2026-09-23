@@ -80,6 +80,7 @@ public:
 
     [[nodiscard]] uint32_t num_channels() const noexcept { return m_channels; }
     [[nodiscard]] uint32_t num_frames() const noexcept { return m_frames; }
+    [[nodiscard]] uint32_t capacity() const noexcept { return m_frames; }
 
     [[nodiscard]] Sample* channel(uint32_t ch) noexcept { return m_channel_ptrs[ch]; }
     [[nodiscard]] const Sample* channel(uint32_t ch) const noexcept { return m_channel_ptrs[ch]; }

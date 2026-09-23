@@ -173,6 +173,26 @@ public:
         return true;
     }
 
+    // Convenience overload to load directly into stereo left and right vectors
+    static bool load_wav(const std::string& filepath,
+                         std::vector<float>& out_l,
+                         std::vector<float>& out_r,
+                         uint32_t& out_sample_rate,
+                         uint16_t& out_channels) {
+        std::vector<std::vector<float>> chs;
+        if (!load_wav(filepath, chs, out_sample_rate) || chs.empty()) {
+            return false;
+        }
+        out_channels = static_cast<uint16_t>(chs.size());
+        out_l = std::move(chs[0]);
+        if (chs.size() >= 2) {
+            out_r = std::move(chs[1]);
+        } else {
+            out_r = out_l; // Mono duplicated to stereo
+        }
+        return true;
+    }
+
     // Save planar audio channels to disk as 16-Bit or 24-Bit PCM or 32-Bit Float WAV
     static bool save_wav(const std::string& filepath,
                          const float* left,
