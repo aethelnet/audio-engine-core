@@ -602,7 +602,11 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
                                       double current_playhead_beat = -1.0,
                                       int* selected_point_out = nullptr,
                                       routing::AutomationTarget target = routing::AutomationTarget::Gain,
-                                      std::vector<size_t>* selected_points_out = nullptr) {
+                                      std::vector<size_t>* selected_points_out = nullptr,
+                                      float custom_min = 0.0f,
+                                      float custom_max = 1.0f,
+                                      const char* custom_unit = nullptr,
+                                      bool compact_mode = false) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
 
@@ -618,8 +622,8 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     const float y = pos.y;
     const float w = size.x;
     const float h = size.y;
-    const float pad_top = 18.0f;
-    const float pad_bot = 18.0f;
+    const float pad_top = compact_mode ? 8.0f : 18.0f;
+    const float pad_bot = compact_mode ? 8.0f : 18.0f;
     const float usable_h = h - pad_top - pad_bot;
     const float bot_y = y + h - pad_bot;
 
@@ -634,6 +638,9 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     } else if (target == routing::AutomationTarget::Pitch) {
         min_val = -24.0f;
         max_val = 24.0f;
+    } else if (target == routing::AutomationTarget::PluginParam) {
+        min_val = custom_min;
+        max_val = (custom_max > custom_min) ? custom_max : (custom_min + 1.0f);
     }
 
     auto beat_to_x = [&](double b) -> float {
@@ -710,6 +717,14 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
             if (std::abs(v - 1.0f) < 0.04f) return 1.0f; // Snap to 0 dB
             if (std::abs(v - 0.5f) < 0.03f) return 0.5f; // Snap to -6 dB
             if (v < 0.03f) return 0.0f; // Snap to silence
+        } else if (target == routing::AutomationTarget::PluginParam) {
+            float span = max_val - min_val;
+            if (span > 1e-4f) {
+                float norm = (v - min_val) / span;
+                if (std::abs(norm - 0.5f) < 0.03f) return min_val + 0.5f * span;
+                if (norm < 0.03f) return min_val;
+                if (norm > 0.97f) return max_val;
+            }
         } else {
             if (v < 0.03f) return 0.0f;
             if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
@@ -1057,10 +1072,12 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) nudge_b += (io.KeyAlt ? 0.0625 : 0.25);
             if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
                 if (target == routing::AutomationTarget::Pitch) nudge_v += (io.KeyAlt ? 0.1f : 1.0f);
+                else if (target == routing::AutomationTarget::PluginParam) nudge_v += (io.KeyAlt ? 0.005f : 0.02f) * (max_val - min_val);
                 else nudge_v += (target == routing::AutomationTarget::Pan ? 0.05f : 0.02f);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
                 if (target == routing::AutomationTarget::Pitch) nudge_v -= (io.KeyAlt ? 0.1f : 1.0f);
+                else if (target == routing::AutomationTarget::PluginParam) nudge_v -= (io.KeyAlt ? 0.005f : 0.02f) * (max_val - min_val);
                 else nudge_v -= (target == routing::AutomationTarget::Pan ? 0.05f : 0.02f);
             }
 
@@ -1130,6 +1147,27 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
 
         draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
         draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "-24 st (-2 Oct)");
+    } else if (target == routing::AutomationTarget::PluginParam) {
+        float y_max = val_to_y(max_val);
+        draw_list->AddLine(ImVec2(x, y_max), ImVec2(x + w, y_max), ImColor(140, 150, 168, 255), 1.0f);
+        char lbl_max[32];
+        if (custom_unit) std::snprintf(lbl_max, sizeof(lbl_max), "%.2f %s", max_val, custom_unit);
+        else std::snprintf(lbl_max, sizeof(lbl_max), "%.2f", max_val);
+        draw_list->AddText(ImVec2(x + 6.0f, y_max + 2.0f), ImColor(120, 130, 145, 220), lbl_max);
+
+        float mid_val = (min_val + max_val) * 0.5f;
+        float y_mid = val_to_y(mid_val);
+        draw_list->AddLine(ImVec2(x, y_mid), ImVec2(x + w, y_mid), ImColor(225, 230, 238, 255), 1.0f);
+        char lbl_mid[32];
+        if (custom_unit) std::snprintf(lbl_mid, sizeof(lbl_mid), "%.2f %s", mid_val, custom_unit);
+        else std::snprintf(lbl_mid, sizeof(lbl_mid), "%.2f", mid_val);
+        draw_list->AddText(ImVec2(x + 6.0f, y_mid - 13.0f), ImColor(160, 170, 185, 200), lbl_mid);
+
+        draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
+        char lbl_min[32];
+        if (custom_unit) std::snprintf(lbl_min, sizeof(lbl_min), "%.2f %s", min_val, custom_unit);
+        else std::snprintf(lbl_min, sizeof(lbl_min), "%.2f", min_val);
+        draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), lbl_min);
     } else {
         // Gain: 0 dB guideline (solid graphite)
         float y_0db = val_to_y(1.0f);
@@ -1288,6 +1326,12 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
             std::snprintf(tip, sizeof(tip), "Bar %.2f | %.0f%% Send", (hb / 4.0) + 1.0, hv * 100.0f);
         } else if (target == routing::AutomationTarget::Pitch) {
             std::snprintf(tip, sizeof(tip), "Beat %.2f | %+.1f st", hb, hv);
+        } else if (target == routing::AutomationTarget::PluginParam) {
+            if (custom_unit) {
+                std::snprintf(tip, sizeof(tip), "Bar %.2f | %.2f %s", (hb / 4.0) + 1.0, hv, custom_unit);
+            } else {
+                std::snprintf(tip, sizeof(tip), "Bar %.2f | %.2f", (hb / 4.0) + 1.0, hv);
+            }
         } else {
             float db = linear_to_db(hv);
             std::snprintf(tip, sizeof(tip), "Bar %.2f | %.1f dB", (hb / 4.0) + 1.0, db);

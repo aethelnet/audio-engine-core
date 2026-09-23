@@ -25,11 +25,12 @@ enum class NodeMode : uint8_t {
 
 // Target Parameter Lane in Channel Strip or Clip Envelope
 enum class AutomationTarget : uint8_t {
-    Gain  = 0,  // Track Volume / Gain Multiplier [0.0, 1.25]
-    Pan   = 1,  // Track Stereo Panning [-1.0, +1.0]
-    Aux1  = 2,  // Auxiliary Send 1 (e.g. Reverb) [0.0, 1.0]
-    Aux2  = 3,  // Auxiliary Send 2 (e.g. Delay) [0.0, 1.0]
-    Pitch = 4   // Pitch Transposition in semitones [-24.0, +24.0]
+    Gain        = 0,  // Track Volume / Gain Multiplier [0.0, 1.25]
+    Pan         = 1,  // Track Stereo Panning [-1.0, +1.0]
+    Aux1        = 2,  // Auxiliary Send 1 (e.g. Reverb) [0.0, 1.0]
+    Aux2        = 3,  // Auxiliary Send 2 (e.g. Delay) [0.0, 1.0]
+    Pitch       = 4,  // Pitch Transposition in semitones [-24.0, +24.0]
+    PluginParam = 5   // Insert Slot Plugin Parameter [custom min, max]
 };
 
 // ============================================================================

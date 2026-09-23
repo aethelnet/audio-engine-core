@@ -65,6 +65,40 @@ public:
         }
     }
 
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 3; }
+    [[nodiscard]] const char* parameter_name(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return "Bass (dB)";
+            case 1: return "Treble (dB)";
+            case 2: return "Trim";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] float parameter_min(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return -15.0f;
+            case 1: return -15.0f;
+            case 2: return 0.0f;
+            default: return 0.0f;
+        }
+    }
+    [[nodiscard]] float parameter_max(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return 15.0f;
+            case 1: return 15.0f;
+            case 2: return 2.0f;
+            default: return 1.0f;
+        }
+    }
+    [[nodiscard]] float parameter_default(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return 0.0f;
+            case 1: return 0.0f;
+            case 2: return 1.0f;
+            default: return 0.0f;
+        }
+    }
+
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
         for (uint32_t i = 0; i < frames; ++i) {
             // 1. Enter Console carrier wave

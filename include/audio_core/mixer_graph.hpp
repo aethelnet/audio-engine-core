@@ -55,6 +55,9 @@ enum class TrackInputMode : uint8_t {
 // ============================================================================
 class Track {
 public:
+    static constexpr size_t kMaxSlotParams = 4;
+    static constexpr size_t kMaxTrackInsertSlots = audio_core::kMaxTrackInsertSlots;
+
     Track(uint32_t id, std::string name, uint32_t buffer_frames = 1024)
         : m_id(id), m_name(std::move(name)), m_buffer(2, buffer_frames) {
         m_console.set_mode(dsp::ConsoleMode::Channel);
@@ -62,6 +65,12 @@ public:
         m_pan_curve.clear(0.0f);
         m_aux1_curve.clear(0.0f);
         m_aux2_curve.clear(0.0f);
+        for (size_t s = 0; s < kMaxTrackInsertSlots; ++s) {
+            for (size_t p = 0; p < kMaxSlotParams; ++p) {
+                m_slot_curves[s][p].clear(0.0f);
+                m_slot_automation_enabled[s][p].store(false, std::memory_order_relaxed);
+            }
+        }
     }
 
     [[nodiscard]] uint32_t id() const noexcept { return m_id; }
@@ -217,6 +226,7 @@ public:
             case routing::AutomationTarget::Aux1: return m_aux1_curve;
             case routing::AutomationTarget::Aux2: return m_aux2_curve;
             case routing::AutomationTarget::Pitch: break;
+            case routing::AutomationTarget::PluginParam: return m_slot_curves[0][0];
         }
         return m_gain_curve;
     }
@@ -228,8 +238,36 @@ public:
             case routing::AutomationTarget::Aux1: return m_aux1_curve;
             case routing::AutomationTarget::Aux2: return m_aux2_curve;
             case routing::AutomationTarget::Pitch: break;
+            case routing::AutomationTarget::PluginParam: return m_slot_curves[0][0];
         }
         return m_gain_curve;
+    }
+
+    [[nodiscard]] routing::AutomationCurve& slot_automation_curve(size_t slot_idx, size_t param_idx) noexcept {
+        if (slot_idx < kMaxTrackInsertSlots && param_idx < kMaxSlotParams) {
+            return m_slot_curves[slot_idx][param_idx];
+        }
+        return m_slot_curves[0][0];
+    }
+
+    [[nodiscard]] const routing::AutomationCurve& slot_automation_curve(size_t slot_idx, size_t param_idx) const noexcept {
+        if (slot_idx < kMaxTrackInsertSlots && param_idx < kMaxSlotParams) {
+            return m_slot_curves[slot_idx][param_idx];
+        }
+        return m_slot_curves[0][0];
+    }
+
+    void set_slot_automation_enabled(size_t slot_idx, size_t param_idx, bool enabled) noexcept {
+        if (slot_idx < kMaxTrackInsertSlots && param_idx < kMaxSlotParams) {
+            m_slot_automation_enabled[slot_idx][param_idx].store(enabled, std::memory_order_relaxed);
+        }
+    }
+
+    [[nodiscard]] bool is_slot_automation_enabled(size_t slot_idx, size_t param_idx) const noexcept {
+        if (slot_idx < kMaxTrackInsertSlots && param_idx < kMaxSlotParams) {
+            return m_slot_automation_enabled[slot_idx][param_idx].load(std::memory_order_relaxed);
+        }
+        return false;
     }
 
     void set_automation_enabled(routing::AutomationTarget target, bool enabled) noexcept {
@@ -247,6 +285,7 @@ public:
                 break;
             }
             case routing::AutomationTarget::Pitch: break;
+            case routing::AutomationTarget::PluginParam: break;
         }
     }
 
@@ -257,6 +296,7 @@ public:
             case routing::AutomationTarget::Aux1: return m_aux1_automation_enabled.load(std::memory_order_relaxed);
             case routing::AutomationTarget::Aux2: return m_aux2_automation_enabled.load(std::memory_order_relaxed);
             case routing::AutomationTarget::Pitch: return false;
+            case routing::AutomationTarget::PluginParam: return false;
         }
         return false;
     }
@@ -582,7 +622,13 @@ public:
     }
 
     // Called inside the RT render loop
-    void process_channel_strip(uint32_t frames, const routing::UniversalRoutingMatrix* matrix = nullptr) noexcept {
+    void process_channel_strip(uint32_t frames,
+                               const routing::UniversalRoutingMatrix* matrix = nullptr,
+                               double start_beat = 0.0,
+                               double end_beat = 0.0,
+                               bool is_playing = false) noexcept {
+        (void)end_beat;
+        (void)is_playing;
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
 
@@ -609,6 +655,17 @@ public:
 
         // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, MultiHeadOde, PurestDrive, WASM)
         for (size_t s = 0; s < m_slots.size(); ++s) {
+            auto* proc = m_slots[s].processor();
+            if (proc) {
+                const uint32_t num_p = std::min<uint32_t>(static_cast<uint32_t>(kMaxSlotParams), proc->parameter_count());
+                for (uint32_t p = 0; p < num_p; ++p) {
+                    if (m_slot_automation_enabled[s][p].load(std::memory_order_relaxed)) {
+                        float val = m_slot_curves[s][p].evaluate_audio_sample(start_beat);
+                        proc->set_parameter(p, val);
+                    }
+                }
+            }
+
             const Sample* sc_l = nullptr;
             const Sample* sc_r = nullptr;
             if (matrix && matrix->has_track_sidechain(m_id, static_cast<uint32_t>(s))) {
@@ -750,6 +807,8 @@ private:
     std::atomic<bool> m_aux1_automation_enabled{false};
     routing::AutomationCurve m_aux2_curve;
     std::atomic<bool> m_aux2_automation_enabled{false};
+    std::array<std::array<routing::AutomationCurve, kMaxSlotParams>, kMaxTrackInsertSlots> m_slot_curves;
+    std::array<std::array<std::atomic<bool>, kMaxSlotParams>, kMaxTrackInsertSlots> m_slot_automation_enabled{};
 
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
@@ -1699,17 +1758,28 @@ public:
             const clock::TimelineClock* clock;
             const clock::BlockBoundaryEvents* events;
             bool any_solo;
+            double start_beat;
+            double end_beat;
+            bool is_playing;
         };
 
         // Evaluate Plugin Delay Compensation (PDC) across active buses
         update_pdc_delay_compensation();
+
+        const double spb = std::max(1.0, m_clock.samples_per_beat());
+        const double block_start_beat = static_cast<double>(m_clock.sample_position()) / spb;
+        const double block_end_beat   = static_cast<double>(m_clock.sample_position() + frames) / spb;
+        const bool block_is_playing   = m_clock.is_playing();
 
         TrackRenderCtx trk_ctx{
             .self = this,
             .frames = frames,
             .clock = &m_clock,
             .events = &boundary_events,
-            .any_solo = any_solo
+            .any_solo = any_solo,
+            .start_beat = block_start_beat,
+            .end_beat = block_end_beat,
+            .is_playing = block_is_playing
         };
 
         m_worker_pool.parallel_for(kMaxTracks, &trk_ctx, [](void* context, uint32_t track_idx) noexcept {
@@ -1723,8 +1793,8 @@ public:
                 return;
             }
 
-            // In-line Channel Strip processing with Routing Matrix sidechain access!
-            track->process_channel_strip(ctx->frames, &ctx->self->m_routing_matrix);
+            // In-line Channel Strip processing with Routing Matrix sidechain access & slot automation!
+            track->process_channel_strip(ctx->frames, &ctx->self->m_routing_matrix, ctx->start_beat, ctx->end_beat, ctx->is_playing);
 
             // Apply Plugin Delay Compensation (PDC) sample-exact alignment
             track->apply_pdc_delay(ctx->frames);

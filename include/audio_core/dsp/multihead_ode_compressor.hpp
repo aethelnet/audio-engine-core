@@ -407,6 +407,56 @@ public:
         }
     }
 
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return m_comp.num_heads() * 6; }
+    [[nodiscard]] const char* parameter_name(uint32_t index) const noexcept override {
+        uint32_t param = index % 6;
+        switch (param) {
+            case 0: return "Threshold";
+            case 1: return "Ratio";
+            case 2: return "Attack";
+            case 3: return "Release";
+            case 4: return "Makeup";
+            case 5: return "Mix";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] float parameter_min(uint32_t index) const noexcept override {
+        uint32_t param = index % 6;
+        switch (param) {
+            case 0: return -60.0f;
+            case 1: return 1.0f;
+            case 2: return 0.1f;
+            case 3: return 10.0f;
+            case 4: return 0.0f;
+            case 5: return 0.0f;
+            default: return 0.0f;
+        }
+    }
+    [[nodiscard]] float parameter_max(uint32_t index) const noexcept override {
+        uint32_t param = index % 6;
+        switch (param) {
+            case 0: return 0.0f;
+            case 1: return 20.0f;
+            case 2: return 200.0f;
+            case 3: return 2000.0f;
+            case 4: return 24.0f;
+            case 5: return 1.0f;
+            default: return 1.0f;
+        }
+    }
+    [[nodiscard]] float parameter_default(uint32_t index) const noexcept override {
+        uint32_t param = index % 6;
+        switch (param) {
+            case 0: return -18.0f;
+            case 1: return 4.0f;
+            case 2: return 10.0f;
+            case 3: return 100.0f;
+            case 4: return 0.0f;
+            case 5: return 1.0f;
+            default: return 0.0f;
+        }
+    }
+
     [[nodiscard]] const char* name() const noexcept override {
         return "MultiHeadOdeCompressor";
     }

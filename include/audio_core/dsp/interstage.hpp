@@ -131,6 +131,7 @@ public:
 
     void set_parameter([[maybe_unused]] uint32_t index, [[maybe_unused]] float value) noexcept override {}
     [[nodiscard]] float get_parameter([[maybe_unused]] uint32_t index) const noexcept override { return 0.0f; }
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 0; }
     [[nodiscard]] const char* name() const noexcept override { return "Interstage"; }
 
 private:

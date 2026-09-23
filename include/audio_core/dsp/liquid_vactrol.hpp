@@ -500,6 +500,40 @@ public:
         }
     }
 
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 8; }
+    [[nodiscard]] const char* parameter_name(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return "Peak Reduct";
+            case 1: return "Makeup (dB)";
+            case 2: return "Mode";
+            case 3: return "Dark Memory";
+            case 4: return "HF Emphasis";
+            case 5: return "Mix";
+            case 6: return "LPG Res";
+            case 7: return "Link";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] float parameter_min(uint32_t /*index*/) const noexcept override { return 0.0f; }
+    [[nodiscard]] float parameter_max(uint32_t index) const noexcept override {
+        if (index == 1) return 30.0f;
+        if (index == 2) return 2.0f;
+        return 1.0f;
+    }
+    [[nodiscard]] float parameter_default(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return 0.5f;
+            case 1: return 0.0f;
+            case 2: return 0.0f;
+            case 3: return 0.75f;
+            case 4: return 0.0f;
+            case 5: return 1.0f;
+            case 6: return 0.2f;
+            case 7: return 1.0f;
+            default: return 0.0f;
+        }
+    }
+
     [[nodiscard]] const char* name() const noexcept override {
         return "LiquidVactrol";
     }

@@ -30,6 +30,7 @@ public:
 
     void set_parameter(uint32_t /*index*/, float /*value*/) noexcept override {}
     [[nodiscard]] float get_parameter(uint32_t /*index*/) const noexcept override { return 1.0f; }
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 0; }
 
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
         constexpr float kThreshold = 0.9549925859f;

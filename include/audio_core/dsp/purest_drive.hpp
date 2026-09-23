@@ -44,6 +44,20 @@ public:
         }
     }
 
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 2; }
+    [[nodiscard]] const char* parameter_name(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return "Drive";
+            case 1: return "Wet";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] float parameter_min(uint32_t /*index*/) const noexcept override { return 0.0f; }
+    [[nodiscard]] float parameter_max(uint32_t /*index*/) const noexcept override { return 1.0f; }
+    [[nodiscard]] float parameter_default(uint32_t index) const noexcept override {
+        return (index == 0) ? 0.5f : 1.0f;
+    }
+
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
         if (m_drive == 0.0f && m_wet == 0.0f) {
             return;

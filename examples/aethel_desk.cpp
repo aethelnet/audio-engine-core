@@ -505,7 +505,26 @@ int main(int argc, char** argv) {
     uint32_t selected_patch_id = 1;
     int selected_curve_point = -1;
     std::vector<size_t> selected_curve_points;
-    int selected_auto_lane = 0; // 0=Gain, 1=Pan, 2=Aux1, 3=Aux2
+
+    enum class LaneKind : uint8_t {
+        TrackParam = 0,
+        PluginParam = 1
+    };
+
+    struct StackedLaneDesc {
+        LaneKind kind{LaneKind::TrackParam};
+        routing::AutomationTarget track_target{routing::AutomationTarget::Gain};
+        uint32_t slot_idx{0};
+        uint32_t param_idx{0};
+        bool collapsed{false};
+    };
+
+    int selected_auto_lane = 0; // 0=Gain, 1=Pan, 2=Aux1, 3=Aux2, 4+ = Slot S Param P
+    int automation_view_mode = 0; // 0 = Focused Single Lane, 1 = Multi-Lane Stacked
+    std::vector<StackedLaneDesc> stacked_lanes = {
+        { LaneKind::TrackParam, routing::AutomationTarget::Gain, 0, 0, false },
+        { LaneKind::TrackParam, routing::AutomationTarget::Pan, 0, 0, false }
+    };
     int automation_context_mode = 0; // 0 = Track Timeline, 1 = Clip-Relative Envelope
     int selected_clip_lane = 0; // 0=Gain, 1=Pan, 2=Pitch
 
@@ -3493,121 +3512,379 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    ImGui::SameLine(0, 28);
+                    ImGui::Text("View Mode:");
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Focused Single Lane", automation_view_mode == 0)) {
+                        automation_view_mode = 0;
+                    }
+                    ImGui::SameLine(0, 16);
+                    if (ImGui::RadioButton("Multi-Lane Stacked", automation_view_mode == 1)) {
+                        automation_view_mode = 1;
+                    }
+
                     ImGui::Spacing();
 
                     routing::AutomationCurve* editor_curve = nullptr;
                     routing::AutomationTarget editor_target = routing::AutomationTarget::Gain;
+                    float editor_custom_min = 0.0f;
+                    float editor_custom_max = 1.0f;
+                    const char* editor_custom_unit = nullptr;
                     double editor_total_beats = 16.0;
                     double editor_play_beat = -1.0;
                     const char* editor_id = "TrackAutomationEditor";
 
                     if (automation_context_mode == 0) {
-                        // Scope 0: Track Timeline Automation
-                        routing::AutomationTarget current_target = static_cast<routing::AutomationTarget>(selected_auto_lane);
-                        routing::AutomationCurve& active_curve = auto_trk->automation_curve(current_target);
+                        if (automation_view_mode == 1) {
+                            // Scope 0, View 1: Multi-Lane Stacked View
+                            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Stacked Automation Lanes (%zu Active):", stacked_lanes.size());
+                            ImGui::SameLine(0, 16);
+                            if (ImGui::Button("[ + ADD AUTOMATION LANE ]")) {
+                                ImGui::OpenPopup("AddLanePopup");
+                            }
 
-                        ImGui::Text("Parameter Lane:");
-                        ImGui::SameLine();
-                        const char* lane_names[4] = { "GAIN", "PAN", "AUX 1 (REVERB)", "AUX 2 (DELAY)" };
-                        for (int l = 0; l < 4; ++l) {
-                            if (l > 0) ImGui::SameLine();
-                            bool is_sel = (selected_auto_lane == l);
-                            if (is_sel) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 0.9f));
-                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            if (ImGui::BeginPopup("AddLanePopup")) {
+                                ImGui::TextDisabled("Select Parameter to Add:");
+                                ImGui::Separator();
+                                if (ImGui::Selectable("Track Gain")) {
+                                    stacked_lanes.push_back({ LaneKind::TrackParam, routing::AutomationTarget::Gain, 0, 0, false });
+                                }
+                                if (ImGui::Selectable("Track Pan")) {
+                                    stacked_lanes.push_back({ LaneKind::TrackParam, routing::AutomationTarget::Pan, 0, 0, false });
+                                }
+                                if (ImGui::Selectable("Track Aux 1 (Reverb)")) {
+                                    stacked_lanes.push_back({ LaneKind::TrackParam, routing::AutomationTarget::Aux1, 0, 0, false });
+                                }
+                                if (ImGui::Selectable("Track Aux 2 (Delay)")) {
+                                    stacked_lanes.push_back({ LaneKind::TrackParam, routing::AutomationTarget::Aux2, 0, 0, false });
+                                }
+                                for (size_t s = 0; s < 4; ++s) {
+                                    auto* proc = auto_trk->slot(s).processor();
+                                    if (proc) {
+                                        ImGui::Separator();
+                                        uint32_t pcount = std::min<uint32_t>(4, proc->parameter_count());
+                                        for (uint32_t p = 0; p < pcount; ++p) {
+                                            char item_name[128];
+                                            std::snprintf(item_name, sizeof(item_name), "Slot %zu: %s -> %s", s + 1, proc->name(), proc->parameter_name(p));
+                                            if (ImGui::Selectable(item_name)) {
+                                                stacked_lanes.push_back({ LaneKind::PluginParam, routing::AutomationTarget::PluginParam, static_cast<uint32_t>(s), p, false });
+                                            }
+                                        }
+                                    }
+                                }
+                                ImGui::EndPopup();
                             }
-                            if (ImGui::Button(lane_names[l], ImVec2(130, 24))) {
-                                selected_auto_lane = l;
-                                selected_curve_point = -1;
-                                selected_curve_points.clear();
+
+                            ImGui::SameLine();
+                            if (ImGui::Button("Expand All")) {
+                                for (auto& ln : stacked_lanes) ln.collapsed = false;
                             }
-                            if (is_sel) {
+                            ImGui::SameLine();
+                            if (ImGui::Button("Collapse All")) {
+                                for (auto& ln : stacked_lanes) ln.collapsed = true;
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Reset to Default (Gain & Pan)")) {
+                                stacked_lanes = {
+                                    { LaneKind::TrackParam, routing::AutomationTarget::Gain, 0, 0, false },
+                                    { LaneKind::TrackParam, routing::AutomationTarget::Pan, 0, 0, false }
+                                };
+                            }
+
+                            ImGui::Separator();
+
+                            int lane_to_remove = -1;
+                            for (size_t i = 0; i < stacked_lanes.size(); ++i) {
+                                auto& ln = stacked_lanes[i];
+                                ImGui::PushID(static_cast<int>(i));
+
+                                routing::AutomationCurve* cur_lane_curve = nullptr;
+                                routing::AutomationTarget cur_lane_target = routing::AutomationTarget::Gain;
+                                bool is_cur_lane_en = false;
+                                float cur_min = 0.0f;
+                                float cur_max = 1.0f;
+                                const char* cur_unit = nullptr;
+                                char lane_title[128];
+
+                                if (ln.kind == LaneKind::TrackParam) {
+                                    cur_lane_target = ln.track_target;
+                                    cur_lane_curve = &auto_trk->automation_curve(cur_lane_target);
+                                    is_cur_lane_en = auto_trk->is_automation_enabled(cur_lane_target);
+                                    if (cur_lane_target == routing::AutomationTarget::Gain) std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: TRACK GAIN", i + 1);
+                                    else if (cur_lane_target == routing::AutomationTarget::Pan) std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: TRACK PAN", i + 1);
+                                    else if (cur_lane_target == routing::AutomationTarget::Aux1) std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: AUX 1 (REVERB)", i + 1);
+                                    else if (cur_lane_target == routing::AutomationTarget::Aux2) std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: AUX 2 (DELAY)", i + 1);
+                                    else std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: TRACK PARAM", i + 1);
+                                } else {
+                                    cur_lane_target = routing::AutomationTarget::PluginParam;
+                                    cur_lane_curve = &auto_trk->slot_automation_curve(ln.slot_idx, ln.param_idx);
+                                    is_cur_lane_en = auto_trk->is_slot_automation_enabled(ln.slot_idx, ln.param_idx);
+                                    auto* proc = auto_trk->slot(ln.slot_idx).processor();
+                                    if (proc) {
+                                        cur_min = proc->parameter_min(ln.param_idx);
+                                        cur_max = proc->parameter_max(ln.param_idx);
+                                        cur_unit = proc->parameter_name(ln.param_idx);
+                                        std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: SLOT %u [%s] -> %s",
+                                                      i + 1, ln.slot_idx + 1, proc->name(), proc->parameter_name(ln.param_idx));
+                                    } else {
+                                        std::snprintf(lane_title, sizeof(lane_title), "LANE %zu: SLOT %u -> PARAM %u",
+                                                      i + 1, ln.slot_idx + 1, ln.param_idx + 1);
+                                    }
+                                }
+
+                                // Header Line
+                                ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.10f, 1.0f), "%s", lane_title);
+                                ImGui::SameLine(0, 16);
+                                if (is_cur_lane_en) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.62f, 0.30f, 1.0f));
+                                    if (ImGui::Button("[ ENGAGED ]##btn", ImVec2(100, 20))) {
+                                        if (ln.kind == LaneKind::TrackParam) auto_trk->set_automation_enabled(cur_lane_target, false);
+                                        else auto_trk->set_slot_automation_enabled(ln.slot_idx, ln.param_idx, false);
+                                    }
+                                    ImGui::PopStyleColor();
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.32f, 0.35f, 0.40f, 0.8f));
+                                    if (ImGui::Button("[ BYPASSED ]##btn", ImVec2(100, 20))) {
+                                        if (ln.kind == LaneKind::TrackParam) auto_trk->set_automation_enabled(cur_lane_target, true);
+                                        else auto_trk->set_slot_automation_enabled(ln.slot_idx, ln.param_idx, true);
+                                    }
+                                    ImGui::PopStyleColor();
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                if (ImGui::Button(ln.collapsed ? "[ + Expand ]" : "[ - Fold ]", ImVec2(90, 20))) {
+                                    ln.collapsed = !ln.collapsed;
+                                }
+
+                                ImGui::SameLine(0, 8);
+                                if (ImGui::Button("[ X ]", ImVec2(32, 20))) {
+                                    lane_to_remove = static_cast<int>(i);
+                                }
+
+                                if (!ln.collapsed && cur_lane_curve) {
+                                    char editor_uid[64];
+                                    std::snprintf(editor_uid, sizeof(editor_uid), "StackedEditor_%zu", i);
+                                    ui::DrawAutomationCurveEditor(editor_uid,
+                                                                  *cur_lane_curve,
+                                                                  ImVec2(0, 115),
+                                                                  16.0,
+                                                                  cur_play_beat,
+                                                                  nullptr,
+                                                                  cur_lane_target,
+                                                                  nullptr,
+                                                                  cur_min,
+                                                                  cur_max,
+                                                                  cur_unit,
+                                                                  true);
+                                }
+
+                                ImGui::PopID();
+                                ImGui::Spacing();
+                            }
+
+                            if (lane_to_remove >= 0 && lane_to_remove < static_cast<int>(stacked_lanes.size())) {
+                                stacked_lanes.erase(stacked_lanes.begin() + lane_to_remove);
+                            }
+                        } else {
+                            // Scope 0, View 0: Focused Single Lane View
+                            routing::AutomationTarget current_target = (selected_auto_lane < 4)
+                                ? static_cast<routing::AutomationTarget>(selected_auto_lane)
+                                : routing::AutomationTarget::PluginParam;
+
+                            routing::AutomationCurve* active_curve_ptr = nullptr;
+                            bool is_auto_on = false;
+                            float cur_pmin = 0.0f;
+                            float cur_pmax = 1.0f;
+                            const char* cur_punit = nullptr;
+
+                            if (selected_auto_lane < 4) {
+                                active_curve_ptr = &auto_trk->automation_curve(current_target);
+                                is_auto_on = auto_trk->is_automation_enabled(current_target);
+                            } else {
+                                size_t s_idx = (selected_auto_lane - 4) / 4;
+                                size_t p_idx = (selected_auto_lane - 4) % 4;
+                                active_curve_ptr = &auto_trk->slot_automation_curve(s_idx, p_idx);
+                                is_auto_on = auto_trk->is_slot_automation_enabled(s_idx, p_idx);
+                                auto* proc = auto_trk->slot(s_idx).processor();
+                                if (proc) {
+                                    cur_pmin = proc->parameter_min(p_idx);
+                                    cur_pmax = proc->parameter_max(p_idx);
+                                    cur_punit = proc->parameter_name(p_idx);
+                                }
+                            }
+                            routing::AutomationCurve& active_curve = *active_curve_ptr;
+
+                            ImGui::Text("Track Parameters:");
+                            ImGui::SameLine();
+                            const char* lane_names[4] = { "GAIN", "PAN", "AUX 1 (REVERB)", "AUX 2 (DELAY)" };
+                            for (int l = 0; l < 4; ++l) {
+                                if (l > 0) ImGui::SameLine();
+                                bool is_sel = (selected_auto_lane == l);
+                                if (is_sel) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 0.9f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                }
+                                if (ImGui::Button(lane_names[l], ImVec2(130, 24))) {
+                                    selected_auto_lane = l;
+                                    selected_curve_point = -1;
+                                    selected_curve_points.clear();
+                                }
+                                if (is_sel) {
+                                    ImGui::PopStyleColor(2);
+                                }
+                            }
+
+                            // Plugin Insert Slot Parameters
+                            bool has_plugins = false;
+                            for (size_t s = 0; s < 4; ++s) {
+                                if (auto_trk->slot(s).processor()) { has_plugins = true; break; }
+                            }
+                            if (has_plugins) {
+                                ImGui::Spacing();
+                                ImGui::Text("Plugin Insert Slot Parameters:");
+                                for (size_t s = 0; s < 4; ++s) {
+                                    auto* proc = auto_trk->slot(s).processor();
+                                    if (!proc) continue;
+                                    ImGui::TextDisabled("Slot %zu [%s]:", s + 1, proc->name());
+                                    ImGui::SameLine();
+                                    uint32_t pcount = std::min<uint32_t>(4, proc->parameter_count());
+                                    for (uint32_t p = 0; p < pcount; ++p) {
+                                        if (p > 0) ImGui::SameLine();
+                                        int p_id = 4 + static_cast<int>(s * 4 + p);
+                                        bool is_sel = (selected_auto_lane == p_id);
+                                        if (is_sel) {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 0.9f));
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                        }
+                                        char pbtn_lbl[64];
+                                        std::snprintf(pbtn_lbl, sizeof(pbtn_lbl), "%s##s%zup%u", proc->parameter_name(p), s, p);
+                                        if (ImGui::Button(pbtn_lbl)) {
+                                            selected_auto_lane = p_id;
+                                            selected_curve_point = -1;
+                                            selected_curve_points.clear();
+                                        }
+                                        if (is_sel) {
+                                            ImGui::PopStyleColor(2);
+                                        }
+                                    }
+                                }
+                            }
+
+                            ImGui::Spacing();
+                            ImGui::Text("Automation Control:");
+                            ImGui::SameLine();
+                            if (is_auto_on) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.62f, 0.30f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.72f, 0.35f, 1.0f));
+                                if (ImGui::Button("[ AUTOMATION ENGAGED ]", ImVec2(180, 24))) {
+                                    if (selected_auto_lane < 4) auto_trk->set_automation_enabled(current_target, false);
+                                    else auto_trk->set_slot_automation_enabled((selected_auto_lane - 4) / 4, (selected_auto_lane - 4) % 4, false);
+                                }
                                 ImGui::PopStyleColor(2);
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.32f, 0.35f, 0.40f, 0.8f));
+                                if (ImGui::Button("[ AUTOMATION BYPASSED ]", ImVec2(180, 24))) {
+                                    if (selected_auto_lane < 4) auto_trk->set_automation_enabled(current_target, true);
+                                    else auto_trk->set_slot_automation_enabled((selected_auto_lane - 4) / 4, (selected_auto_lane - 4) % 4, true);
+                                }
+                                ImGui::PopStyleColor(1);
                             }
-                        }
 
-                        ImGui::SameLine(0, 16);
-                        bool is_auto_on = auto_trk->is_automation_enabled(current_target);
-                        if (is_auto_on) {
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.62f, 0.30f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.72f, 0.35f, 1.0f));
-                            if (ImGui::Button("[ AUTOMATION ENGAGED ]", ImVec2(180, 24))) {
-                                auto_trk->set_automation_enabled(current_target, false);
+                            ImGui::SameLine(0, 16);
+                            ImGui::TextDisabled("Presets:");
+                            ImGui::SameLine();
+                            if (current_target == routing::AutomationTarget::Gain) {
+                                if (ImGui::Button("Fade In")) {
+                                    active_curve.preset_fade_in(0.0, 16.0);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Fade Out")) {
+                                    active_curve.preset_fade_out(0.0, 16.0);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("4-Beat Pump")) {
+                                    active_curve.preset_sidechain_pump(16.0);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Reset 0 dB")) {
+                                    active_curve.preset_reset_unity(16.0);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Clear")) {
+                                    active_curve.clear(1.0f);
+                                }
+                            } else if (current_target == routing::AutomationTarget::Pan) {
+                                if (ImGui::Button("Auto-Pan Sine")) {
+                                    active_curve.preset_sine_pan(16.0, 4.0);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Reset Center")) {
+                                    active_curve.clear(0.0f);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Clear")) {
+                                    active_curve.clear(0.0f);
+                                }
+                            } else if (current_target == routing::AutomationTarget::Aux1 || current_target == routing::AutomationTarget::Aux2) {
+                                if (ImGui::Button("Reverb/FX Swell")) {
+                                    active_curve.preset_reverb_swell(12.0, 16.0, 0.80f);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Delay Throw")) {
+                                    active_curve.preset_delay_throw(4, 0.75f);
+                                    auto_trk->set_automation_enabled(current_target, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Reset Off")) {
+                                    active_curve.clear(0.0f);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Clear")) {
+                                    active_curve.clear(0.0f);
+                                }
+                            } else {
+                                // PluginParam presets
+                                size_t s_idx = (selected_auto_lane - 4) / 4;
+                                size_t p_idx = (selected_auto_lane - 4) % 4;
+                                auto* proc = auto_trk->slot(s_idx).processor();
+                                float def_v = proc ? proc->parameter_default(p_idx) : 0.5f;
+                                if (ImGui::Button("Ramp Up")) {
+                                    active_curve.clear(cur_pmin);
+                                    active_curve.add_point(0.0, cur_pmin, routing::NodeMode::Smooth, 0.0f);
+                                    active_curve.add_point(16.0, cur_pmax, routing::NodeMode::Smooth, 0.0f);
+                                    auto_trk->set_slot_automation_enabled(s_idx, p_idx, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Ramp Down")) {
+                                    active_curve.clear(cur_pmax);
+                                    active_curve.add_point(0.0, cur_pmax, routing::NodeMode::Smooth, 0.0f);
+                                    active_curve.add_point(16.0, cur_pmin, routing::NodeMode::Smooth, 0.0f);
+                                    auto_trk->set_slot_automation_enabled(s_idx, p_idx, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Reset Default")) {
+                                    active_curve.clear(def_v);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Clear (Min)")) {
+                                    active_curve.clear(cur_pmin);
+                                }
                             }
-                            ImGui::PopStyleColor(2);
-                        } else {
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.32f, 0.35f, 0.40f, 0.8f));
-                            if (ImGui::Button("[ AUTOMATION BYPASSED ]", ImVec2(180, 24))) {
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::PopStyleColor(1);
-                        }
 
-                        ImGui::SameLine(0, 16);
-                        ImGui::TextDisabled("Presets:");
-                        ImGui::SameLine();
-                        if (current_target == routing::AutomationTarget::Gain) {
-                            if (ImGui::Button("Fade In")) {
-                                active_curve.preset_fade_in(0.0, 16.0);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Fade Out")) {
-                                active_curve.preset_fade_out(0.0, 16.0);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("4-Beat Pump")) {
-                                active_curve.preset_sidechain_pump(16.0);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Reset 0 dB")) {
-                                active_curve.preset_reset_unity(16.0);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Clear")) {
-                                active_curve.clear(1.0f);
-                            }
-                        } else if (current_target == routing::AutomationTarget::Pan) {
-                            if (ImGui::Button("Auto-Pan Sine")) {
-                                active_curve.preset_sine_pan(16.0, 4.0);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Reset Center")) {
-                                active_curve.clear(0.0f);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Clear")) {
-                                active_curve.clear(0.0f);
-                            }
-                        } else {
-                            // Aux 1 or Aux 2
-                            if (ImGui::Button("Reverb/FX Swell")) {
-                                active_curve.preset_reverb_swell(12.0, 16.0, 0.80f);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Delay Throw")) {
-                                active_curve.preset_delay_throw(4, 0.75f);
-                                auto_trk->set_automation_enabled(current_target, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Reset Off")) {
-                                active_curve.clear(0.0f);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Clear")) {
-                                active_curve.clear(0.0f);
-                            }
+                            editor_curve = &active_curve;
+                            editor_target = current_target;
+                            editor_custom_min = cur_pmin;
+                            editor_custom_max = cur_pmax;
+                            editor_custom_unit = cur_punit;
+                            editor_total_beats = 16.0;
+                            editor_play_beat = cur_play_beat;
+                            editor_id = "TrackAutomationEditor";
                         }
-
-                        editor_curve = &active_curve;
-                        editor_target = current_target;
-                        editor_total_beats = 16.0;
-                        editor_play_beat = cur_play_beat;
-                        editor_id = "TrackAutomationEditor";
                     } else {
                         // Scope 1: Clip-Relative Loop Envelope
                         auto cur_clip = auto_trk ? auto_trk->clip() : nullptr;
@@ -3765,7 +4042,10 @@ int main(int argc, char** argv) {
                                                       editor_play_beat,
                                                       &selected_curve_point,
                                                       editor_target,
-                                                      &selected_curve_points);
+                                                      &selected_curve_points,
+                                                      editor_custom_min,
+                                                      editor_custom_max,
+                                                      editor_custom_unit);
 
                         // Curve Inspector & Ergonomics Legend
                         auto pts = editor_curve->get_points();
@@ -3802,6 +4082,8 @@ int main(int argc, char** argv) {
                                     mid_v = 0.0f; min_v = -1.0f; max_v = 1.0f;
                                 } else if (editor_target == routing::AutomationTarget::Pitch) {
                                     mid_v = 0.0f; min_v = -24.0f; max_v = 24.0f;
+                                } else if (editor_target == routing::AutomationTarget::PluginParam) {
+                                    min_v = editor_custom_min; max_v = editor_custom_max; mid_v = (min_v + max_v) * 0.5f;
                                 }
                                 editor_curve->invert_points_value(selected_curve_points, mid_v, min_v, max_v);
                             }
@@ -3850,6 +4132,12 @@ int main(int argc, char** argv) {
                                 float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
                                 ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Send: %.0f%% (%.1f dB)",
                                                    pt.time_beats, pt.value * 100.0f, db_val);
+                            } else if (editor_target == routing::AutomationTarget::PluginParam) {
+                                if (editor_custom_unit) {
+                                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Value: %.2f %s", pt.time_beats, pt.value, editor_custom_unit);
+                                } else {
+                                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Value: %.2f", pt.time_beats, pt.value);
+                                }
                             } else {
                                 float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
                                 ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Linear: %.3f (%+.1f dB)",

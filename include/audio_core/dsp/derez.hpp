@@ -72,6 +72,28 @@ public:
         }
     }
 
+    [[nodiscard]] uint32_t parameter_count() const noexcept override { return 4; }
+    [[nodiscard]] const char* parameter_name(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return "Rate";
+            case 1: return "Resolution";
+            case 2: return "Hard";
+            case 3: return "Wet";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] float parameter_min(uint32_t /*index*/) const noexcept override { return 0.0f; }
+    [[nodiscard]] float parameter_max(uint32_t /*index*/) const noexcept override { return 1.0f; }
+    [[nodiscard]] float parameter_default(uint32_t index) const noexcept override {
+        switch (index) {
+            case 0: return 1.0f;
+            case 1: return 1.0f;
+            case 2: return 0.0f;
+            case 3: return 1.0f;
+            default: return 0.0f;
+        }
+    }
+
     void process_stereo(Sample* left, Sample* right, uint32_t frames) noexcept override {
         if (!left || !right || frames == 0) return;
 

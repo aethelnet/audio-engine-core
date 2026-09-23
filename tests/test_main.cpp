@@ -9008,6 +9008,275 @@ void test_clip_relative_envelopes_and_loop_modulation() {
     }
 }
 
+void test_insert_slot_automation_and_multilane_stacking() {
+    std::cout << "[TEST] Running Plugin Insert Slot Automation & Multi-Lane Stacking Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+    using namespace audio_core::routing;
+    using namespace audio_core::serialization;
+
+    const uint32_t kSr = 48000;
+
+    // 1. Processor Parameter Reflection & Dynamic Range Verification
+    {
+        // 1A. Baxandall EQ (3 parameters: Bass, Treble, Trim)
+        Baxandall bax;
+        TEST_CHECK(bax.parameter_count() == 3);
+        TEST_CHECK(std::string(bax.parameter_name(0)) == "Bass (dB)");
+        TEST_CHECK(std::string(bax.parameter_name(1)) == "Treble (dB)");
+        TEST_CHECK(std::string(bax.parameter_name(2)) == "Trim");
+        TEST_CHECK(bax.parameter_min(0) == -15.0f && bax.parameter_max(0) == 15.0f);
+        TEST_CHECK(bax.parameter_default(0) == 0.0f);
+        bax.set_parameter(0, 6.5f);
+        TEST_CHECK(std::abs(bax.get_parameter(0) - 6.5f) < 1e-4f);
+        bax.set_parameter(2, 1.5f);
+        TEST_CHECK(std::abs(bax.get_parameter(2) - 1.5f) < 1e-4f);
+
+        // 1B. PurestDrive (2 parameters: Drive, Wet)
+        PurestDrive pd;
+        TEST_CHECK(pd.parameter_count() == 2);
+        TEST_CHECK(std::string(pd.parameter_name(0)) == "Drive");
+        TEST_CHECK(std::string(pd.parameter_name(1)) == "Wet");
+        pd.set_parameter(0, 0.75f);
+        TEST_CHECK(std::abs(pd.get_parameter(0) - 0.75f) < 1e-4f);
+
+        // 1C. ButterComp2 (3 parameters: Compress, Output, Wet)
+        ButterComp2 bc;
+        TEST_CHECK(bc.parameter_count() == 3);
+        TEST_CHECK(std::string(bc.parameter_name(0)) == "Compress");
+        TEST_CHECK(std::string(bc.parameter_name(1)) == "Output");
+        TEST_CHECK(std::string(bc.parameter_name(2)) == "Wet");
+        bc.set_parameter(0, 0.45f);
+        TEST_CHECK(std::abs(bc.get_parameter(0) - 0.45f) < 1e-4f);
+
+        // 1D. DeRez (4 parameters: Rate, Resolution, Hard, Wet)
+        DeRez derez;
+        TEST_CHECK(derez.parameter_count() == 4);
+        TEST_CHECK(std::string(derez.parameter_name(0)) == "Rate");
+        TEST_CHECK(std::string(derez.parameter_name(1)) == "Resolution");
+        derez.set_parameter(1, 0.25f);
+        TEST_CHECK(std::abs(derez.get_parameter(1) - 0.25f) < 1e-4f);
+
+        // 1E. LiquidVactrolProcessor (8 parameters)
+        LiquidVactrolProcessor vactrol(kSr);
+        TEST_CHECK(vactrol.parameter_count() == 8);
+        TEST_CHECK(std::string(vactrol.parameter_name(0)) == "Peak Reduct");
+        TEST_CHECK(std::string(vactrol.parameter_name(1)) == "Makeup (dB)");
+        vactrol.set_parameter(0, 0.8f);
+        TEST_CHECK(std::abs(vactrol.get_parameter(0) - 0.8f) < 1e-4f);
+
+        // 1F. MultiHeadOdeProcessor (24 parameters: 4 heads x 6)
+        MultiHeadOdeProcessor ode(kSr, 4);
+        TEST_CHECK(ode.parameter_count() == 24);
+
+        // 1G. Zero-param processors (ClipOnly2, Interstage)
+        ClipOnly2 clip;
+        TEST_CHECK(clip.parameter_count() == 0);
+        Interstage interstage;
+        TEST_CHECK(interstage.parameter_count() == 0);
+
+        std::cout << "  -> Processor Parameter Reflection & Dynamic Range: PASSED" << std::endl;
+    }
+
+    // 2. Track Insert Slot Automation Storage & Boundary Checks
+    {
+        Track trk(1, "InsertAutoTrack");
+        for (size_t s = 0; s < Track::kMaxTrackInsertSlots; ++s) {
+            for (size_t p = 0; p < Track::kMaxSlotParams; ++p) {
+                TEST_CHECK(!trk.is_slot_automation_enabled(s, p));
+                TEST_CHECK(trk.slot_automation_curve(s, p).get_points().size() == 1);
+                TEST_CHECK(std::abs(trk.slot_automation_curve(s, p).get_points()[0].value - 0.0f) < 1e-4f);
+            }
+        }
+
+        // Out-of-bounds safety
+        TEST_CHECK(!trk.is_slot_automation_enabled(99, 0));
+        TEST_CHECK(!trk.is_slot_automation_enabled(0, 99));
+        trk.set_slot_automation_enabled(99, 0, true);
+        TEST_CHECK(!trk.is_slot_automation_enabled(99, 0));
+
+        // Enable slot 0, param 0
+        trk.set_slot_automation_enabled(0, 0, true);
+        TEST_CHECK(trk.is_slot_automation_enabled(0, 0));
+        trk.slot_automation_curve(0, 0).set_points({
+            AutomationPoint{0.0, -10.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{4.0,  10.0f, NodeMode::Smooth, 0.0f}
+        });
+        TEST_CHECK(trk.slot_automation_curve(0, 0).get_points().size() == 2);
+
+        // Enable slot 1, param 1
+        trk.set_slot_automation_enabled(1, 1, true);
+        TEST_CHECK(trk.is_slot_automation_enabled(1, 1));
+        trk.slot_automation_curve(1, 1).set_points({
+            AutomationPoint{0.0, 0.2f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0, 0.8f, NodeMode::Corner, 0.0f}
+        });
+
+        std::cout << "  -> Track Insert Slot Automation Storage & Boundary Checks: PASSED" << std::endl;
+    }
+
+    // 3. In-Line Real-Time Channel Strip Slot Automation Updates
+    {
+        Track trk(2, "RealtimeStripTrack");
+        trk.slot(0).set_processor(std::make_unique<Baxandall>());
+        trk.slot(0).set_bypass(false);
+
+        trk.slot(1).set_processor(std::make_unique<PurestDrive>());
+        trk.slot(1).set_bypass(false);
+
+        // Slot 0, Param 0: Bass (dB) linearly swept from -12 dB at beat 0 to +12 dB at beat 4
+        trk.set_slot_automation_enabled(0, 0, true);
+        trk.slot_automation_curve(0, 0).set_points({
+            AutomationPoint{0.0, -12.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0,  12.0f, NodeMode::Corner, 0.0f}
+        });
+
+        // Slot 1, Param 0: Drive swept from 0.1 at beat 0 to 0.9 at beat 4
+        trk.set_slot_automation_enabled(1, 0, true);
+        trk.slot_automation_curve(1, 0).set_points({
+            AutomationPoint{0.0, 0.1f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 0.9f, NodeMode::Corner, 0.0f}
+        });
+
+        // Process block at beat 0.0
+        trk.process_channel_strip(256, nullptr, 0.0, 0.1, true);
+        auto* bax = static_cast<Baxandall*>(trk.slot(0).processor());
+        auto* pd  = static_cast<PurestDrive*>(trk.slot(1).processor());
+        TEST_CHECK(std::abs(bax->get_parameter(0) - (-12.0f)) < 0.1f);
+        TEST_CHECK(std::abs(pd->get_parameter(0) - 0.1f) < 0.05f);
+
+        // Process block at beat 2.0 (midway)
+        trk.process_channel_strip(256, nullptr, 2.0, 2.1, true);
+        TEST_CHECK(std::abs(bax->get_parameter(0) - 0.0f) < 0.1f);
+        TEST_CHECK(std::abs(pd->get_parameter(0) - 0.5f) < 0.05f);
+
+        // Process block at beat 4.0 (end)
+        trk.process_channel_strip(256, nullptr, 4.0, 4.1, true);
+        TEST_CHECK(std::abs(bax->get_parameter(0) - 12.0f) < 0.1f);
+        TEST_CHECK(std::abs(pd->get_parameter(0) - 0.9f) < 0.05f);
+
+        std::cout << "  -> In-Line Real-Time Channel Strip Slot Automation Updates: PASSED" << std::endl;
+    }
+
+    // 4. MixerGraph Full Render Integration with Multiple Active Slots
+    {
+        MixerGraph mixer(256, false, kSr);
+        Track* trk = mixer.allocate_track("GraphAutoTrack");
+        TEST_CHECK(trk != nullptr);
+
+        trk->slot(0).set_processor(std::make_unique<ButterComp2>());
+        trk->slot(0).set_bypass(false);
+        trk->set_slot_automation_enabled(0, 0, true); // Compress param
+        trk->slot_automation_curve(0, 0).set_points({
+            AutomationPoint{0.0, 0.1f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 0.9f, NodeMode::Corner, 0.0f}
+        });
+
+        // Populate track buffer with a test sine wave
+        for (uint32_t i = 0; i < 256; ++i) {
+            float s = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / kSr);
+            trk->buffer().view().channel(0)[i] = s;
+            trk->buffer().view().channel(1)[i] = s;
+        }
+
+        mixer.clock().set_sample_rate(kSr);
+        mixer.clock().set_bpm(120.0);
+        mixer.clock().set_playing(true);
+        mixer.clock().set_sample_position(0);
+
+        // Render audio through graph
+        AudioBuffer master_buf(2, 256);
+        auto master_view = master_buf.view();
+        mixer.render(master_view);
+
+        auto* comp = static_cast<ButterComp2*>(trk->slot(0).processor());
+        TEST_CHECK(comp != nullptr);
+        TEST_CHECK(comp->get_parameter(0) >= 0.1f);
+
+        // Verify output buffer is finite and non-NaN
+        const Sample* out_l = mixer.master_bus().buffer().view().channel(0);
+        const Sample* out_r = mixer.master_bus().buffer().view().channel(1);
+        for (uint32_t i = 0; i < 256; ++i) {
+            TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+            TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+        }
+
+        std::cout << "  -> MixerGraph Full Render Integration: PASSED" << std::endl;
+    }
+
+    // 5. JSON Session Serialization Round-Trip of Slot Automation Curves
+    {
+        MixerGraph src_mixer(256, false, kSr);
+        Track* src_trk = src_mixer.allocate_track("SerializeAutoTrack");
+        TEST_CHECK(src_trk != nullptr);
+
+        src_trk->slot(0).set_processor(std::make_unique<Baxandall>());
+        src_trk->set_slot_automation_enabled(0, 0, true);
+        src_trk->slot_automation_curve(0, 0).set_points({
+            AutomationPoint{0.0, -8.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{2.0,  0.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{4.0,  8.0f, NodeMode::Smooth, 0.0f}
+        });
+
+        src_trk->slot(2).set_processor(std::make_unique<DeRez>());
+        src_trk->set_slot_automation_enabled(2, 1, true);
+        src_trk->slot_automation_curve(2, 1).set_points({
+            AutomationPoint{0.0, 1.0f, NodeMode::Hold, 0.0f},
+            AutomationPoint{4.0, 0.3f, NodeMode::Hold, 0.0f}
+        });
+
+        clock::TimelineClock clock(kSr, 120.0);
+        ProjectSessionData sess = SessionSerializer::extract_session(src_mixer, clock, "SlotAutoSessionTest");
+        TEST_CHECK(sess.tracks.size() >= 1);
+        const auto& trk_auto = sess.tracks[0].automation;
+        TEST_CHECK(trk_auto.slot_automation.size() == 2);
+
+        // Serialize to JSON
+        std::string json_str = sess.to_json();
+        TEST_CHECK(!json_str.empty());
+        TEST_CHECK(json_str.find("slot_automation") != std::string::npos);
+
+        // Parse JSON
+        auto parsed = json::Parser::parse(json_str);
+        TEST_CHECK(parsed.has_value());
+        auto restored_sess = ProjectSessionData::from_json_val(*parsed);
+        TEST_CHECK(restored_sess.has_value());
+
+        // Restore to target mixer
+        MixerGraph dst_mixer(256, false, kSr);
+        clock::TimelineClock dst_clock(kSr, 120.0);
+        bool applied = SessionSerializer::apply_session(dst_mixer, dst_clock, *restored_sess);
+        TEST_CHECK(applied);
+
+        Track* dst_trk = dst_mixer.track_by_index(0);
+        TEST_CHECK(dst_trk != nullptr);
+
+        // Verify slot 0 param 0
+        TEST_CHECK(dst_trk->is_slot_automation_enabled(0, 0) == true);
+        const auto& c00 = dst_trk->slot_automation_curve(0, 0);
+        TEST_CHECK(c00.get_points().size() == 3);
+        TEST_CHECK(std::abs(c00.get_points()[0].value - (-8.0f)) < 1e-4f);
+        TEST_CHECK(std::abs(c00.get_points()[1].value - 0.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c00.get_points()[2].value - 8.0f) < 1e-4f);
+
+        // Verify slot 2 param 1
+        TEST_CHECK(dst_trk->is_slot_automation_enabled(2, 1) == true);
+        const auto& c21 = dst_trk->slot_automation_curve(2, 1);
+        TEST_CHECK(c21.get_points().size() == 2);
+        TEST_CHECK(std::abs(c21.get_points()[0].value - 1.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c21.get_points()[1].value - 0.3f) < 1e-4f);
+        TEST_CHECK(c21.get_points()[0].node_mode == NodeMode::Hold);
+
+        // Verify disabled slots remain disabled
+        TEST_CHECK(dst_trk->is_slot_automation_enabled(0, 1) == false);
+        TEST_CHECK(dst_trk->is_slot_automation_enabled(1, 0) == false);
+        TEST_CHECK(dst_trk->is_slot_automation_enabled(3, 3) == false);
+
+        std::cout << "  -> JSON Session Serialization Round-Trip: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -9081,6 +9350,7 @@ int main() {
     test_multi_parameter_automation_and_session_serialization();
     test_automation_selection_and_batch_editing();
     test_clip_relative_envelopes_and_loop_modulation();
+    test_insert_slot_automation_and_multilane_stacking();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

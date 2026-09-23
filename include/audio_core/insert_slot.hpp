@@ -50,6 +50,21 @@ public:
     [[nodiscard]] virtual float get_parameter(uint32_t index) const noexcept = 0;
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 
+    // Parameter Metadata & Reflection for Automation & UI
+    [[nodiscard]] virtual uint32_t parameter_count() const noexcept { return 4; }
+    [[nodiscard]] virtual const char* parameter_name(uint32_t index) const noexcept {
+        switch (index) {
+            case 0: return "Param 1";
+            case 1: return "Param 2";
+            case 2: return "Param 3";
+            case 3: return "Param 4";
+            default: return "Param";
+        }
+    }
+    [[nodiscard]] virtual float parameter_min(uint32_t /*index*/) const noexcept { return 0.0f; }
+    [[nodiscard]] virtual float parameter_max(uint32_t /*index*/) const noexcept { return 1.0f; }
+    [[nodiscard]] virtual float parameter_default(uint32_t /*index*/) const noexcept { return 0.5f; }
+
     // Latency reporting for Plugin Delay Compensation (PDC)
     [[nodiscard]] virtual uint32_t latency_samples() const noexcept { return 0; }
 

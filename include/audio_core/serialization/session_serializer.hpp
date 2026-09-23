@@ -356,6 +356,13 @@ struct AutomationPointData {
     float tau{0.0f};
 };
 
+struct SlotAutomationData {
+    uint32_t slot{0};
+    uint32_t param{0};
+    bool enabled{false};
+    std::vector<AutomationPointData> points{};
+};
+
 struct TrackAutomationData {
     bool gain_enabled{false};
     std::vector<AutomationPointData> gain_points{};
@@ -365,6 +372,7 @@ struct TrackAutomationData {
     std::vector<AutomationPointData> aux1_points{};
     bool aux2_enabled{false};
     std::vector<AutomationPointData> aux2_points{};
+    std::vector<SlotAutomationData> slot_automation{};
 };
 
 struct ClipEnvelopeData {
@@ -464,6 +472,19 @@ struct ProjectSessionData {
                 const auto& pt = trk.automation.aux2_points[p];
                 ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
                    << (p + 1 < trk.automation.aux2_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"slot_automation\": [";
+            for (size_t sa = 0; sa < trk.automation.slot_automation.size(); ++sa) {
+                const auto& sdata = trk.automation.slot_automation[sa];
+                ss << "{\"slot\":" << sdata.slot << ",\"param\":" << sdata.param
+                   << ",\"enabled\":" << (sdata.enabled ? "true" : "false") << ",\"points\":[";
+                for (size_t p = 0; p < sdata.points.size(); ++p) {
+                    const auto& pt = sdata.points[p];
+                    ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                       << (p + 1 < sdata.points.size() ? "," : "");
+                }
+                ss << "]}" << (sa + 1 < trk.automation.slot_automation.size() ? "," : "");
             }
             ss << "]\n";
             ss << "      },\n";
@@ -583,6 +604,32 @@ struct ProjectSessionData {
                             parse_lane(auto_obj, "pan_enabled", "pan_points", tdata.automation.pan_enabled, tdata.automation.pan_points);
                             parse_lane(auto_obj, "aux1_enabled", "aux1_points", tdata.automation.aux1_enabled, tdata.automation.aux1_points);
                             parse_lane(auto_obj, "aux2_enabled", "aux2_points", tdata.automation.aux2_enabled, tdata.automation.aux2_points);
+
+                            if (auto* sa_arr = auto_obj->get("slot_automation")) {
+                                if (sa_arr->is_array()) {
+                                    for (const auto& entry : sa_arr->arr_val) {
+                                        if (!entry.is_object()) continue;
+                                        SlotAutomationData sdata;
+                                        if (auto* s = entry.get("slot")) sdata.slot = s->as_uint(0);
+                                        if (auto* p = entry.get("param")) sdata.param = p->as_uint(0);
+                                        if (auto* e = entry.get("enabled")) sdata.enabled = e->as_bool(false);
+                                        if (auto* pa = entry.get("points")) {
+                                            if (pa->is_array()) {
+                                                for (const auto& pv : pa->arr_val) {
+                                                    if (!pv.is_object()) continue;
+                                                    AutomationPointData ptd;
+                                                    if (auto* t = pv.get("t")) ptd.t = t->as_double(0.0);
+                                                    if (auto* v = pv.get("v")) ptd.v = v->as_float(1.0f);
+                                                    if (auto* m = pv.get("m")) ptd.m = static_cast<uint8_t>(m->as_uint(0));
+                                                    if (auto* tau = pv.get("tau")) ptd.tau = tau->as_float(0.0f);
+                                                    sdata.points.push_back(ptd);
+                                                }
+                                            }
+                                        }
+                                        tdata.automation.slot_automation.push_back(std::move(sdata));
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -738,6 +785,21 @@ public:
             tdata.automation.aux2_enabled = trk->is_automation_enabled(routing::AutomationTarget::Aux2);
             extract_pts(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points);
 
+            for (size_t s = 0; s < Track::kMaxTrackInsertSlots; ++s) {
+                for (size_t p = 0; p < Track::kMaxSlotParams; ++p) {
+                    bool en = trk->is_slot_automation_enabled(s, p);
+                    const auto& pts = trk->slot_automation_curve(s, p).get_points();
+                    if (en || pts.size() > 1 || (pts.size() == 1 && std::abs(pts[0].value) > 1e-4f)) {
+                        SlotAutomationData sdata;
+                        sdata.slot = static_cast<uint32_t>(s);
+                        sdata.param = static_cast<uint32_t>(p);
+                        sdata.enabled = en;
+                        extract_pts(trk->slot_automation_curve(s, p), sdata.points);
+                        tdata.automation.slot_automation.push_back(std::move(sdata));
+                    }
+                }
+            }
+
             // Extract clip envelopes if track has an audio clip
             if (trk->clip()) {
                 const auto& clp = trk->clip();
@@ -838,6 +900,13 @@ public:
 
             restore_lane(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points, 0.0f);
             trk->set_automation_enabled(routing::AutomationTarget::Aux2, tdata.automation.aux2_enabled);
+
+            for (const auto& sdata : tdata.automation.slot_automation) {
+                if (sdata.slot < Track::kMaxTrackInsertSlots && sdata.param < Track::kMaxSlotParams) {
+                    restore_lane(trk->slot_automation_curve(sdata.slot, sdata.param), sdata.points, 0.0f);
+                    trk->set_slot_automation_enabled(sdata.slot, sdata.param, sdata.enabled);
+                }
+            }
 
             // Restore clip envelopes if track has an audio clip (or instantiate clip if envelope data exists)
             if (!trk->clip() && (tdata.clip_envelopes.gain_enabled ||
