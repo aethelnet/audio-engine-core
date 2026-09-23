@@ -504,6 +504,7 @@ int main(int argc, char** argv) {
     mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
     uint32_t selected_patch_id = 1;
     int selected_curve_point = -1;
+    std::vector<size_t> selected_curve_points;
     int selected_auto_lane = 0; // 0=Gain, 1=Pan, 2=Aux1, 3=Aux2
 
     protocol::MixerTelemetryFrame telemetry{};
@@ -3467,6 +3468,7 @@ int main(int argc, char** argv) {
                         if (ImGui::Button(trk_short_names[t], ImVec2(120, 24))) {
                             selected_track = t;
                             selected_curve_point = -1;
+                            selected_curve_points.clear();
                         }
                         if (is_sel) {
                             ImGui::PopStyleColor(2);
@@ -3492,6 +3494,7 @@ int main(int argc, char** argv) {
                         if (ImGui::Button(lane_names[l], ImVec2(130, 24))) {
                             selected_auto_lane = l;
                             selected_curve_point = -1;
+                            selected_curve_points.clear();
                         }
                         if (is_sel) {
                             ImGui::PopStyleColor(2);
@@ -3584,17 +3587,69 @@ int main(int argc, char** argv) {
                                                   16.0,
                                                   cur_play_beat,
                                                   &selected_curve_point,
-                                                  current_target);
+                                                  current_target,
+                                                  &selected_curve_points);
 
                     // Curve Inspector & Ergonomics Legend
                     auto pts = active_curve.get_points();
                     ImGui::Spacing();
                     ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
-                        "Ergonomics: Click curve = Split & Add Node | Drag Node = Move (Snap 1/16th beat; hold Shift for free movement)");
+                        "Ergonomics: Click Canvas = Marquee Box | Shift+Click = Multi-select | Ctrl+A = Select All | Esc = Clear Selection");
                     ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
-                        "            Drag Tension Dot = Adjust Curvature tau in [-1, 1] | Double-Click Node = Toggle Smooth / Corner / Hold | Right-Click = Delete Node");
+                        "            Drag Handles = Time-Stretch / Scale Y | Drag Nodes = Move (1/16th Snap; Shift=Free) | Arrow Keys = Nudge (Alt=Fine)");
+                    ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
+                        "            Click Curve = Split & Add Node | Drag Tension Dot = Curvature tau | Double-Click = Mode | Del = Remove | Ctrl+D = Dup");
 
-                    if (selected_curve_point >= 0 && selected_curve_point < static_cast<int>(pts.size())) {
+                    // Multi-Node Batch Action Bar
+                    if (selected_curve_points.size() > 1) {
+                        ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.10f, 1.0f), "Batch Selection (%zu Nodes):", selected_curve_points.size());
+                        ImGui::SameLine();
+                        if (ImGui::Button("Smooth All (S)")) {
+                            active_curve.set_nodes_mode(selected_curve_points, routing::NodeMode::Smooth);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Corner All (C)")) {
+                            active_curve.set_nodes_mode(selected_curve_points, routing::NodeMode::Corner);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Hold All (H)")) {
+                            active_curve.set_nodes_mode(selected_curve_points, routing::NodeMode::Hold);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Invert Y")) {
+                            float mid_v = (current_target == routing::AutomationTarget::Pan) ? 0.0f : 0.5f;
+                            float min_v = (current_target == routing::AutomationTarget::Pan) ? -1.0f : 0.0f;
+                            float max_v = (current_target == routing::AutomationTarget::Pan) ?  1.0f : 1.25f;
+                            active_curve.invert_points_value(selected_curve_points, mid_v, min_v, max_v);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Stretch 2x")) {
+                            double min_t = 1e9;
+                            for (auto idx : selected_curve_points) {
+                                if (idx < pts.size()) min_t = std::min(min_t, pts[idx].time_beats);
+                            }
+                            active_curve.scale_points_time(selected_curve_points, min_t, 2.0);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Compress 0.5x")) {
+                            double min_t = 1e9;
+                            for (auto idx : selected_curve_points) {
+                                if (idx < pts.size()) min_t = std::min(min_t, pts[idx].time_beats);
+                            }
+                            active_curve.scale_points_time(selected_curve_points, min_t, 0.5);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Duplicate (Ctrl+D)")) {
+                            selected_curve_points = active_curve.duplicate_points(selected_curve_points, 1.0);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Delete (Del)")) {
+                            active_curve.remove_points(selected_curve_points);
+                            selected_curve_points.clear();
+                            selected_curve_point = -1;
+                        }
+                    } else if (selected_curve_point >= 0 && selected_curve_point < static_cast<int>(pts.size())) {
                         auto pt = pts[selected_curve_point];
                         ImGui::Spacing();
                         ImGui::Text("Node #%d Selected:", selected_curve_point + 1);

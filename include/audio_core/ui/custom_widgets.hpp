@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <unordered_map>
 #include <cstdio>
 
 namespace audio_core::ui {
@@ -600,7 +601,8 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
                                       double total_beats = 16.0,
                                       double current_playhead_beat = -1.0,
                                       int* selected_point_out = nullptr,
-                                      routing::AutomationTarget target = routing::AutomationTarget::Gain) {
+                                      routing::AutomationTarget target = routing::AutomationTarget::Gain,
+                                      std::vector<size_t>* selected_points_out = nullptr) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
 
@@ -646,10 +648,36 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         return min_val + norm * (max_val - min_val);
     };
 
-    static int s_active_pt = -1;
-    static int s_active_tension = -1;
-    static bool s_is_dragging_pt = false;
-    static bool s_is_dragging_tension = false;
+    struct CurveEditorState {
+        std::vector<size_t> selected_indices;
+        int active_drag_idx = -1;
+        int active_tension_idx = -1;
+        bool is_dragging_nodes = false;
+        bool is_dragging_tension = false;
+        bool is_marquee_selecting = false;
+        ImVec2 marquee_start{0, 0};
+        ImVec2 marquee_end{0, 0};
+
+        enum class TransformHandle { None, Left, Right, Top, Bottom };
+        TransformHandle active_handle = TransformHandle::None;
+
+        struct InitialPoint {
+            size_t idx;
+            double t;
+            float v;
+        };
+        std::vector<InitialPoint> drag_start_pts;
+        double drag_start_mouse_beat = 0.0;
+        float drag_start_mouse_val = 0.0f;
+        double bbox_min_t = 0.0;
+        double bbox_max_t = 0.0;
+        float bbox_min_v = 0.0f;
+        float bbox_max_v = 0.0f;
+    };
+
+    uint64_t state_key = (static_cast<uint64_t>(id) << 32) ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&curve));
+    static std::unordered_map<uint64_t, CurveEditorState> s_editor_states;
+    CurveEditorState& state = s_editor_states[state_key];
 
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 mouse = io.MousePos;
@@ -658,21 +686,98 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     auto points = curve.get_points();
     auto snap = curve.snapshot();
 
-    // 1. Hit Testing: Points & Tension Handles
-    int hovered_pt = -1;
-    int hovered_tension = -1;
+    // Sanitize selection indices
+    std::vector<size_t> valid_sel;
+    for (size_t s : state.selected_indices) {
+        if (s < points.size() && std::find(valid_sel.begin(), valid_sel.end(), s) == valid_sel.end()) {
+            valid_sel.push_back(s);
+        }
+    }
+    state.selected_indices = std::move(valid_sel);
 
-    for (size_t i = 0; i < points.size(); ++i) {
-        float px = beat_to_x(points[i].time_beats);
-        float py = val_to_y(points[i].value);
-        if (std::hypot(mouse.x - px, mouse.y - py) <= 9.0f) {
-            hovered_pt = static_cast<int>(i);
-            break;
+    auto snap_val = [&](float v) -> float {
+        if (io.KeyShift) return v;
+        if (target == routing::AutomationTarget::Pan) {
+            if (std::abs(v) < 0.05f) return 0.0f; // Snap to Center
+            if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
+            if (std::abs(v + 1.0f) < 0.04f) return -1.0f;
+        } else if (target == routing::AutomationTarget::Gain) {
+            if (std::abs(v - 1.0f) < 0.04f) return 1.0f; // Snap to 0 dB
+            if (std::abs(v - 0.5f) < 0.03f) return 0.5f; // Snap to -6 dB
+            if (v < 0.03f) return 0.0f; // Snap to silence
+        } else {
+            if (v < 0.03f) return 0.0f;
+            if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
+            if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
+        }
+        return v;
+    };
+
+    auto snap_beat = [&](double b) -> double {
+        if (io.KeyShift) return b;
+        return std::round(b * 4.0) / 4.0; // Snap to 1/16th beat
+    };
+
+    // Calculate Bounding Box of selection
+    bool has_multi_selection = state.selected_indices.size() >= 2;
+    double sel_min_t = 1e9, sel_max_t = -1e9;
+    float sel_min_v = 1e9f, sel_max_v = -1e9f;
+    if (has_multi_selection) {
+        for (size_t s : state.selected_indices) {
+            if (s < points.size()) {
+                sel_min_t = std::min(sel_min_t, points[s].time_beats);
+                sel_max_t = std::max(sel_max_t, points[s].time_beats);
+                sel_min_v = std::min(sel_min_v, points[s].value);
+                sel_max_v = std::max(sel_max_v, points[s].value);
+            }
         }
     }
 
-    if (hovered_pt < 0) {
+    float bbox_x1 = beat_to_x(sel_min_t) - 8.0f;
+    float bbox_x2 = beat_to_x(sel_max_t) + 8.0f;
+    float bbox_y_top = val_to_y(sel_max_v) - 8.0f;
+    float bbox_y_bot = val_to_y(sel_min_v) + 8.0f;
+
+    // 1. Hit Testing: Transform Handles, Points, Tension Handles, and Curve Line
+    int hovered_pt = -1;
+    int hovered_tension = -1;
+    CurveEditorState::TransformHandle hovered_handle = CurveEditorState::TransformHandle::None;
+
+    if (has_multi_selection && !state.is_dragging_nodes && !state.is_marquee_selecting) {
+        ImVec2 h_l(bbox_x1, 0.5f * (bbox_y_top + bbox_y_bot));
+        ImVec2 h_r(bbox_x2, 0.5f * (bbox_y_top + bbox_y_bot));
+        ImVec2 h_t(0.5f * (bbox_x1 + bbox_x2), bbox_y_top);
+        ImVec2 h_b(0.5f * (bbox_x1 + bbox_x2), bbox_y_bot);
+
+        if (std::hypot(mouse.x - h_l.x, mouse.y - h_l.y) <= 8.0f) {
+            hovered_handle = CurveEditorState::TransformHandle::Left;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        } else if (std::hypot(mouse.x - h_r.x, mouse.y - h_r.y) <= 8.0f) {
+            hovered_handle = CurveEditorState::TransformHandle::Right;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        } else if (std::hypot(mouse.x - h_t.x, mouse.y - h_t.y) <= 8.0f) {
+            hovered_handle = CurveEditorState::TransformHandle::Top;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        } else if (std::hypot(mouse.x - h_b.x, mouse.y - h_b.y) <= 8.0f) {
+            hovered_handle = CurveEditorState::TransformHandle::Bottom;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+    }
+
+    if (hovered_handle == CurveEditorState::TransformHandle::None) {
+        for (size_t i = 0; i < points.size(); ++i) {
+            float px = beat_to_x(points[i].time_beats);
+            float py = val_to_y(points[i].value);
+            if (std::hypot(mouse.x - px, mouse.y - py) <= 9.0f) {
+                hovered_pt = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    if (hovered_handle == CurveEditorState::TransformHandle::None && hovered_pt < 0) {
         for (size_t i = 0; i + 1 < points.size(); ++i) {
+            if (points[i].node_mode == routing::NodeMode::Hold) continue;
             double mid_t = 0.5 * (points[i].time_beats + points[i + 1].time_beats);
             float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (points[i].value + points[i + 1].value);
             float tx = beat_to_x(mid_t);
@@ -684,100 +789,286 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         }
     }
 
+    // Check if mouse is directly on the curve (Ghost node splitting)
+    bool is_mouse_on_curve = false;
+    double mouse_beat = x_to_beat(mouse.x);
+    float curve_val_at_mouse = snap ? snap->evaluate(mouse_beat) : 0.0f;
+    float curve_y_at_mouse = val_to_y(curve_val_at_mouse);
+    if (is_hovered && hovered_handle == CurveEditorState::TransformHandle::None && hovered_pt < 0 && hovered_tension < 0) {
+        if (std::abs(mouse.y - curve_y_at_mouse) <= 10.0f && mouse.x >= x && mouse.x <= x + w) {
+            is_mouse_on_curve = true;
+        }
+    }
+
+    // Dynamic mouse cursor styling
+    if (hovered_pt >= 0) {
+        bool is_sel = std::find(state.selected_indices.begin(), state.selected_indices.end(), static_cast<size_t>(hovered_pt)) != state.selected_indices.end();
+        ImGui::SetMouseCursor(is_sel ? ImGuiMouseCursor_ResizeAll : ImGuiMouseCursor_Hand);
+    } else if (is_mouse_on_curve) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
     // 2. Mouse Actions & Gestures
     bool modified = false;
 
     if (is_hovered && ImGui::IsMouseClicked(0)) {
-        if (hovered_pt >= 0) {
+        if (hovered_handle != CurveEditorState::TransformHandle::None) {
+            state.active_handle = hovered_handle;
+            state.drag_start_pts.clear();
+            for (size_t s : state.selected_indices) {
+                if (s < points.size()) {
+                    state.drag_start_pts.push_back({s, points[s].time_beats, points[s].value});
+                }
+            }
+            state.drag_start_mouse_beat = x_to_beat(mouse.x);
+            state.drag_start_mouse_val = y_to_val(mouse.y);
+            state.bbox_min_t = sel_min_t;
+            state.bbox_max_t = sel_max_t;
+            state.bbox_min_v = sel_min_v;
+            state.bbox_max_v = sel_max_v;
+        } else if (hovered_pt >= 0) {
+            size_t h_idx = static_cast<size_t>(hovered_pt);
             if (io.MouseDoubleClicked[0]) {
                 // FontLab Double-Click: Toggle Smooth <-> Corner <-> Hold
-                curve.toggle_node_mode(static_cast<size_t>(hovered_pt));
+                if (std::find(state.selected_indices.begin(), state.selected_indices.end(), h_idx) != state.selected_indices.end()) {
+                    for (size_t s : state.selected_indices) {
+                        curve.toggle_node_mode(s);
+                    }
+                } else {
+                    curve.toggle_node_mode(h_idx);
+                }
                 modified = true;
             } else {
-                s_active_pt = hovered_pt;
-                s_is_dragging_pt = true;
+                if (io.KeyShift) {
+                    auto it = std::find(state.selected_indices.begin(), state.selected_indices.end(), h_idx);
+                    if (it != state.selected_indices.end()) {
+                        state.selected_indices.erase(it);
+                    } else {
+                        state.selected_indices.push_back(h_idx);
+                    }
+                } else {
+                    auto it = std::find(state.selected_indices.begin(), state.selected_indices.end(), h_idx);
+                    if (it == state.selected_indices.end()) {
+                        state.selected_indices = { h_idx };
+                    }
+                }
+
+                state.is_dragging_nodes = true;
+                state.active_drag_idx = hovered_pt;
+                state.drag_start_mouse_beat = x_to_beat(mouse.x);
+                state.drag_start_mouse_val = y_to_val(mouse.y);
+                state.drag_start_pts.clear();
+                for (size_t s : state.selected_indices) {
+                    if (s < points.size()) {
+                        state.drag_start_pts.push_back({s, points[s].time_beats, points[s].value});
+                    }
+                }
             }
         } else if (hovered_tension >= 0) {
-            s_active_tension = hovered_tension;
-            s_is_dragging_tension = true;
-        } else {
-            // Click on line/canvas: Insert new breakpoint (Ghost node becomes real)
-            auto snap_val = [&](float v) -> float {
-                if (io.KeyShift) return v;
-                if (target == routing::AutomationTarget::Pan) {
-                    if (std::abs(v) < 0.05f) return 0.0f; // Snap to Center
-                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
-                    if (std::abs(v + 1.0f) < 0.04f) return -1.0f;
-                } else if (target == routing::AutomationTarget::Gain) {
-                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f; // Snap to 0 dB
-                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f; // Snap to -6 dB
-                    if (v < 0.03f) return 0.0f; // Snap to silence
-                } else {
-                    if (v < 0.03f) return 0.0f;
-                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
-                    if (std::abs(v - 1.0f) < 0.03f) return 1.0f;
-                }
-                return v;
-            };
-
-            double nb = x_to_beat(mouse.x);
-            if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0; // Snap to 1/16th beat
-            float nv = snap_val(y_to_val(mouse.y));
+            state.active_tension_idx = hovered_tension;
+            state.is_dragging_tension = true;
+        } else if (is_mouse_on_curve) {
+            // Click on curve line: Split curve & insert new node (Ghost node becomes real)
+            double nb = snap_beat(mouse_beat);
+            float nv = snap_val(curve_val_at_mouse);
             size_t new_idx = curve.add_point(nb, nv, routing::NodeMode::Smooth, 0.0f);
-            s_active_pt = static_cast<int>(new_idx);
-            s_is_dragging_pt = true;
+            state.selected_indices = { new_idx };
+            state.is_dragging_nodes = true;
+            state.active_drag_idx = static_cast<int>(new_idx);
+            state.drag_start_mouse_beat = nb;
+            state.drag_start_mouse_val = nv;
+            state.drag_start_pts = { {new_idx, nb, nv} };
             modified = true;
+        } else {
+            // Click in empty canvas: Marquee Selection Box
+            if (!io.KeyShift) {
+                state.selected_indices.clear();
+            }
+            state.is_marquee_selecting = true;
+            state.marquee_start = mouse;
+            state.marquee_end = mouse;
         }
     }
 
     if (is_hovered && ImGui::IsMouseClicked(1)) {
         if (hovered_pt >= 0) {
-            // Right-click: Delete node
-            curve.remove_point(static_cast<size_t>(hovered_pt));
-            if (s_active_pt == hovered_pt) s_active_pt = -1;
+            size_t h_idx = static_cast<size_t>(hovered_pt);
+            bool in_sel = std::find(state.selected_indices.begin(), state.selected_indices.end(), h_idx) != state.selected_indices.end();
+            if (in_sel && state.selected_indices.size() > 1) {
+                curve.remove_points(state.selected_indices);
+                state.selected_indices.clear();
+            } else {
+                curve.remove_point(h_idx);
+                auto it = std::find(state.selected_indices.begin(), state.selected_indices.end(), h_idx);
+                if (it != state.selected_indices.end()) state.selected_indices.erase(it);
+            }
             modified = true;
         }
     }
 
     // Dragging
     if (io.MouseDown[0]) {
-        if (s_is_dragging_pt && s_active_pt >= 0 && static_cast<size_t>(s_active_pt) < points.size()) {
-            auto snap_val = [&](float v) -> float {
-                if (io.KeyShift) return v;
-                if (target == routing::AutomationTarget::Pan) {
-                    if (std::abs(v) < 0.05f) return 0.0f;
-                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
-                    if (std::abs(v + 1.0f) < 0.04f) return -1.0f;
-                } else if (target == routing::AutomationTarget::Gain) {
-                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
-                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
-                    if (v < 0.03f) return 0.0f;
-                } else {
-                    if (v < 0.03f) return 0.0f;
-                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
-                    if (std::abs(v - 1.0f) < 0.03f) return 1.0f;
-                }
-                return v;
-            };
+        if (state.active_handle != CurveEditorState::TransformHandle::None) {
+            // Bounding box transformation
+            double cur_b = x_to_beat(mouse.x);
+            float cur_v = y_to_val(mouse.y);
 
-            double nb = x_to_beat(mouse.x);
-            if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0;
-            float nv = snap_val(y_to_val(mouse.y));
-            curve.update_point(static_cast<size_t>(s_active_pt), nb, nv);
+            if (state.active_handle == CurveEditorState::TransformHandle::Right) {
+                double orig_span = state.bbox_max_t - state.bbox_min_t;
+                if (orig_span > 1e-4) {
+                    double target_b = snap_beat(cur_b);
+                    double scale_t = std::max(0.05, (target_b - state.bbox_min_t) / orig_span);
+                    for (const auto& pt : state.drag_start_pts) {
+                        double rel = pt.t - state.bbox_min_t;
+                        double new_t = std::clamp(state.bbox_min_t + rel * scale_t, 0.0, total_beats);
+                        curve.update_point(pt.idx, new_t, pt.v);
+                    }
+                    modified = true;
+                }
+            } else if (state.active_handle == CurveEditorState::TransformHandle::Left) {
+                double orig_span = state.bbox_max_t - state.bbox_min_t;
+                if (orig_span > 1e-4) {
+                    double target_b = snap_beat(cur_b);
+                    double scale_t = std::max(0.05, (state.bbox_max_t - target_b) / orig_span);
+                    for (const auto& pt : state.drag_start_pts) {
+                        double rel = state.bbox_max_t - pt.t;
+                        double new_t = std::clamp(state.bbox_max_t - rel * scale_t, 0.0, total_beats);
+                        curve.update_point(pt.idx, new_t, pt.v);
+                    }
+                    modified = true;
+                }
+            } else if (state.active_handle == CurveEditorState::TransformHandle::Top) {
+                float orig_h = state.bbox_max_v - state.bbox_min_v;
+                if (orig_h > 1e-4f) {
+                    float target_v = snap_val(cur_v);
+                    float scale_v = (target_v - state.bbox_min_v) / orig_h;
+                    for (const auto& pt : state.drag_start_pts) {
+                        float rel = pt.v - state.bbox_min_v;
+                        float new_v = std::clamp(state.bbox_min_v + rel * scale_v, min_val, max_val);
+                        curve.update_point(pt.idx, pt.t, new_v);
+                    }
+                    modified = true;
+                }
+            } else if (state.active_handle == CurveEditorState::TransformHandle::Bottom) {
+                float orig_h = state.bbox_max_v - state.bbox_min_v;
+                if (orig_h > 1e-4f) {
+                    float target_v = snap_val(cur_v);
+                    float scale_v = (state.bbox_max_v - target_v) / orig_h;
+                    for (const auto& pt : state.drag_start_pts) {
+                        float rel = state.bbox_max_v - pt.v;
+                        float new_v = std::clamp(state.bbox_max_v - rel * scale_v, min_val, max_val);
+                        curve.update_point(pt.idx, pt.t, new_v);
+                    }
+                    modified = true;
+                }
+            }
+        } else if (state.is_dragging_nodes && !state.drag_start_pts.empty()) {
+            double cur_b = x_to_beat(mouse.x);
+            float cur_v = y_to_val(mouse.y);
+            double delta_b = cur_b - state.drag_start_mouse_beat;
+            float delta_v = cur_v - state.drag_start_mouse_val;
+
+            if (!io.KeyShift) {
+                delta_b = std::round(delta_b * 4.0) / 4.0;
+            }
+
+            for (const auto& pt : state.drag_start_pts) {
+                double new_t = std::clamp(pt.t + delta_b, 0.0, total_beats);
+                float new_v = snap_val(std::clamp(pt.v + delta_v, min_val, max_val));
+                curve.update_point(pt.idx, new_t, new_v);
+            }
             modified = true;
-        } else if (s_is_dragging_tension && s_active_tension >= 0 && static_cast<size_t>(s_active_tension) < points.size()) {
+        } else if (state.is_dragging_tension && state.active_tension_idx >= 0 &&
+                   static_cast<size_t>(state.active_tension_idx) < points.size()) {
             float dy = -io.MouseDelta.y * 0.035f;
-            float cur_tau = points[s_active_tension].tension + dy;
-            curve.set_segment_tension(static_cast<size_t>(s_active_tension), cur_tau);
+            float cur_tau = points[state.active_tension_idx].tension + dy;
+            curve.set_segment_tension(static_cast<size_t>(state.active_tension_idx), cur_tau);
             modified = true;
+        } else if (state.is_marquee_selecting) {
+            state.marquee_end = mouse;
+
+            float mx1 = std::min(state.marquee_start.x, state.marquee_end.x);
+            float mx2 = std::max(state.marquee_start.x, state.marquee_end.x);
+            float my1 = std::min(state.marquee_start.y, state.marquee_end.y);
+            float my2 = std::max(state.marquee_start.y, state.marquee_end.y);
+
+            for (size_t i = 0; i < points.size(); ++i) {
+                float px = beat_to_x(points[i].time_beats);
+                float py = val_to_y(points[i].value);
+                if (px >= mx1 && px <= mx2 && py >= my1 && py <= my2) {
+                    if (std::find(state.selected_indices.begin(), state.selected_indices.end(), i) == state.selected_indices.end()) {
+                        state.selected_indices.push_back(i);
+                    }
+                }
+            }
         }
     } else {
-        s_is_dragging_pt = false;
-        s_is_dragging_tension = false;
+        if (state.is_dragging_nodes || state.active_handle != CurveEditorState::TransformHandle::None) {
+            // Re-sync selected_indices to match newly sorted points by (time_beats, value)
+            auto cur_pts = curve.get_points();
+            std::vector<size_t> new_sel;
+            for (const auto& sp : state.drag_start_pts) {
+                size_t best_idx = 0;
+                double best_dist = 1e9;
+                for (size_t i = 0; i < cur_pts.size(); ++i) {
+                    double d = std::abs(cur_pts[i].time_beats - sp.t) + std::abs(cur_pts[i].value - sp.v);
+                    if (d < best_dist) {
+                        best_dist = d;
+                        best_idx = i;
+                    }
+                }
+                if (best_dist < 0.1 && std::find(new_sel.begin(), new_sel.end(), best_idx) == new_sel.end()) {
+                    new_sel.push_back(best_idx);
+                }
+            }
+            if (!new_sel.empty()) state.selected_indices = new_sel;
+        }
+        state.is_dragging_nodes = false;
+        state.is_dragging_tension = false;
+        state.is_marquee_selecting = false;
+        state.active_handle = CurveEditorState::TransformHandle::None;
+        state.active_drag_idx = -1;
+        state.active_tension_idx = -1;
+    }
+
+    // Keyboard Shortcuts & Fine Nudging
+    if (is_hovered) {
+        if ((ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) && !state.selected_indices.empty()) {
+            curve.remove_points(state.selected_indices);
+            state.selected_indices.clear();
+            modified = true;
+        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+            state.selected_indices.clear();
+            for (size_t i = 0; i < points.size(); ++i) state.selected_indices.push_back(i);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            state.selected_indices.clear();
+        }
+        if (!state.selected_indices.empty()) {
+            double nudge_b = 0.0;
+            float nudge_v = 0.0f;
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  nudge_b -= (io.KeyAlt ? 0.0625 : 0.25);
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) nudge_b += (io.KeyAlt ? 0.0625 : 0.25);
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    nudge_v += (target == routing::AutomationTarget::Pan ? 0.05f : 0.02f);
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  nudge_v -= (target == routing::AutomationTarget::Pan ? 0.05f : 0.02f);
+
+            if (nudge_b != 0.0 || nudge_v != 0.0f) {
+                curve.move_points(state.selected_indices, nudge_b, nudge_v, min_val, max_val);
+                modified = true;
+            }
+        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !state.selected_indices.empty()) {
+            state.selected_indices = curve.duplicate_points(state.selected_indices, 1.0);
+            modified = true;
+        }
     }
 
     if (selected_point_out) {
-        *selected_point_out = s_active_pt;
+        *selected_point_out = state.selected_indices.empty() ? -1 : static_cast<int>(state.selected_indices.back());
+    }
+    if (selected_points_out) {
+        *selected_points_out = state.selected_indices;
     }
 
     // Re-fetch points after potential edits
@@ -869,7 +1160,7 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (points[i].value + points[i + 1].value);
         float tx = beat_to_x(mid_t);
         float ty = val_to_y(mid_v);
-        bool is_t_hov = (hovered_tension == static_cast<int>(i) || (s_is_dragging_tension && s_active_tension == static_cast<int>(i)));
+        bool is_t_hov = (hovered_tension == static_cast<int>(i) || (state.is_dragging_tension && state.active_tension_idx == static_cast<int>(i)));
         ImU32 col_t = is_t_hov ? ImColor(217, 119, 6, 255) : ImColor(217, 119, 6, 170);
 
         draw_list->AddCircleFilled(ImVec2(tx, ty), is_t_hov ? 5.0f : 3.5f, col_t);
@@ -880,32 +1171,79 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     for (size_t i = 0; i < points.size(); ++i) {
         float px = beat_to_x(points[i].time_beats);
         float py = val_to_y(points[i].value);
-        bool is_sel = (s_active_pt == static_cast<int>(i));
+        bool is_sel = (std::find(state.selected_indices.begin(), state.selected_indices.end(), i) != state.selected_indices.end());
         bool is_hov = (hovered_pt == static_cast<int>(i));
 
+        // Selected halo
+        if (is_sel) {
+            draw_list->AddCircle(ImVec2(px, py), 10.5f, ImColor(220, 38, 38, 170), 0, 1.5f);
+        }
+
         if (points[i].node_mode == routing::NodeMode::Smooth) {
-            // Smooth: Circle
             float r = (is_sel || is_hov) ? 6.5f : 4.5f;
             draw_list->AddCircleFilled(ImVec2(px, py), r, ImColor(255, 255, 255, 255));
             draw_list->AddCircle(ImVec2(px, py), r, is_sel ? ImColor(220, 38, 38, 255) : ImColor(31, 97, 217, 255), 0, 2.0f);
         } else if (points[i].node_mode == routing::NodeMode::Corner) {
-            // Corner: Diamond
             float d = (is_sel || is_hov) ? 7.0f : 5.0f;
             ImVec2 p_top(px, py - d), p_right(px + d, py), p_bot(px, py + d), p_left(px - d, py);
             draw_list->AddQuadFilled(p_top, p_right, p_bot, p_left, ImColor(255, 255, 255, 255));
             draw_list->AddQuad(p_top, p_right, p_bot, p_left, is_sel ? ImColor(220, 38, 38, 255) : ImColor(217, 119, 6, 255), 2.0f);
         } else {
-            // Hold: Step Box
             float s = (is_sel || is_hov) ? 6.0f : 4.0f;
             draw_list->AddRectFilled(ImVec2(px - s, py - s), ImVec2(px + s, py + s), ImColor(255, 255, 255, 255));
             draw_list->AddRect(ImVec2(px - s, py - s), ImVec2(px + s, py + s), is_sel ? ImColor(220, 38, 38, 255) : ImColor(20, 25, 35, 255), 0.0f, 0, 2.0f);
         }
     }
 
-    // 7. Ghost Node & Tooltip (Hover Preview)
-    if (is_hovered && hovered_pt < 0 && hovered_tension < 0 && !s_is_dragging_pt && !s_is_dragging_tension) {
-        double hb = x_to_beat(mouse.x);
-        if (!io.KeyShift) hb = std::round(hb * 4.0) / 4.0;
+    // 7. Marquee Selection Box
+    if (state.is_marquee_selecting) {
+        float mx1 = std::min(state.marquee_start.x, state.marquee_end.x);
+        float mx2 = std::max(state.marquee_start.x, state.marquee_end.x);
+        float my1 = std::min(state.marquee_start.y, state.marquee_end.y);
+        float my2 = std::max(state.marquee_start.y, state.marquee_end.y);
+        draw_list->AddRectFilled(ImVec2(mx1, my1), ImVec2(mx2, my2), ImColor(31, 97, 217, 35), 1.0f);
+        draw_list->AddRect(ImVec2(mx1, my1), ImVec2(mx2, my2), ImColor(31, 97, 217, 220), 1.0f, 0, 1.5f);
+    }
+
+    // 8. Transform Bounding Box & Scale Handles
+    if (has_multi_selection && !state.is_marquee_selecting) {
+        sel_min_t = 1e9; sel_max_t = -1e9;
+        sel_min_v = 1e9f; sel_max_v = -1e9f;
+        for (size_t s : state.selected_indices) {
+            if (s < points.size()) {
+                sel_min_t = std::min(sel_min_t, points[s].time_beats);
+                sel_max_t = std::max(sel_max_t, points[s].time_beats);
+                sel_min_v = std::min(sel_min_v, points[s].value);
+                sel_max_v = std::max(sel_max_v, points[s].value);
+            }
+        }
+        float bx1 = beat_to_x(sel_min_t) - 8.0f;
+        float bx2 = beat_to_x(sel_max_t) + 8.0f;
+        float by_t = val_to_y(sel_max_v) - 8.0f;
+        float by_b = val_to_y(sel_min_v) + 8.0f;
+
+        draw_list->AddRect(ImVec2(bx1, by_t), ImVec2(bx2, by_b), ImColor(31, 97, 217, 130), 2.0f, 0, 1.0f);
+
+        auto draw_handle = [&](ImVec2 h_pos, bool is_h_hov) {
+            float hr = is_h_hov ? 5.5f : 4.0f;
+            draw_list->AddRectFilled(ImVec2(h_pos.x - hr, h_pos.y - hr), ImVec2(h_pos.x + hr, h_pos.y + hr),
+                                     is_h_hov ? ImColor(220, 38, 38, 255) : ImColor(255, 255, 255, 255), 1.0f);
+            draw_list->AddRect(ImVec2(h_pos.x - hr, h_pos.y - hr), ImVec2(h_pos.x + hr, h_pos.y + hr),
+                               ImColor(31, 97, 217, 255), 1.0f, 0, 1.5f);
+        };
+        draw_handle(ImVec2(bx1, 0.5f * (by_t + by_b)), hovered_handle == CurveEditorState::TransformHandle::Left);
+        draw_handle(ImVec2(bx2, 0.5f * (by_t + by_b)), hovered_handle == CurveEditorState::TransformHandle::Right);
+        draw_handle(ImVec2(0.5f * (bx1 + bx2), by_t), hovered_handle == CurveEditorState::TransformHandle::Top);
+        draw_handle(ImVec2(0.5f * (bx1 + bx2), by_b), hovered_handle == CurveEditorState::TransformHandle::Bottom);
+
+        char bbox_hdr[64];
+        std::snprintf(bbox_hdr, sizeof(bbox_hdr), "%zu Nodes | Span: %.2f Beats", state.selected_indices.size(), sel_max_t - sel_min_t);
+        draw_list->AddText(ImVec2(bx1, by_t - 14.0f), ImColor(31, 97, 217, 220), bbox_hdr);
+    }
+
+    // 9. Ghost Node & Tooltip (Hover Preview)
+    if (is_mouse_on_curve && hovered_pt < 0 && hovered_tension < 0 && !state.is_dragging_nodes && !state.is_marquee_selecting) {
+        double hb = snap_beat(mouse_beat);
         float hv = snap ? snap->evaluate(hb) : 1.0f;
         float gx = beat_to_x(hb);
         float gy = val_to_y(hv);
@@ -929,7 +1267,7 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         draw_list->AddText(ImVec2(gx + 10.0f, gy - 16.0f), ImColor(31, 97, 217, 220), tip);
     }
 
-    // 8. Live Transport Playhead Needle
+    // 10. Live Transport Playhead Needle
     if (current_playhead_beat >= 0.0 && current_playhead_beat <= total_beats) {
         float hx = beat_to_x(current_playhead_beat);
         draw_list->AddLine(ImVec2(hx, y), ImVec2(hx, y + h), ImColor(20, 25, 35, 240), 1.5f);

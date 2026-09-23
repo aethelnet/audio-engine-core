@@ -8568,6 +8568,173 @@ void test_multi_parameter_automation_and_session_serialization() {
     }
 }
 
+void test_automation_selection_and_batch_editing() {
+    std::cout << "[TEST] Running FontLab Automation Selection & Batch Editing Test..." << std::endl;
+
+    using namespace audio_core::routing;
+
+    // 1. Move points with time & value translation and boundary clamping
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{1.0, 0.4f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0, 0.7f, NodeMode::Smooth, 0.2f},
+            AutomationPoint{3.0, 0.2f, NodeMode::Hold,   0.0f}
+        });
+
+        // Move points {0, 1} forward by 0.5 beats and +0.2 value
+        curve.move_points({0, 1}, 0.5, 0.2f, 0.0f, 1.0f);
+        auto pts = curve.get_points();
+        TEST_CHECK(pts.size() == 3);
+        TEST_CHECK(std::abs(pts[0].time_beats - 1.5) < 1e-4);
+        TEST_CHECK(std::abs(pts[0].value - 0.6f) < 1e-4f);
+        TEST_CHECK(std::abs(pts[1].time_beats - 2.5) < 1e-4);
+        TEST_CHECK(std::abs(pts[1].value - 0.9f) < 1e-4f);
+        // Point 2 should remain unaffected
+        TEST_CHECK(std::abs(pts[2].time_beats - 3.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[2].value - 0.2f) < 1e-4f);
+
+        // Test boundary clamping: move backward past 0 beats and past max value
+        curve.move_points({0}, -10.0, 5.0f, 0.0f, 1.25f);
+        pts = curve.get_points();
+        TEST_CHECK(pts[0].time_beats == 0.0);
+        TEST_CHECK(std::abs(pts[0].value - 1.25f) < 1e-4f);
+
+        std::cout << "  -> Multi-Node Translation & Boundary Clamping: PASSED" << std::endl;
+    }
+
+    // 2. Batch Node Mode Updates
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{2.0, 0.5f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{4.0, 1.0f, NodeMode::Smooth, 0.0f}
+        });
+
+        // Set points {0, 2} to Corner
+        curve.set_nodes_mode({0, 2}, NodeMode::Corner);
+        auto pts = curve.get_points();
+        TEST_CHECK(pts[0].node_mode == NodeMode::Corner);
+        TEST_CHECK(pts[1].node_mode == NodeMode::Smooth);
+        TEST_CHECK(pts[2].node_mode == NodeMode::Corner);
+
+        // Set all to Hold
+        curve.set_nodes_mode({0, 1, 2}, NodeMode::Hold);
+        pts = curve.get_points();
+        TEST_CHECK(pts[0].node_mode == NodeMode::Hold);
+        TEST_CHECK(pts[1].node_mode == NodeMode::Hold);
+        TEST_CHECK(pts[2].node_mode == NodeMode::Hold);
+
+        std::cout << "  -> Batch Node Mode Switching (Smooth/Corner/Hold): PASSED" << std::endl;
+    }
+
+    // 3. Time Stretch / Compression Scaling
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{2.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 0.5f, NodeMode::Corner, 0.0f},
+            AutomationPoint{6.0, 1.0f, NodeMode::Corner, 0.0f}
+        });
+
+        // Scale 2x around anchor 2.0
+        curve.scale_points_time({0, 1, 2}, 2.0, 2.0);
+        auto pts = curve.get_points();
+        TEST_CHECK(std::abs(pts[0].time_beats - 2.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[1].time_beats - 6.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[2].time_beats - 10.0) < 1e-4);
+
+        // Compress 0.5x around anchor 2.0
+        curve.scale_points_time({0, 1, 2}, 2.0, 0.5);
+        pts = curve.get_points();
+        TEST_CHECK(std::abs(pts[0].time_beats - 2.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[1].time_beats - 4.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[2].time_beats - 6.0) < 1e-4);
+
+        std::cout << "  -> Time-Stretch & Compression Proportional Transform: PASSED" << std::endl;
+    }
+
+    // 4. Value Scaling & Inversion
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{0.0, 0.2f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0, 0.8f, NodeMode::Corner, 0.0f}
+        });
+
+        // Invert points around center 0.5
+        curve.invert_points_value({0, 1}, 0.5f, 0.0f, 1.0f);
+        auto pts = curve.get_points();
+        // 0.5 + (0.2 - 0.5) * -1 = 0.8
+        // 0.5 + (0.8 - 0.5) * -1 = 0.2
+        TEST_CHECK(std::abs(pts[0].value - 0.8f) < 1e-4f);
+        TEST_CHECK(std::abs(pts[1].value - 0.2f) < 1e-4f);
+
+        // Scale value 2x around anchor 0.0
+        curve.scale_points_value({1}, 0.0f, 2.0f, 0.0f, 2.0f);
+        pts = curve.get_points();
+        TEST_CHECK(std::abs(pts[1].value - 0.4f) < 1e-4f);
+
+        std::cout << "  -> Value Scale & Inversion Transform: PASSED" << std::endl;
+    }
+
+    // 5. Cluster Duplication (Ctrl+D semantics)
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{1.0, 0.3f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0, 0.7f, NodeMode::Smooth, 0.1f}
+        });
+
+        auto new_indices = curve.duplicate_points({0, 1}, 4.0);
+        auto pts = curve.get_points();
+        TEST_CHECK(pts.size() == 4);
+        TEST_CHECK(new_indices.size() == 2);
+        // Original points at 1.0 and 2.0
+        TEST_CHECK(std::abs(pts[0].time_beats - 1.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[1].time_beats - 2.0) < 1e-4);
+        // Duplicated points shifted to 5.0 and 6.0
+        TEST_CHECK(std::abs(pts[2].time_beats - 5.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[2].value - 0.3f) < 1e-4f);
+        TEST_CHECK(std::abs(pts[3].time_beats - 6.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[3].value - 0.7f) < 1e-4f);
+
+        std::cout << "  -> Cluster Duplication & Re-indexing: PASSED" << std::endl;
+    }
+
+    // 6. Batch Point Removal & Invariant Guard
+    {
+        AutomationCurve curve;
+        curve.set_points({
+            AutomationPoint{0.0, 0.1f, NodeMode::Corner, 0.0f},
+            AutomationPoint{1.0, 0.2f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0, 0.3f, NodeMode::Corner, 0.0f},
+            AutomationPoint{3.0, 0.4f, NodeMode::Corner, 0.0f}
+        });
+
+        // Remove points at indices 1 and 3 (with duplicates/out-of-order)
+        bool removed = curve.remove_points({3, 1, 3});
+        TEST_CHECK(removed);
+        auto pts = curve.get_points();
+        TEST_CHECK(pts.size() == 2);
+        TEST_CHECK(std::abs(pts[0].time_beats - 0.0) < 1e-4);
+        TEST_CHECK(std::abs(pts[1].time_beats - 2.0) < 1e-4);
+
+        // Attempt to remove remaining 2 points -> Invariant guard keeps at least 1 point
+        curve.remove_points({0, 1});
+        pts = curve.get_points();
+        TEST_CHECK(pts.size() == 1);
+
+        // Attempting to remove last point fails and returns false
+        bool res = curve.remove_points({0});
+        TEST_CHECK(!res);
+        TEST_CHECK(curve.get_points().size() == 1);
+
+        std::cout << "  -> Batch Removal & Non-Empty Curve Invariant: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -8639,6 +8806,7 @@ int main() {
     test_waveform_overview_and_long_stem_mipmapping();
     test_automation_curve_and_gain_rendering();
     test_multi_parameter_automation_and_session_serialization();
+    test_automation_selection_and_batch_editing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

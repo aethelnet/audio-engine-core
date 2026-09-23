@@ -327,6 +327,123 @@ public:
         set_points(std::move(current_pts));
     }
 
+    // Remove multiple points in batch (keeps at least 1 point in curve)
+    bool remove_points(std::vector<size_t> indices) {
+        auto current_pts = get_points();
+        if (current_pts.size() <= 1 || indices.empty()) return false;
+
+        std::sort(indices.rbegin(), indices.rend());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+
+        for (size_t idx : indices) {
+            if (idx < current_pts.size() && current_pts.size() > 1) {
+                current_pts.erase(current_pts.begin() + idx);
+            }
+        }
+        set_points(std::move(current_pts));
+        return true;
+    }
+
+    // Set node mode for multiple selected points
+    void set_nodes_mode(const std::vector<size_t>& indices, NodeMode mode) {
+        auto current_pts = get_points();
+        bool changed = false;
+        for (size_t idx : indices) {
+            if (idx < current_pts.size()) {
+                current_pts[idx].node_mode = mode;
+                changed = true;
+            }
+        }
+        if (changed) set_points(std::move(current_pts));
+    }
+
+    // Move a selection of points by (delta_beats, delta_val)
+    void move_points(const std::vector<size_t>& indices, double delta_beats, float delta_val,
+                     float min_val = -10.0f, float max_val = 10.0f) {
+        auto current_pts = get_points();
+        bool changed = false;
+        for (size_t idx : indices) {
+            if (idx < current_pts.size()) {
+                current_pts[idx].time_beats = std::max(0.0, current_pts[idx].time_beats + delta_beats);
+                float nv = current_pts[idx].value + delta_val;
+                if (!std::isnan(nv) && !std::isinf(nv)) {
+                    current_pts[idx].value = std::clamp(nv, min_val, max_val);
+                }
+                changed = true;
+            }
+        }
+        if (changed) set_points(std::move(current_pts));
+    }
+
+    // Scale time of selected points relative to an anchor beat
+    void scale_points_time(const std::vector<size_t>& indices, double anchor_beat, double scale_factor) {
+        if (scale_factor <= 1e-5) return;
+        auto current_pts = get_points();
+        bool changed = false;
+        for (size_t idx : indices) {
+            if (idx < current_pts.size()) {
+                double rel = current_pts[idx].time_beats - anchor_beat;
+                current_pts[idx].time_beats = std::max(0.0, anchor_beat + rel * scale_factor);
+                changed = true;
+            }
+        }
+        if (changed) set_points(std::move(current_pts));
+    }
+
+    // Scale value of selected points relative to an anchor value
+    void scale_points_value(const std::vector<size_t>& indices, float anchor_val, float scale_factor,
+                            float min_val = -10.0f, float max_val = 10.0f) {
+        auto current_pts = get_points();
+        bool changed = false;
+        for (size_t idx : indices) {
+            if (idx < current_pts.size()) {
+                float rel = current_pts[idx].value - anchor_val;
+                float nv = anchor_val + rel * scale_factor;
+                if (!std::isnan(nv) && !std::isinf(nv)) {
+                    current_pts[idx].value = std::clamp(nv, min_val, max_val);
+                }
+                changed = true;
+            }
+        }
+        if (changed) set_points(std::move(current_pts));
+    }
+
+    // Invert values of selected points around a center axis
+    void invert_points_value(const std::vector<size_t>& indices, float center_val,
+                             float min_val = -10.0f, float max_val = 10.0f) {
+        scale_points_value(indices, center_val, -1.0f, min_val, max_val);
+    }
+
+    // Duplicate selected points with a time shift, returns new indices
+    std::vector<size_t> duplicate_points(const std::vector<size_t>& indices, double shift_beats) {
+        auto current_pts = get_points();
+        std::vector<AutomationPoint> new_pts;
+        for (size_t idx : indices) {
+            if (idx < current_pts.size()) {
+                auto pt = current_pts[idx];
+                pt.time_beats = std::max(0.0, pt.time_beats + shift_beats);
+                new_pts.push_back(pt);
+            }
+        }
+        for (auto& np : new_pts) {
+            current_pts.push_back(np);
+        }
+        set_points(std::move(current_pts));
+
+        auto final_pts = get_points();
+        std::vector<size_t> res_indices;
+        for (const auto& np : new_pts) {
+            for (size_t i = 0; i < final_pts.size(); ++i) {
+                if (std::abs(final_pts[i].time_beats - np.time_beats) < 1e-4 &&
+                    std::abs(final_pts[i].value - np.value) < 1e-4f) {
+                    res_indices.push_back(i);
+                    break;
+                }
+            }
+        }
+        return res_indices;
+    }
+
     // ========================================================================
     // Quick Musical Presets
     // ========================================================================
