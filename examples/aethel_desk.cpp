@@ -17,6 +17,7 @@
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/engine.hpp"
+#include "audio_core/midi/hardware_midi_receiver.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -523,6 +524,14 @@ int main(int argc, char** argv) {
     // Route 3: LFO 2 -> LFO 1 Rate (FM between modulators)
     mod_matrix.set_route(3, modulation::ModulationSource::LFO2, modulation::ModulationDestination::LFO1_Rate, 0.35f, true);
 
+    // Hardware MIDI Ingestion & Auto-Routing Setup
+    midi::HardwareMidiReceiver midi_rx;
+    midi_rx.auto_connect();
+
+    // Auto-route Track 1 ("Acid 303 Lead" / Poly Synth) to PolyphonicSynth + ModulationMatrix
+    trk1->set_name("Poly Synth / Lead");
+    mixer.assign_track_poly_synth(trk1->id(), &mod_matrix.poly_synth(), &mod_matrix);
+
     int selected_modulator = 0; // 0=MSEG1 (Hi-Hat), 1=MSEG2 (Lead), 2=LFO1, 3=LFO2
     int selected_mseg_node = 0;
     float mod_preview_vel = 0.9f;
@@ -649,6 +658,9 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+        // Drain incoming Hardware MIDI events into ModulationMatrix & PolyphonicSynth
+        midi_rx.drain_to(mod_matrix);
 
         // Advance Modulator Matrix & Polyphonic Voice Pool at audio clock rate for real-time visual feedback
         uint32_t mod_sim_frames = std::clamp(static_cast<uint32_t>(dt * 48000.0f), 1u, 1024u);
@@ -4276,6 +4288,45 @@ int main(int argc, char** argv) {
                                        "Orderly Architect: Multi-Stage Envelope (MSEG) & Meta-Modulation Engine");
                     ImGui::SameLine();
                     ImGui::TextDisabled("| Bitwig Dragless Modulation Rings • Buchla/Maths Function Generator • Zero-Allocation RCU");
+                    ImGui::Separator();
+
+                    // Hardware MIDI & Automatic Poly Track Routing Status Banner
+                    {
+                        bool is_conn = midi_rx.is_connected();
+                        bool is_mock = midi_rx.is_mock();
+                        bool has_act = midi_rx.has_activity_and_clear();
+                        static float midi_activity_timer = 0.0f;
+                        if (has_act) midi_activity_timer = 0.30f;
+                        if (midi_activity_timer > 0.0f) midi_activity_timer -= dt;
+
+                        ImVec4 port_col = is_conn ? (is_mock ? ImVec4(0.90f, 0.75f, 0.20f, 1.0f) : ImVec4(0.20f, 0.90f, 0.40f, 1.0f))
+                                                  : ImVec4(0.80f, 0.25f, 0.25f, 1.0f);
+                        ImGui::TextColored(port_col, is_conn ? (is_mock ? "[ ● VIRTUAL/MOCK MIDI ]" : "[ ● ALSA USB MIDI ]") : "[ ○ NO MIDI PORT ]");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("Interface: %s", midi_rx.current_device_path().c_str());
+
+                        ImGui::SameLine();
+                        ImVec4 led_col = (midi_activity_timer > 0.0f) ? ImVec4(0.20f, 1.0f, 0.40f, 1.0f) : ImVec4(0.30f, 0.30f, 0.30f, 1.0f);
+                        ImGui::TextColored(led_col, " [RX LED]");
+
+                        ImGui::SameLine();
+                        uint8_t st = midi_rx.last_status();
+                        uint8_t d1 = midi_rx.last_note();
+                        uint8_t d2 = midi_rx.last_velocity();
+                        if (st != 0) {
+                            ImGui::TextDisabled("| Last Event: 0x%02X (d1:%u, d2:%u)", st, d1, d2);
+                        } else {
+                            ImGui::TextDisabled("| Last Event: Idle");
+                        }
+
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(0.25f, 0.70f, 1.0f, 1.0f), "➔ Auto-Routed: Track 2 (\"Poly Synth / Lead\") -> Bus B (Music)");
+
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" ⟳ Re-probe MIDI ")) {
+                            midi_rx.auto_connect();
+                        }
+                    }
                     ImGui::Separator();
 
                     // Header Status & Trigger Bar: Polyphonic Chords & Voice Audition

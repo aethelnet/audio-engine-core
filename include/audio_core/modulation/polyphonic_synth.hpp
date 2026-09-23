@@ -142,6 +142,9 @@ public:
 
     void reset() noexcept {
         m_timestamp_counter = 0;
+        m_sustain_pedal_held = false;
+        m_pitch_bend_norm = 0.0f;
+        m_pitch_bend_semitones = 0.0f;
         for (auto& v : m_voices) {
             v.reset();
         }
@@ -246,15 +249,79 @@ public:
         if (m_play_mode == PolyphonyPlayMode::Unison4x) {
             for (size_t u = 0; u < 4; ++u) {
                 if (m_voices[u].note == midi_note) {
-                    m_voices[u].release();
+                    if (m_sustain_pedal_held) {
+                        m_voices[u].gate_held = false;
+                    } else {
+                        m_voices[u].release();
+                    }
                 }
             }
             return;
         }
         for (size_t i = 0; i < m_polyphony_limit; ++i) {
             if (m_voices[i].active && m_voices[i].note == midi_note && m_voices[i].gate_held) {
-                m_voices[i].release();
+                if (m_sustain_pedal_held) {
+                    m_voices[i].gate_held = false;
+                } else {
+                    m_voices[i].release();
+                }
             }
+        }
+    }
+
+    void set_sustain_pedal(bool held) noexcept {
+        m_sustain_pedal_held = held;
+        if (!held) {
+            // Release any voices whose keys are no longer physically held
+            for (size_t i = 0; i < kMaxVoices; ++i) {
+                if (m_voices[i].active && !m_voices[i].gate_held) {
+                    m_voices[i].release();
+                }
+            }
+        }
+    }
+    [[nodiscard]] bool is_sustain_pedal_held() const noexcept { return m_sustain_pedal_held; }
+
+    void set_pitch_bend_norm(float norm) noexcept {
+        m_pitch_bend_norm = std::clamp(norm, -1.0f, 1.0f);
+        m_pitch_bend_semitones = m_pitch_bend_norm * m_pitch_bend_range_semitones;
+    }
+    [[nodiscard]] float pitch_bend_norm() const noexcept { return m_pitch_bend_norm; }
+    [[nodiscard]] float pitch_bend_semitones() const noexcept { return m_pitch_bend_semitones; }
+
+    void set_pitch_bend_range(float semitones) noexcept {
+        m_pitch_bend_range_semitones = std::clamp(semitones, 0.0f, 24.0f);
+        m_pitch_bend_semitones = m_pitch_bend_norm * m_pitch_bend_range_semitones;
+    }
+    [[nodiscard]] float pitch_bend_range() const noexcept { return m_pitch_bend_range_semitones; }
+
+    void handle_midi_event(const MidiEvent& ev) noexcept {
+        switch (ev.type()) {
+            case MidiStatus::NoteOn:
+                if (ev.velocity() > 0) {
+                    note_on(ev.note(), static_cast<float>(ev.velocity()) / 127.0f);
+                } else {
+                    note_off(ev.note());
+                }
+                break;
+            case MidiStatus::NoteOff:
+                note_off(ev.note());
+                break;
+            case MidiStatus::ControlChange:
+                if (ev.data1 == 64) {
+                    set_sustain_pedal(ev.data2 >= 64);
+                } else if (ev.data1 == 120 || ev.data1 == 123) {
+                    all_notes_off();
+                }
+                break;
+            case MidiStatus::PitchBend: {
+                int pb = (static_cast<int>(ev.data2) << 7) | static_cast<int>(ev.data1);
+                float norm_pb = (static_cast<float>(pb) - 8192.0f) / 8192.0f;
+                set_pitch_bend_norm(norm_pb);
+                break;
+            }
+            default:
+                break;
         }
     }
 
@@ -405,8 +472,8 @@ public:
                 v.current_freq = v.target_freq;
             }
 
-            // 2. Frequency with pitch modulation
-            float freq_mod = std::pow(2.0f, mod_pitch / 12.0f);
+            // 2. Frequency with pitch modulation and pitch bend
+            float freq_mod = std::pow(2.0f, (mod_pitch + m_pitch_bend_semitones) / 12.0f);
             if (m_play_mode == PolyphonyPlayMode::Unison4x) {
                 constexpr float unison_detunes[4] = { -10.0f, -3.0f, +3.0f, +10.0f };
                 freq_mod *= std::pow(2.0f, unison_detunes[i] / 1200.0f);
@@ -515,6 +582,11 @@ private:
     float m_voice_pan_spread{0.6f};
     float m_glide_time_ms{0.0f};
     float m_master_level{1.0f};
+
+    bool m_sustain_pedal_held{false};
+    float m_pitch_bend_norm{0.0f};
+    float m_pitch_bend_semitones{0.0f};
+    float m_pitch_bend_range_semitones{2.0f};
 };
 
 } // namespace audio_core::modulation

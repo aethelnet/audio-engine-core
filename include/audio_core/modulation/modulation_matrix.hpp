@@ -196,6 +196,16 @@ public:
         m_mod_wheel = std::clamp(mod_wheel, 0.0f, 1.0f);
         m_pitch_bend = std::clamp(pitch_bend, -1.0f, 1.0f);
     }
+    [[nodiscard]] float velocity() const noexcept { return m_velocity; }
+    [[nodiscard]] float key_track() const noexcept { return m_key_track; }
+    [[nodiscard]] float mod_wheel() const noexcept { return m_mod_wheel; }
+    [[nodiscard]] float pitch_bend() const noexcept { return m_pitch_bend; }
+
+    void evaluate_block(uint32_t frames, double bpm = 120.0) noexcept {
+        for (uint32_t s = 0; s < frames; ++s) {
+            evaluate_sample(bpm);
+        }
+    }
 
     // Trigger voice envelopes on note on / slice trigger
     void note_on(float velocity = 1.0f, float key_norm = 0.5f) noexcept {

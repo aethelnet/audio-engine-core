@@ -18,6 +18,8 @@
 #include "audio_core/dsp/kinetic_meter.hpp"
 #include "audio_core/routing/universal_routing_matrix.hpp"
 #include "audio_core/routing/automation_curve.hpp"
+#include "audio_core/modulation/polyphonic_synth.hpp"
+#include "audio_core/modulation/modulation_matrix.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -46,7 +48,8 @@ enum class TrackInputMode : uint8_t {
     InternalClip = 0,    // Pure internal clip / sequencer playback
     PipeWireStream = 1,  // External PipeWire audio input replaces clip
     MergeAll = 2,        // Sum internal clip + external PipeWire stream
-    NetworkAoip = 3      // Stream from AoIP / Dante network channel
+    NetworkAoip = 3,     // Stream from AoIP / Dante network channel
+    PolySynth = 4        // Live Polyphonic MSEG Synthesizer generator
 };
 
 // ============================================================================
@@ -112,6 +115,8 @@ public:
         m_pdc_write_pos = 0;
         m_pdc_delay_samples.store(0, std::memory_order_relaxed);
         m_has_previous_gain = false;
+        m_poly_synth = nullptr;
+        m_mod_matrix = nullptr;
         m_gain_automation_enabled.store(false, std::memory_order_relaxed);
         m_pan_automation_enabled.store(false, std::memory_order_relaxed);
         m_aux1_automation_enabled.store(false, std::memory_order_relaxed);
@@ -121,6 +126,8 @@ public:
 
     void deactivate() noexcept {
         m_active.store(false, std::memory_order_release);
+        m_poly_synth = nullptr;
+        m_mod_matrix = nullptr;
         m_gain_automation_enabled.store(false, std::memory_order_relaxed);
         m_pan_automation_enabled.store(false, std::memory_order_relaxed);
         m_aux1_automation_enabled.store(false, std::memory_order_relaxed);
@@ -537,6 +544,13 @@ public:
     void set_input_mode(TrackInputMode mode) noexcept { m_input_mode.store(mode, std::memory_order_relaxed); }
     [[nodiscard]] TrackInputMode input_mode() const noexcept { return m_input_mode.load(std::memory_order_relaxed); }
 
+    void set_poly_synth(modulation::PolyphonicSynth* synth, modulation::ModulationMatrix* matrix = nullptr) noexcept {
+        m_poly_synth = synth;
+        m_mod_matrix = matrix;
+    }
+    [[nodiscard]] modulation::PolyphonicSynth* poly_synth() const noexcept { return m_poly_synth; }
+    [[nodiscard]] modulation::ModulationMatrix* modulation_matrix() const noexcept { return m_mod_matrix; }
+
     // Called inside RT render loop before channel strip processing
     void render_input(uint32_t frames, const clock::TimelineClock& clock,
                       const clock::BlockBoundaryEvents& boundary_events) noexcept {
@@ -549,12 +563,40 @@ public:
             return;
         }
 
+        if (mode == TrackInputMode::PolySynth) {
+            if (m_poly_synth) {
+                if (m_mod_matrix) {
+                    m_mod_matrix->evaluate_block(frames, clock.bpm());
+                }
+                const float mod_c = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthCutoff) : 0.0f;
+                const float mod_p = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthPitch) : 0.0f;
+                const float mod_a = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthAmp) : 0.0f;
+                m_poly_synth->process_block(left, right, frames, clock.bpm(), mod_c, mod_p, mod_a);
+            } else {
+                std::memset(left, 0, frames * sizeof(Sample));
+                std::memset(right, 0, frames * sizeof(Sample));
+            }
+            return;
+        }
+
         if (mode == TrackInputMode::MergeAll) {
-            // Additive summing: render internal clip/launcher/sequencer and sum into existing external audio
+            // Additive summing: render internal clip/launcher/sequencer/poly_synth and sum into existing external audio
             Sample tmp_l[2048];
             Sample tmp_r[2048];
             const uint32_t f_proc = std::min(frames, 2048u);
-            if (m_launcher.is_active()) {
+            if (m_poly_synth) {
+                if (m_mod_matrix) {
+                    m_mod_matrix->evaluate_block(f_proc, clock.bpm());
+                }
+                const float mod_c = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthCutoff) : 0.0f;
+                const float mod_p = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthPitch) : 0.0f;
+                const float mod_a = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthAmp) : 0.0f;
+                m_poly_synth->process_block(tmp_l, tmp_r, f_proc, clock.bpm(), mod_c, mod_p, mod_a);
+                for (uint32_t f = 0; f < f_proc; ++f) {
+                    left[f] += tmp_l[f];
+                    right[f] += tmp_r[f];
+                }
+            } else if (m_launcher.is_active()) {
                 m_launcher.render(tmp_l, tmp_r, f_proc, clock, boundary_events);
                 m_clip_playhead.store(m_launcher.playhead(), std::memory_order_relaxed);
                 for (uint32_t f = 0; f < f_proc; ++f) {
@@ -604,6 +646,18 @@ public:
     }
 
     void render_input(uint32_t frames) noexcept {
+        if (m_input_mode.load(std::memory_order_relaxed) == TrackInputMode::PolySynth && m_poly_synth) {
+            Sample* left = m_buffer.view().channel(0);
+            Sample* right = m_buffer.view().channel(1);
+            if (m_mod_matrix) {
+                m_mod_matrix->evaluate_block(frames, 120.0);
+            }
+            const float mod_c = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthCutoff) : 0.0f;
+            const float mod_p = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthPitch) : 0.0f;
+            const float mod_a = m_mod_matrix ? m_mod_matrix->get_destination_value(modulation::ModulationDestination::SynthAmp) : 0.0f;
+            m_poly_synth->process_block(left, right, frames, 120.0, mod_c, mod_p, mod_a);
+            return;
+        }
         if (m_clip) {
             Sample* left = m_buffer.view().channel(0);
             Sample* right = m_buffer.view().channel(1);
@@ -793,6 +847,8 @@ private:
     std::atomic<bool> m_input_phase_invert{false};
     std::atomic<float> m_input_meter_peak_l{0.0f};
     std::atomic<float> m_input_meter_peak_r{0.0f};
+    modulation::PolyphonicSynth* m_poly_synth{nullptr};
+    modulation::ModulationMatrix* m_mod_matrix{nullptr};
     sampling::VariSpeedStreamer m_streamer;
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
@@ -1428,6 +1484,14 @@ public:
             return t->is_active() ? t : nullptr;
         }
         return nullptr;
+    }
+
+    bool assign_track_poly_synth(uint32_t track_id, modulation::PolyphonicSynth* synth, modulation::ModulationMatrix* matrix = nullptr) noexcept {
+        Track* trk = get_track(track_id);
+        if (!trk) return false;
+        trk->set_poly_synth(synth, matrix);
+        trk->set_input_mode(TrackInputMode::PolySynth);
+        return true;
     }
 
     [[nodiscard]] Track* track_by_index(size_t idx) noexcept {

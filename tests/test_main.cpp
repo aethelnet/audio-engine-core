@@ -54,6 +54,7 @@
 #include "audio_core/modulation/multi_stage_envelope.hpp"
 #include "audio_core/modulation/modulation_lfo.hpp"
 #include "audio_core/modulation/modulation_matrix.hpp"
+#include "audio_core/midi/hardware_midi_receiver.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -9667,6 +9668,168 @@ void test_polyphonic_mseg_synth_and_voice_allocator() {
     }
 }
 
+void test_hardware_midi_and_automatic_track_routing() {
+    std::cout << "[TEST 72] Running Hardware MIDI Ingestion & Automatic PolySynth Track Routing..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+    using namespace audio_core::midi;
+    using namespace audio_core::modulation;
+
+    // 1. Hardware ALSA RawMIDI Device Enumeration & Safe Fallback
+    {
+        auto devices = HardwareMidiReceiver::enumerate_devices();
+        std::cout << "  -> Hardware RawMIDI probe found " << devices.size() << " device(s) on host." << std::endl;
+        for (const auto& dev : devices) {
+            std::cout << "     * [" << dev.path << "] " << dev.name << " (" << dev.card_id << ")" << std::endl;
+        }
+
+        HardwareMidiReceiver rx;
+        bool connected = rx.auto_connect();
+        TEST_CHECK(connected);
+        TEST_CHECK(rx.is_connected());
+        TEST_CHECK(!rx.current_device_path().empty());
+        std::cout << "  -> Active MIDI port: " << rx.current_device_path() 
+                  << (rx.is_mock() ? " [Mock/Virtual Headless]" : " [ALSA Hardware]") << std::endl;
+    }
+
+    // 2. Real-Time Byte Parser: Running Status, Active Sensing / Clock Interleaving, Velocity 0 Normalization
+    {
+        HardwareMidiReceiver rx;
+        TEST_CHECK(rx.auto_connect());
+
+        ModulationMatrix matrix;
+        matrix.init(48000);
+        matrix.poly_synth().init(48000);
+        matrix.poly_synth().set_polyphony_limit(8);
+
+        // Byte sequence:
+        // [0..2] Note On ch0, note 60 (C4), vel 100
+        // [3..4] Running Status Note On: note 64 (E4), vel 85 (no status byte!)
+        // [5..8] Realtime 0xF8 clock byte interleaved between note 67 (G4) and vel 90
+        // [9..11] CC 64 (Sustain Pedal = 127)
+        // [12..14] Note On ch0, note 60 with velocity 0 (must normalize to Note Off)
+        // [15..16] Running status Note Off for note 64 (vel 0)
+        // [17..19] Pitch Bend: LSB=0x00, MSB=0x60 -> 12288 -> +0.5 normalised
+        const uint8_t raw_midi_stream[] = {
+            0x90, 60, 100,
+            64, 85,
+            0x90, 67, 0xF8, 90,
+            0xB0, 64, 127,
+            0x90, 60, 0,
+            64, 0,
+            0xE0, 0x00, 0x60
+        };
+
+        rx.inject_raw_bytes(raw_midi_stream, sizeof(raw_midi_stream));
+        TEST_CHECK(rx.event_count() >= 6);
+        TEST_CHECK(rx.has_activity_and_clear());
+
+        size_t drained = rx.drain_to(matrix);
+        TEST_CHECK(drained >= 6);
+
+        // Pitch bend verified
+        TEST_CHECK(std::abs(matrix.pitch_bend() - 0.5f) < 0.01f);
+        TEST_CHECK(std::abs(matrix.poly_synth().pitch_bend_norm() - 0.5f) < 0.01f);
+
+        // Sustain pedal verified (CC 64 >= 64 holds voices even after note-off)
+        TEST_CHECK(matrix.poly_synth().is_sustain_pedal_held());
+        TEST_CHECK(matrix.poly_synth().active_voice_count() >= 1);
+
+        // Release sustain pedal: 0xB0 64 0
+        const uint8_t pedal_up[] = { 0xB0, 64, 0 };
+        rx.inject_raw_bytes(pedal_up, sizeof(pedal_up));
+        rx.drain_to(matrix);
+        TEST_CHECK(!matrix.poly_synth().is_sustain_pedal_held());
+
+        // Process a block to let released voices decay
+        std::vector<Sample> tmp_l(1024, 0.0f);
+        std::vector<Sample> tmp_r(1024, 0.0f);
+        for (int i = 0; i < 50; ++i) {
+            matrix.process_synth_block(tmp_l.data(), tmp_r.data(), 1024, 120.0);
+        }
+
+        std::cout << "  -> Hardware RawMIDI byte stream & running status parser: PASSED" << std::endl;
+    }
+
+    // 3. Automatic Track Routing Setup & Channel Strip Insert Audio Verification
+    {
+        HardwareMidiReceiver rx;
+        TEST_CHECK(rx.auto_connect());
+
+        ModulationMatrix matrix;
+        matrix.init(48000);
+        matrix.poly_synth().init(48000);
+        matrix.poly_synth().set_polyphony_limit(8);
+
+        MixerGraph mixer(256, false, 48000);
+        mixer.clock().set_bpm(120.0);
+        mixer.clock().set_playing(true);
+
+        auto* trk = mixer.add_track("Poly Lead");
+        TEST_CHECK(trk != nullptr);
+
+        // Automatic Track Routing Assignment
+        bool assigned = mixer.assign_track_poly_synth(trk->id(), &matrix.poly_synth(), &matrix);
+        TEST_CHECK(assigned);
+        TEST_CHECK(trk->input_mode() == TrackInputMode::PolySynth);
+        TEST_CHECK(trk->poly_synth() == &matrix.poly_synth());
+        TEST_CHECK(trk->modulation_matrix() == &matrix);
+
+        // Insert Slot: PurestDrive saturation on the PolySynth channel strip
+        auto drive = std::make_shared<dsp::PurestDrive>();
+        drive->init(48000);
+        drive->set_parameter(0, 0.45f);
+        trk->slot(0).set_processor(drive);
+
+        // Submix Bus routing
+        auto* bus_music = mixer.allocate_submix_bus("Bus: Music");
+        TEST_CHECK(bus_music != nullptr);
+        trk->set_target_bus(bus_music->id());
+
+        // Trigger polyphonic triad chord via raw MIDI: C4 (60), E4 (64), G4 (67)
+        const uint8_t chord_bytes[] = {
+            0x90, 60, 100,
+            64, 95,
+            67, 90
+        };
+        rx.inject_raw_bytes(chord_bytes, sizeof(chord_bytes));
+        size_t count = rx.drain_to(matrix);
+        TEST_CHECK(count == 3);
+        TEST_CHECK(matrix.poly_synth().active_voice_count() == 3);
+
+        // Render audio through mixer graph
+        AudioBuffer master_out(2, 256);
+        auto master_view = master_out.view();
+        float max_rms = 0.0f;
+        for (int b = 0; b < 20; ++b) {
+            mixer.render(master_view);
+            const Sample* out_l = master_view.channel(0);
+            const Sample* out_r = master_view.channel(1);
+            float sum_sq = 0.0f;
+            for (uint32_t i = 0; i < 256; ++i) {
+                TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+                TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+                sum_sq += out_l[i] * out_l[i] + out_r[i] * out_r[i];
+            }
+            float b_rms = std::sqrt(sum_sq / 512.0f);
+            max_rms = std::max(max_rms, b_rms);
+        }
+        TEST_CHECK(max_rms > 0.01f);
+
+        // All notes off message (CC 123)
+        const uint8_t all_off[] = { 0xB0, 123, 0 };
+        rx.inject_raw_bytes(all_off, sizeof(all_off));
+        rx.drain_to(matrix);
+
+        rx.close_device();
+        TEST_CHECK(!rx.is_connected());
+
+        std::cout << "  -> Automatic Track Routing (PolySynth -> PurestDrive -> Bus -> Master): PASSED (Max RMS=" 
+                  << max_rms << ")" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -9743,6 +9906,7 @@ int main() {
     test_insert_slot_automation_and_multilane_stacking();
     test_multi_stage_envelope_and_meta_modulation_matrix();
     test_polyphonic_mseg_synth_and_voice_allocator();
+    test_hardware_midi_and_automatic_track_routing();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
