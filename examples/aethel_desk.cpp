@@ -15,6 +15,8 @@
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
+#include "audio_core/serialization/session_serializer.hpp"
+#include "audio_core/engine.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -503,13 +505,82 @@ int main(int argc, char** argv) {
     uint32_t selected_patch_id = 1;
 
     protocol::MixerTelemetryFrame telemetry{};
-    auto last_time = std::chrono::high_resolution_clock::now();
+    auto last_time = std::chrono::steady_clock::now();
+
+    // Session Persistence & Offline Bounce State
+    char session_file_path[256] = "session.json";
+    char rack_preset_file_path[256] = "rack_preset.json";
+    char bounce_wav_path[256] = "export_master.wav";
+    int bounce_bars = 4;
+    int bounce_bit_depth_idx = 1; // 0=16-bit, 1=24-bit, 2=32-bit Float
+    bool bounce_normalize = true;
+    float bounce_peak_target = -0.1f;
+    std::string session_status_msg = "";
+    auto session_status_time = std::chrono::steady_clock::now();
+
+    bool open_save_session_modal = false;
+    bool open_load_session_modal = false;
+    bool open_bounce_modal = false;
+    bool open_save_rack_modal = false;
+    bool open_load_rack_modal = false;
+
+    auto sync_ui_from_mixer = [&]() {
+        for (int i = 0; i < 4; ++i) {
+            auto* t = mixer.get_track(i + 1);
+            if (t) {
+                track_gains[i] = t->gain();
+                track_pans[i] = t->pan();
+                track_mutes[i] = t->is_muted();
+                track_solos[i] = t->is_solo();
+                track_solo_safes[i] = t->is_solo_safe();
+                track_consoles[i] = static_cast<int>(t->console_type());
+                track_target_buses[i] = (t->target_bus() <= 0) ? 0 : t->target_bus();
+            }
+        }
+        master_gain = mixer.master_volume();
+        bpm = static_cast<float>(mixer.clock().bpm());
+        for (int b = 0; b < 2; ++b) {
+            auto* bus = mixer.get_bus(b + 1);
+            if (bus) {
+                bus_gains[b] = bus->gain();
+                bus_mutes[b] = bus->is_muted();
+                bus_solos[b] = bus->is_solo();
+                bus_consoles[b] = static_cast<int>(bus->console_type());
+            }
+        }
+    };
+
+    auto do_offline_bounce = [&]() {
+        Engine bounce_engine(kSampleRate, kBlockFrames);
+        auto sess_data = serialization::SessionSerializer::extract_session(mixer, mixer.clock(), "Export Session");
+        serialization::SessionSerializer::apply_session(bounce_engine.mixer(), bounce_engine.clock(), sess_data);
+
+        BounceOptions b_opts{};
+        b_opts.start_frame = 0;
+        b_opts.total_frames = static_cast<uint64_t>(bounce_engine.clock().samples_per_bar() * bounce_bars);
+        b_opts.tail_frames = static_cast<uint32_t>(kSampleRate * 1); // 1.0s decay tail
+        b_opts.bits_per_sample = (bounce_bit_depth_idx == 0) ? 16 : ((bounce_bit_depth_idx == 1) ? 24 : 32);
+        b_opts.apply_pdc_flush = true;
+        b_opts.normalize = bounce_normalize;
+        b_opts.target_peak_db = bounce_peak_target;
+
+        auto b_res = bounce_engine.render_offline_wav(bounce_wav_path, b_opts);
+        if (b_res.success) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Exported %.1fs in %.3fs (%.1fx RT) -> %s",
+                          b_res.duration_seconds, b_res.render_time_seconds, b_res.realtime_factor, bounce_wav_path);
+            session_status_msg = buf;
+        } else {
+            session_status_msg = "Bounce error: " + b_res.error_message;
+        }
+        session_status_time = std::chrono::steady_clock::now();
+    };
 
     // 4. Main Window Render Loop
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        auto now = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - last_time).count();
         last_time = now;
 
@@ -628,6 +699,56 @@ int main(int argc, char** argv) {
             ImGui::SetNextItemWidth(100);
             if (ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f")) {
                 mixer.clock().set_bpm(bpm);
+            }
+
+            // Keyboard Shortcuts: Ctrl+S (Save), Ctrl+O (Load)
+            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+                if (serialization::SessionSerializer::save_session_file(session_file_path, mixer, mixer.clock(), "Aethel Project")) {
+                    session_status_msg = "Saved: " + std::string(session_file_path);
+                } else {
+                    session_status_msg = "Error saving session!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+            }
+            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
+                if (serialization::SessionSerializer::load_session_file(session_file_path, mixer, mixer.clock())) {
+                    sync_ui_from_mixer();
+                    session_status_msg = "Loaded: " + std::string(session_file_path);
+                } else {
+                    session_status_msg = "Error loading session!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+            }
+
+            ImGui::SameLine(0, 10);
+            if (ImGui::Button("[ SESSION ]", ImVec2(85, 32))) {
+                ImGui::OpenPopup("SessionMenuPopup");
+            }
+            if (ImGui::BeginPopup("SessionMenuPopup")) {
+                if (ImGui::MenuItem("Save Session...", "Ctrl+S")) {
+                    open_save_session_modal = true;
+                }
+                if (ImGui::MenuItem("Load Session...", "Ctrl+O")) {
+                    open_load_session_modal = true;
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Export Master WAV (Offline Bounce)...")) {
+                    open_bounce_modal = true;
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::SameLine(0, 5);
+            if (ImGui::Button("[ BOUNCE ]", ImVec2(80, 32))) {
+                open_bounce_modal = true;
+            }
+
+            if (!session_status_msg.empty()) {
+                float time_alive = std::chrono::duration<float>(now - session_status_time).count();
+                if (time_alive < 5.0f) {
+                    ImGui::SameLine(0, 8);
+                    ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.35f, 1.0f), "[%s]", session_status_msg.c_str());
+                }
             }
 
             ImGui::SameLine(0, 15);
@@ -2518,9 +2639,20 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "DSP RACK: TRACK %d", selected_track + 1);
                         ImGui::SameLine();
                         ImGui::TextDisabled("(%s)", cur_trk_name);
-                        ImGui::Separator();
 
                         auto* sel_trk = (selected_track == 0) ? trk0 : ((selected_track == 1) ? trk1 : ((selected_track == 2) ? trk2 : trk3));
+
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 90);
+                        if (ImGui::SmallButton("SAVE##rk")) {
+                            std::snprintf(rack_preset_file_path, sizeof(rack_preset_file_path), "rack_track_%d.json", selected_track + 1);
+                            open_save_rack_modal = true;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("LOAD##rk")) {
+                            std::snprintf(rack_preset_file_path, sizeof(rack_preset_file_path), "rack_track_%d.json", selected_track + 1);
+                            open_load_rack_modal = true;
+                        }
+                        ImGui::Separator();
 
                         // 4 Modular Rack Units
                         for (int s = 0; s < 4; ++s) {
@@ -3315,7 +3447,158 @@ int main(int argc, char** argv) {
                 ImGui::EndTabBar();
             }
         }
-        ImGui::EndChild();
+        // ====================================================================
+        // SESSION PERSISTENCE & OFFLINE BOUNCE MODAL DIALOGS
+        // ====================================================================
+        if (open_save_session_modal) {
+            ImGui::OpenPopup("Save Project As");
+            open_save_session_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Save Project As", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "SAVE PROJECT SESSION (.JSON)");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::InputText("File Path", session_file_path, sizeof(session_file_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("SAVE PROJECT", ImVec2(130, 30))) {
+                if (serialization::SessionSerializer::save_session_file(session_file_path, mixer, mixer.clock(), "Aethel Project")) {
+                    session_status_msg = "Saved: " + std::string(session_file_path);
+                } else {
+                    session_status_msg = "Error saving session!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(90, 30))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_load_session_modal) {
+            ImGui::OpenPopup("Load Project");
+            open_load_session_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Load Project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "LOAD PROJECT SESSION (.JSON)");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::InputText("File Path", session_file_path, sizeof(session_file_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("LOAD PROJECT", ImVec2(130, 30))) {
+                if (serialization::SessionSerializer::load_session_file(session_file_path, mixer, mixer.clock())) {
+                    sync_ui_from_mixer();
+                    session_status_msg = "Loaded: " + std::string(session_file_path);
+                } else {
+                    session_status_msg = "Error loading session!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(90, 30))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_bounce_modal) {
+            ImGui::OpenPopup("Bounce Master to WAV");
+            open_bounce_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Bounce Master to WAV", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.10f, 1.0f), "FASTER-THAN-REALTIME OFFLINE MASTER BOUNCE");
+            ImGui::TextDisabled("Pure C++20 zero-hardware accelerated export with PDC latency flush");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::InputText("Output WAV Path", bounce_wav_path, sizeof(bounce_wav_path));
+            ImGui::SliderInt("Length", &bounce_bars, 1, 32, "%d Bars");
+            const char* bit_depths[] = { "16-Bit PCM", "24-Bit PCM (Studio Reference)", "32-Bit IEEE Float" };
+            ImGui::Combo("Bit Depth", &bounce_bit_depth_idx, bit_depths, IM_ARRAYSIZE(bit_depths));
+            ImGui::Checkbox("Peak Normalize", &bounce_normalize);
+            if (bounce_normalize) {
+                ImGui::SameLine();
+                ImGui::SliderFloat("Target Peak", &bounce_peak_target, -6.0f, 0.0f, "%.1f dBFS");
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ImGui::Button("EXPORT NOW", ImVec2(130, 32))) {
+                do_offline_bounce();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(90, 32))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_save_rack_modal) {
+            ImGui::OpenPopup("Save Rack Preset");
+            open_save_rack_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Save Rack Preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "SAVE DSP RACK PRESET (TRACK %d)", selected_track + 1);
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::InputText("Preset File", rack_preset_file_path, sizeof(rack_preset_file_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("SAVE RACK", ImVec2(120, 28))) {
+                auto* sel_trk = (selected_track == 0) ? trk0 : ((selected_track == 1) ? trk1 : ((selected_track == 2) ? trk2 : trk3));
+                if (sel_trk && serialization::SessionSerializer::save_rack_preset_file(rack_preset_file_path, *sel_trk, sel_trk->name())) {
+                    session_status_msg = "Rack saved: " + std::string(rack_preset_file_path);
+                } else {
+                    session_status_msg = "Error saving rack!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(80, 28))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_load_rack_modal) {
+            ImGui::OpenPopup("Load Rack Preset");
+            open_load_rack_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Load Rack Preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "LOAD DSP RACK PRESET (TRACK %d)", selected_track + 1);
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::InputText("Preset File", rack_preset_file_path, sizeof(rack_preset_file_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("LOAD RACK", ImVec2(120, 28))) {
+                auto* sel_trk = (selected_track == 0) ? trk0 : ((selected_track == 1) ? trk1 : ((selected_track == 2) ? trk2 : trk3));
+                if (sel_trk && serialization::SessionSerializer::load_rack_preset_file(rack_preset_file_path, *sel_trk, kSampleRate)) {
+                    session_status_msg = "Rack loaded: " + std::string(rack_preset_file_path);
+                } else {
+                    session_status_msg = "Error loading rack!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(80, 28))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
 
         ImGui::End();
 
