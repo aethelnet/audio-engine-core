@@ -17,6 +17,7 @@
 #include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/dsp/kinetic_meter.hpp"
 #include "audio_core/routing/universal_routing_matrix.hpp"
+#include "audio_core/routing/automation_curve.hpp"
 #include <string>
 #include <vector>
 #include <array>
@@ -98,11 +99,13 @@ public:
         m_pdc_write_pos = 0;
         m_pdc_delay_samples.store(0, std::memory_order_relaxed);
         m_has_previous_gain = false;
+        m_gain_automation_enabled.store(false, std::memory_order_relaxed);
         m_active.store(true, std::memory_order_release);
     }
 
     void deactivate() noexcept {
         m_active.store(false, std::memory_order_release);
+        m_gain_automation_enabled.store(false, std::memory_order_relaxed);
         m_azimuth.store(0.0f, std::memory_order_relaxed);
         m_custom_azimuth.store(false, std::memory_order_relaxed);
         m_solo_safe.store(false, std::memory_order_relaxed);
@@ -139,6 +142,16 @@ public:
         if (snap) snap_parameters();
     }
     [[nodiscard]] float gain() const noexcept { return m_gain.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] routing::AutomationCurve& gain_curve() noexcept { return m_gain_curve; }
+    [[nodiscard]] const routing::AutomationCurve& gain_curve() const noexcept { return m_gain_curve; }
+
+    void set_gain_automation_enabled(bool enabled) noexcept {
+        m_gain_automation_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_gain_automation_enabled() const noexcept {
+        return m_gain_automation_enabled.load(std::memory_order_relaxed);
+    }
 
     void set_pan(float pan, bool snap = false) noexcept {
         float p = std::clamp(pan, -1.0f, 1.0f);
@@ -621,6 +634,9 @@ private:
     std::atomic<bool> m_sequencer_enabled{false};
     sequencer::ClipLauncher m_launcher;
 
+    routing::AutomationCurve m_gain_curve;
+    std::atomic<bool> m_gain_automation_enabled{false};
+
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
     std::atomic<float> m_meter_rms_l{0.0f};
@@ -802,6 +818,7 @@ public:
     static constexpr size_t kMaxSampleTaps = 4;
     static constexpr size_t kMaxDcaGroups = 8;
     static constexpr size_t kMaxMuteGroups = 8;
+    static constexpr size_t kMaxBlockFrames = routing::UniversalRoutingMatrix::kMaxBlockFrames;
 
     explicit MixerGraph(uint32_t buffer_frames = 1024, bool enable_multithreading = true, uint32_t sample_rate = 48000)
         : m_buffer_frames(buffer_frames), m_master_bus(0, "Master", buffer_frames),
@@ -1642,6 +1659,15 @@ public:
             const float target_left_gain = target_gain * pan_l;
             const float target_right_gain = target_gain * pan_r;
 
+            const bool auto_gain_active = track->is_gain_automation_enabled();
+            alignas(64) float auto_curve[kMaxBlockFrames];
+            if (auto_gain_active) {
+                const double spb = std::max(1.0, m_clock.samples_per_beat());
+                const double start_beat = static_cast<double>(m_clock.sample_position()) / spb;
+                const double end_beat   = static_cast<double>(m_clock.sample_position() + frames) / spb;
+                track->gain_curve().evaluate_audio_block(start_beat, end_beat, auto_curve, frames);
+            }
+
             if (!track->m_has_previous_gain) {
                 track->m_gain_l_ramp_start = target_left_gain;
                 track->m_gain_r_ramp_start = target_right_gain;
@@ -1672,7 +1698,16 @@ public:
                 Sample* dst_l = target_bus->buffer().view().channel(0);
                 Sample* dst_r = target_bus->buffer().view().channel(1);
 
-                if (is_ramping) {
+                if (auto_gain_active) {
+                    #if defined(__GNUC__) || defined(__clang__)
+                    #pragma GCC ivdep
+                    #endif
+                    for (uint32_t i = 0; i < frames; ++i) {
+                        const float cur_mult = auto_curve[i];
+                        dst_l[i] += trk_l[i] * (target_left_gain * cur_mult);
+                        dst_r[i] += trk_r[i] * (target_right_gain * cur_mult);
+                    }
+                } else if (is_ramping) {
                     const float step_l = (target_left_gain - start_l) / static_cast<float>(frames);
                     const float step_r = (target_right_gain - start_r) / static_cast<float>(frames);
                     #if defined(__GNUC__) || defined(__clang__)
@@ -1710,8 +1745,9 @@ public:
                     #pragma GCC ivdep
                     #endif
                     for (uint32_t i = 0; i < frames; ++i) {
-                        s_l[i] += trk_l[i] * s_gain * pan_l;
-                        s_r[i] += trk_r[i] * s_gain * pan_r;
+                        float eff_s = (auto_gain_active && !send.pre_fader) ? (s_gain * auto_curve[i]) : s_gain;
+                        s_l[i] += trk_l[i] * eff_s * pan_l;
+                        s_r[i] += trk_r[i] * eff_s * pan_r;
                     }
                 }
             }

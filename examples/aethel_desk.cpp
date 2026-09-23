@@ -503,6 +503,7 @@ int main(int argc, char** argv) {
     // Universal Routing Matrix state: Pre-connect Track 1 Kick -> Track 2 Acid SC (120Hz Cytomic SVF)
     mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
     uint32_t selected_patch_id = 1;
+    int selected_curve_point = -1;
 
     protocol::MixerTelemetryFrame telemetry{};
     auto last_time = std::chrono::steady_clock::now();
@@ -3436,15 +3437,137 @@ int main(int argc, char** argv) {
                 }
 
                 // ------------------------------------------------------------
+                // ------------------------------------------------------------
                 // TAB 3: ENVELOPES & AUTOMATION
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  ENVELOPES & AUTOMATION  ")) {
+                    Track* auto_trk = (selected_track == 0) ? trk0 : ((selected_track == 1) ? trk1 : ((selected_track == 2) ? trk2 : trk3));
+
+                    const double spb = std::max(1.0, mixer.clock().samples_per_beat());
+                    const double cur_play_beat = is_playing ? std::fmod(static_cast<double>(mixer.clock().sample_position()) / spb, 16.0) : -1.0;
+
                     ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
-                                       "Liquid ODE Trapezoidal Modulation Envelope (A-Stable C^inf)");
+                                       "Orderly Architect: FontLab-Inspired Track Automation Curve Editor");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("| C^1 Hermite Smooth Splines, Direct Curvature Tension Dots & Zero-Allocation RCU");
                     ImGui::Separator();
 
+                    // Track Selector Buttons
+                    ImGui::Text("Target Channel:");
+                    ImGui::SameLine();
+                    const char* trk_short_names[4] = { "Track 1: Kick", "Track 2: Acid", "Track 3: Vocal", "Track 4: Drums" };
+                    for (int t = 0; t < 4; ++t) {
+                        if (t > 0) ImGui::SameLine();
+                        bool is_sel = (selected_track == t);
+                        if (is_sel) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 0.9f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        }
+                        if (ImGui::Button(trk_short_names[t], ImVec2(120, 24))) {
+                            selected_track = t;
+                            selected_curve_point = -1;
+                        }
+                        if (is_sel) {
+                            ImGui::PopStyleColor(2);
+                        }
+                    }
+
+                    ImGui::SameLine(0, 16);
+                    bool is_auto_on = auto_trk->is_gain_automation_enabled();
+                    if (is_auto_on) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.62f, 0.30f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.72f, 0.35f, 1.0f));
+                        if (ImGui::Button("[ AUTOMATION ENGAGED ]", ImVec2(180, 24))) {
+                            auto_trk->set_gain_automation_enabled(false);
+                        }
+                        ImGui::PopStyleColor(2);
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.32f, 0.35f, 0.40f, 0.8f));
+                        if (ImGui::Button("[ AUTOMATION BYPASSED ]", ImVec2(180, 24))) {
+                            auto_trk->set_gain_automation_enabled(true);
+                        }
+                        ImGui::PopStyleColor(1);
+                    }
+
+                    ImGui::SameLine(0, 16);
+                    ImGui::TextDisabled("Presets:");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Fade In")) {
+                        auto_trk->gain_curve().preset_fade_in(0.0, 16.0);
+                        auto_trk->set_gain_automation_enabled(true);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Fade Out")) {
+                        auto_trk->gain_curve().preset_fade_out(0.0, 16.0);
+                        auto_trk->set_gain_automation_enabled(true);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("4-Beat Pump")) {
+                        auto_trk->gain_curve().preset_sidechain_pump(16.0);
+                        auto_trk->set_gain_automation_enabled(true);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset 0 dB")) {
+                        auto_trk->gain_curve().preset_reset_unity(16.0);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear")) {
+                        auto_trk->gain_curve().clear();
+                    }
+
+                    ImGui::Spacing();
+
+                    // Canvas
+                    ui::DrawAutomationCurveEditor("TrackGainAutomationEditor",
+                                                  auto_trk->gain_curve(),
+                                                  ImVec2(0, 200),
+                                                  16.0,
+                                                  cur_play_beat,
+                                                  &selected_curve_point);
+
+                    // Curve Inspector & Ergonomics Legend
+                    auto pts = auto_trk->gain_curve().get_points();
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
+                        "Ergonomics: Click curve = Split & Add Node | Drag Node = Move (Snap 1/16th beat; hold Shift for free movement)");
+                    ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
+                        "            Drag Tension Dot = Adjust Curvature tau in [-1, 1] | Double-Click Node = Toggle Smooth / Corner | Right-Click = Delete Node");
+
+                    if (selected_curve_point >= 0 && selected_curve_point < static_cast<int>(pts.size())) {
+                        auto pt = pts[selected_curve_point];
+                        ImGui::Spacing();
+                        ImGui::Text("Node #%d Selected:", selected_curve_point + 1);
+                        ImGui::SameLine();
+                        float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Linear: %.3f (%+.1f dB)",
+                                           pt.time_beats, pt.value, db_val);
+                        ImGui::SameLine(0, 16);
+                        const char* m_str = (pt.node_mode == routing::NodeMode::Smooth) ? "Mode: Smooth (Circle)" :
+                                            (pt.node_mode == routing::NodeMode::Corner) ? "Mode: Corner (Diamond)" : "Mode: Hold (Box)";
+                        if (ImGui::Button(m_str)) {
+                            auto_trk->gain_curve().toggle_node_mode(selected_curve_point);
+                        }
+                        if (selected_curve_point < static_cast<int>(pts.size()) - 1) {
+                            ImGui::SameLine(0, 16);
+                            ImGui::SetNextItemWidth(140);
+                            float cur_t = pt.tension;
+                            if (ImGui::SliderFloat("Tension", &cur_t, -1.0f, 1.0f, "%.2f")) {
+                                auto_trk->gain_curve().set_segment_tension(selected_curve_point, cur_t);
+                            }
+                        }
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // Liquid ODE Envelope Section
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
+                                       "Liquid ODE Trapezoidal Modulation Envelope (A-Stable C^inf)");
+                    ImGui::Spacing();
+
                     ImVec2 env_pos = ImGui::GetCursorScreenPos();
-                    ImVec2 env_size(ImGui::GetContentRegionAvail().x - 260.0f, 160.0f);
+                    ImVec2 env_size(ImGui::GetContentRegionAvail().x - 260.0f, 130.0f);
                     ui::DrawEnvelopeCurve(ImGui::GetWindowDrawList(), env_pos, env_size,
                                          env_attack, env_decay, env_sustain, env_release, env_tau);
                     ImGui::Dummy(env_size);
@@ -3461,7 +3584,7 @@ int main(int argc, char** argv) {
                         ImGui::SetNextItemWidth(120);
                         ImGui::SliderFloat("Release", &env_release, 10.0f, 2000.0f, "%.0f ms");
                         ImGui::SetNextItemWidth(120);
-                        ImGui::SliderFloat("ODE Tau (Curvature)", &env_tau, 0.1f, 5.0f, "%.2f");
+                        ImGui::SliderFloat("ODE Tau", &env_tau, 0.1f, 5.0f, "%.2f");
                     }
                     ImGui::EndGroup();
 

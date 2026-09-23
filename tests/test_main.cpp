@@ -8137,6 +8137,213 @@ void test_waveform_overview_and_long_stem_mipmapping() {
     std::cout << "  -> AudioClip Auto-Mipmapping & Normalization Sync: PASSED (Peak=" << clip_l0[0].max_val << ")" << std::endl;
 }
 
+void test_automation_curve_and_gain_rendering() {
+    std::cout << "[TEST] Running FontLab Automation Curve & Sample-Accurate Gain Engine Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::routing;
+
+    // 1. Breakpoint Interpolation & Node Modes (Smooth, Corner, Hold)
+    {
+        AutomationCurve curve;
+        // Points: (0.0, 0.0, Corner, 0.0), (4.0, 1.0, Corner, 0.0) -> Linear ramp
+        std::vector<AutomationPoint> pts = {
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 1.0f, NodeMode::Corner, 0.0f}
+        };
+        curve.set_points(pts);
+
+        auto snap = curve.snapshot();
+        TEST_CHECK(snap != nullptr);
+        TEST_CHECK(std::abs(snap->evaluate(0.0) - 0.0f) < 1e-5f);
+        TEST_CHECK(std::abs(snap->evaluate(2.0) - 0.5f) < 1e-5f);
+        TEST_CHECK(std::abs(snap->evaluate(4.0) - 1.0f) < 1e-5f);
+        TEST_CHECK(std::abs(snap->evaluate(6.0) - 1.0f) < 1e-5f); // Clamped end
+        TEST_CHECK(std::abs(snap->evaluate(-1.0) - 0.0f) < 1e-5f); // Clamped start
+
+        // Test Hold mode: remains at initial value until the boundary
+        pts = {
+            AutomationPoint{0.0, 0.2f, NodeMode::Hold, 0.0f},
+            AutomationPoint{4.0, 0.8f, NodeMode::Hold, 0.0f}
+        };
+        curve.set_points(pts);
+        snap = curve.snapshot();
+        TEST_CHECK(snap->evaluate(0.0) == 0.2f);
+        TEST_CHECK(snap->evaluate(2.0) == 0.2f);
+        TEST_CHECK(snap->evaluate(3.99) == 0.2f);
+        TEST_CHECK(snap->evaluate(4.0) == 0.8f);
+
+        // Test Smooth mode: C^1 Hermite curve
+        pts = {
+            AutomationPoint{0.0, 0.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{4.0, 1.0f, NodeMode::Smooth, 0.0f}
+        };
+        curve.set_points(pts);
+        snap = curve.snapshot();
+        // Hermite smoothstep at midpoint u = 0.5 gives 3(0.5)^2 - 2(0.5)^3 = 3*0.25 - 2*0.125 = 0.75 - 0.25 = 0.5
+        TEST_CHECK(std::abs(snap->evaluate(2.0) - 0.5f) < 1e-5f);
+        // At u = 0.25 (time = 1.0), smoothstep is 3*(1/16) - 2*(1/64) = 3/16 - 1/32 = 5/32 = 0.15625 < 0.25 (slower start)
+        TEST_CHECK(snap->evaluate(1.0) < 0.25f);
+        // At u = 0.75 (time = 3.0), smoothstep is 1 - 0.15625 = 0.84375 > 0.75 (slower finish)
+        TEST_CHECK(snap->evaluate(3.0) > 0.75f);
+
+        std::cout << "  -> Breakpoint Node Modes (Smooth C^1, Corner Linear, Hold Step): PASSED" << std::endl;
+    }
+
+    // 2. Curvature Tension Bending (tau in [-1, +1])
+    {
+        AutomationCurve curve;
+        // Upward ramp from 0.0 to 1.0
+        // tau = -0.7 (concave / fast attack rise)
+        curve.set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, -0.7f},
+            AutomationPoint{2.0, 1.0f, NodeMode::Corner, 0.0f}
+        });
+        float val_concave = curve.snapshot()->evaluate(1.0); // Midpoint
+        TEST_CHECK(val_concave > 0.55f); // Rises faster early
+
+        // tau = +0.7 (convex / slow rise)
+        curve.set_segment_tension(0, 0.7f);
+        float val_convex = curve.snapshot()->evaluate(1.0);
+        TEST_CHECK(val_convex < 0.45f); // Rises slower early
+
+        std::cout << "  -> Curvature Tension Dots (tau concave=" << val_concave << " vs convex=" << val_convex << "): PASSED" << std::endl;
+    }
+
+    // 3. Audio Block Vectorized Evaluation
+    {
+        AutomationCurve curve;
+        curve.preset_fade_in(4.0, 16.0); // 0 to 4 beats fade in
+        constexpr uint32_t kFrames = 256;
+        alignas(64) float out[kFrames];
+
+        // Evaluate from beat 0.0 to 2.0 (midway through fade-in)
+        curve.evaluate_audio_block(0.0, 2.0, out, kFrames);
+        TEST_CHECK(out[0] >= 0.0f);
+        TEST_CHECK(out[kFrames - 1] > out[0]); // Strictly increasing
+        TEST_CHECK(!std::isnan(out[kFrames / 2]));
+        TEST_CHECK(!std::isinf(out[kFrames / 2]));
+
+        // Continuous block sequence: next block from 2.0 to 4.0
+        alignas(64) float out2[kFrames];
+        curve.evaluate_audio_block(2.0, 4.0, out2, kFrames);
+        // Check boundary continuity between end of block 1 and start of block 2
+        TEST_CHECK(std::abs(out[kFrames - 1] - out2[0]) < 0.02f);
+        TEST_CHECK(std::abs(out2[kFrames - 1] - 1.0f) < 1e-4f);
+
+        std::cout << "  -> Sample-Accurate Audio Block Evaluation & Continuity: PASSED" << std::endl;
+    }
+
+    // 4. Concurrency & Lock-Free Atomic RCU Safety
+    {
+        AutomationCurve curve;
+        curve.preset_reset_unity(16.0);
+
+        std::atomic<bool> running{true};
+        std::atomic<uint64_t> audio_blocks_rendered{0};
+        std::atomic<uint64_t> gui_mutations_performed{0};
+
+        // Audio thread worker: continuously evaluates audio blocks
+        std::thread audio_thread([&]() {
+            alignas(64) float block_buf[128];
+            double beat = 0.0;
+            while (running.load(std::memory_order_relaxed) || audio_blocks_rendered.load(std::memory_order_relaxed) < 2000) {
+                curve.evaluate_audio_block(beat, beat + 0.1, block_buf, 128);
+                beat += 0.1;
+                if (beat >= 16.0) beat = 0.0;
+                audio_blocks_rendered.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        // GUI thread worker: rapidly mutates points, tension, modes
+        std::thread gui_thread([&]() {
+            for (int i = 0; i < 5000; ++i) {
+                curve.add_point(2.0 + (i % 8) * 0.5, 0.1f * (i % 10), NodeMode::Smooth, 0.2f);
+                curve.set_segment_tension(0, -0.5f + (i % 10) * 0.1f);
+                curve.toggle_node_mode(0);
+                if (curve.get_points().size() > 10) {
+                    curve.remove_point(1);
+                }
+                gui_mutations_performed.fetch_add(1, std::memory_order_relaxed);
+            }
+            running.store(false, std::memory_order_relaxed);
+        });
+
+        gui_thread.join();
+        audio_thread.join();
+
+        TEST_CHECK(audio_blocks_rendered.load() >= 2000);
+        TEST_CHECK(gui_mutations_performed.load() == 5000);
+        std::cout << "  -> Lock-Free RCU Atomic Concurrency: PASSED (" 
+                  << audio_blocks_rendered.load() << " RT blocks rendered concurrent to "
+                  << gui_mutations_performed.load() << " GUI mutations)" << std::endl;
+    }
+
+    // 5. MixerGraph Track Gain Automation Rendering Integration
+    {
+        constexpr uint32_t kFrames = 256;
+        MixerGraph mixer(kFrames, false, 48000);
+        Track* trk = mixer.add_track("Synth Track");
+        TEST_CHECK(trk != nullptr);
+        trk->set_pan(-1.0f); // Hard Left so pan_l = 1.0 (avoids -3dB center pan law attenuation)
+
+        // Fill track buffer with DC 1.0f on both channels
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+
+        // Setup fade-in automation curve: 0.0 at beat 0, 1.0 at beat 4.0
+        trk->gain_curve().set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 1.0f, NodeMode::Corner, 0.0f}
+        });
+        trk->set_gain_automation_enabled(true);
+        TEST_CHECK(trk->is_gain_automation_enabled());
+
+        AudioBuffer master_out(2, kFrames);
+        auto master_view = master_out.view();
+
+        // At sample position 0 (beat 0), clock at 120 BPM -> 24000 samples per beat
+        mixer.clock().set_sample_position(0);
+        mixer.clock().set_bpm(120.0);
+        mixer.render(master_view);
+
+        // At beat 0, gain multiplier is 0.0, so output should be heavily attenuated
+        TEST_CHECK(master_view.channel(0)[0] < 0.05f);
+        // Over the 256 frames (~0.01 beats), output should ramp upwards
+        TEST_CHECK(master_view.channel(0)[kFrames - 1] > master_view.channel(0)[0]);
+
+        // Advance transport to beat 4 (96000 samples)
+        mixer.clock().set_sample_position(96000);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        // At beat 4, gain multiplier is 1.0f
+        TEST_CHECK(master_view.channel(0)[kFrames / 2] > 0.90f);
+
+        // Disable automation and check fallback to static gain (e.g. 0.5)
+        trk->set_gain_automation_enabled(false);
+        trk->set_gain(0.5f);
+        // Warm up fader ramp
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        TEST_CHECK(std::abs(master_view.channel(0)[kFrames / 2] - 0.5f) < 0.05f);
+
+        std::cout << "  -> MixerGraph Gain Automation End-to-End Render: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -8206,6 +8413,7 @@ int main() {
     test_websocket_bridge_and_remote_control();
     test_faster_than_realtime_offline_wav_bounce();
     test_waveform_overview_and_long_stem_mipmapping();
+    test_automation_curve_and_gain_rendering();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

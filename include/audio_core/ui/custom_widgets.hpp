@@ -589,4 +589,275 @@ inline void DrawKineticHitMeter(ImDrawList* draw_list, ImVec2 pos, ImVec2 size,
     draw_list->AddText(ImVec2(pill_pos.x + 8.0f, pill_pos.y + 3.0f), ImColor(diag_fg), diag_text);
 }
 
+// ============================================================================
+// Orderly Architect's Desk: FontLab-Inspired Automation Curve Editor
+// Technical Vellum Canvas, Blueprint Cobalt Splines, FontLab Smooth/Corner Nodes,
+// Tension Dots (Rapid Tool curvature bending), Ghost Splitting & Live Needle
+// ============================================================================
+inline bool DrawAutomationCurveEditor(const char* str_id,
+                                      routing::AutomationCurve& curve,
+                                      ImVec2 size = ImVec2(0, 160),
+                                      double total_beats = 16.0,
+                                      double current_playhead_beat = -1.0,
+                                      int* selected_point_out = nullptr) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    if (size.x <= 0.0f) size.x = ImGui::GetContentRegionAvail().x;
+    ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+    ImGui::ItemSize(bb);
+    ImGuiID id = window->GetID(str_id);
+    if (!ImGui::ItemAdd(bb, id)) return false;
+
+    ImDrawList* draw_list = window->DrawList;
+    const float x = pos.x;
+    const float y = pos.y;
+    const float w = size.x;
+    const float h = size.y;
+    const float pad_top = 18.0f;
+    const float pad_bot = 18.0f;
+    const float usable_h = h - pad_top - pad_bot;
+    const float bot_y = y + h - pad_bot;
+
+    constexpr float kMaxVal = 1.25f; // Headroom up to +2 dB
+
+    auto beat_to_x = [&](double b) -> float {
+        return x + static_cast<float>(std::clamp(b / total_beats, 0.0, 1.0)) * w;
+    };
+    auto x_to_beat = [&](float px) -> double {
+        return std::clamp(static_cast<double>((px - x) / w) * total_beats, 0.0, total_beats);
+    };
+    auto val_to_y = [&](float v) -> float {
+        float norm = std::clamp(v / kMaxVal, 0.0f, 1.0f);
+        return bot_y - (norm * usable_h);
+    };
+    auto y_to_val = [&](float py) -> float {
+        float norm = std::clamp((bot_y - py) / usable_h, 0.0f, 1.0f);
+        return norm * kMaxVal;
+    };
+
+    static int s_active_pt = -1;
+    static int s_active_tension = -1;
+    static bool s_is_dragging_pt = false;
+    static bool s_is_dragging_tension = false;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 mouse = io.MousePos;
+    bool is_hovered = bb.Contains(mouse);
+
+    auto points = curve.get_points();
+    auto snap = curve.snapshot();
+
+    // 1. Hit Testing: Points & Tension Handles
+    int hovered_pt = -1;
+    int hovered_tension = -1;
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        float px = beat_to_x(points[i].time_beats);
+        float py = val_to_y(points[i].value);
+        if (std::hypot(mouse.x - px, mouse.y - py) <= 9.0f) {
+            hovered_pt = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (hovered_pt < 0) {
+        for (size_t i = 0; i + 1 < points.size(); ++i) {
+            double mid_t = 0.5 * (points[i].time_beats + points[i + 1].time_beats);
+            float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (points[i].value + points[i + 1].value);
+            float tx = beat_to_x(mid_t);
+            float ty = val_to_y(mid_v);
+            if (std::hypot(mouse.x - tx, mouse.y - ty) <= 8.0f) {
+                hovered_tension = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    // 2. Mouse Actions & Gestures
+    bool modified = false;
+
+    if (is_hovered && ImGui::IsMouseClicked(0)) {
+        if (hovered_pt >= 0) {
+            if (io.MouseDoubleClicked[0]) {
+                // FontLab Double-Click: Toggle Smooth <-> Corner <-> Hold
+                curve.toggle_node_mode(static_cast<size_t>(hovered_pt));
+                modified = true;
+            } else {
+                s_active_pt = hovered_pt;
+                s_is_dragging_pt = true;
+            }
+        } else if (hovered_tension >= 0) {
+            s_active_tension = hovered_tension;
+            s_is_dragging_tension = true;
+        } else {
+            // Click on line/canvas: Insert new breakpoint (Ghost node becomes real)
+            double nb = x_to_beat(mouse.x);
+            if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0; // Snap to 1/16th beat
+            float nv = y_to_val(mouse.y);
+            if (std::abs(nv - 1.0f) < 0.04f && !io.KeyShift) nv = 1.0f; // Snap to 0 dB
+            size_t new_idx = curve.add_point(nb, nv, routing::NodeMode::Smooth, 0.0f);
+            s_active_pt = static_cast<int>(new_idx);
+            s_is_dragging_pt = true;
+            modified = true;
+        }
+    }
+
+    if (is_hovered && ImGui::IsMouseClicked(1)) {
+        if (hovered_pt >= 0) {
+            // Right-click: Delete node
+            curve.remove_point(static_cast<size_t>(hovered_pt));
+            if (s_active_pt == hovered_pt) s_active_pt = -1;
+            modified = true;
+        }
+    }
+
+    // Dragging
+    if (io.MouseDown[0]) {
+        if (s_is_dragging_pt && s_active_pt >= 0 && static_cast<size_t>(s_active_pt) < points.size()) {
+            double nb = x_to_beat(mouse.x);
+            if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0;
+            float nv = y_to_val(mouse.y);
+            if (std::abs(nv - 1.0f) < 0.04f && !io.KeyShift) nv = 1.0f;
+            curve.update_point(static_cast<size_t>(s_active_pt), nb, nv);
+            modified = true;
+        } else if (s_is_dragging_tension && s_active_tension >= 0 && static_cast<size_t>(s_active_tension) < points.size()) {
+            float dy = -io.MouseDelta.y * 0.035f;
+            float cur_tau = points[s_active_tension].tension + dy;
+            curve.set_segment_tension(static_cast<size_t>(s_active_tension), cur_tau);
+            modified = true;
+        }
+    } else {
+        s_is_dragging_pt = false;
+        s_is_dragging_tension = false;
+    }
+
+    if (selected_point_out) {
+        *selected_point_out = s_active_pt;
+    }
+
+    // Re-fetch points after potential edits
+    points = curve.get_points();
+    snap = curve.snapshot();
+
+    // 3. Render Canvas & Guidelines (Drafting Millimeter Aesthetic)
+    draw_list->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(255, 255, 255, 255), 2.0f);
+    draw_list->AddRect(pos, ImVec2(x + w, y + h), ImColor(190, 196, 206, 255), 2.0f);
+
+    // 0 dB guideline (solid graphite)
+    float y_0db = val_to_y(1.0f);
+    draw_list->AddLine(ImVec2(x, y_0db), ImVec2(x + w, y_0db), ImColor(140, 150, 168, 255), 1.5f);
+    draw_list->AddText(ImVec2(x + 6.0f, y_0db - 13.0f), ImColor(120, 130, 145, 220), "0 dB [Unity]");
+
+    // -6 dB guideline (dashed)
+    float y_6db = val_to_y(0.5f);
+    draw_list->AddLine(ImVec2(x, y_6db), ImVec2(x + w, y_6db), ImColor(225, 230, 238, 255), 1.0f);
+    draw_list->AddText(ImVec2(x + 6.0f, y_6db - 13.0f), ImColor(160, 170, 185, 200), "-6 dB [0.5]");
+
+    // Baseline (-inf)
+    draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
+    draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "-inf [Silence]");
+
+    // Vertical Bars & Beats
+    for (double b = 0.0; b <= total_beats; b += 1.0) {
+        float bx = beat_to_x(b);
+        bool is_bar = (std::fmod(b, 4.0) == 0.0);
+        if (is_bar) {
+            draw_list->AddLine(ImVec2(bx, y), ImVec2(bx, y + h), ImColor(215, 222, 232, 255), 1.0f);
+            char bar_txt[16];
+            std::snprintf(bar_txt, sizeof(bar_txt), "Bar %d", static_cast<int>(b / 4.0) + 1);
+            draw_list->AddText(ImVec2(bx + 4.0f, y + 2.0f), ImColor(140, 150, 168, 200), bar_txt);
+        } else {
+            draw_list->AddLine(ImVec2(bx, y + 16.0f), ImVec2(bx, y + h), ImColor(245, 247, 250, 255), 1.0f);
+        }
+    }
+
+    // 4. Sampled Curve Polyline & Translucent Wash
+    const int num_steps = static_cast<int>(std::clamp(w * 0.45f, 60.0f, 600.0f));
+    std::vector<ImVec2> poly_pts;
+    poly_pts.reserve(num_steps + 3);
+    poly_pts.push_back(ImVec2(x, bot_y));
+
+    for (int s = 0; s <= num_steps; ++s) {
+        double b = (static_cast<double>(s) / static_cast<double>(num_steps)) * total_beats;
+        float v = snap ? snap->evaluate(b) : 1.0f;
+        poly_pts.push_back(ImVec2(beat_to_x(b), val_to_y(v)));
+    }
+    poly_pts.push_back(ImVec2(x + w, bot_y));
+
+    // Semi-transparent Cobalt wash below curve
+    draw_list->AddConvexPolyFilled(poly_pts.data(), static_cast<int>(poly_pts.size()), ImColor(31, 97, 217, 30));
+    // Polyline stroke
+    draw_list->AddPolyline(poly_pts.data() + 1, num_steps + 1, ImColor(31, 97, 217, 240), 0, 2.5f);
+
+    // 5. Tension Dots (FontLab Curvature Handles)
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        if (points[i].node_mode == routing::NodeMode::Hold) continue;
+
+        double mid_t = 0.5 * (points[i].time_beats + points[i + 1].time_beats);
+        float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (points[i].value + points[i + 1].value);
+        float tx = beat_to_x(mid_t);
+        float ty = val_to_y(mid_v);
+        bool is_t_hov = (hovered_tension == static_cast<int>(i) || (s_is_dragging_tension && s_active_tension == static_cast<int>(i)));
+        ImU32 col_t = is_t_hov ? ImColor(217, 119, 6, 255) : ImColor(217, 119, 6, 170);
+
+        draw_list->AddCircleFilled(ImVec2(tx, ty), is_t_hov ? 5.0f : 3.5f, col_t);
+        draw_list->AddCircle(ImVec2(tx, ty), is_t_hov ? 5.0f : 3.5f, ImColor(255, 255, 255, 255), 0, 1.0f);
+    }
+
+    // 6. Breakpoint Nodes (Smooth = Circle, Corner = Diamond, Hold = Step Box)
+    for (size_t i = 0; i < points.size(); ++i) {
+        float px = beat_to_x(points[i].time_beats);
+        float py = val_to_y(points[i].value);
+        bool is_sel = (s_active_pt == static_cast<int>(i));
+        bool is_hov = (hovered_pt == static_cast<int>(i));
+
+        if (points[i].node_mode == routing::NodeMode::Smooth) {
+            // Smooth: Circle
+            float r = (is_sel || is_hov) ? 6.5f : 4.5f;
+            draw_list->AddCircleFilled(ImVec2(px, py), r, ImColor(255, 255, 255, 255));
+            draw_list->AddCircle(ImVec2(px, py), r, is_sel ? ImColor(220, 38, 38, 255) : ImColor(31, 97, 217, 255), 0, 2.0f);
+        } else if (points[i].node_mode == routing::NodeMode::Corner) {
+            // Corner: Diamond
+            float d = (is_sel || is_hov) ? 7.0f : 5.0f;
+            ImVec2 p_top(px, py - d), p_right(px + d, py), p_bot(px, py + d), p_left(px - d, py);
+            draw_list->AddQuadFilled(p_top, p_right, p_bot, p_left, ImColor(255, 255, 255, 255));
+            draw_list->AddQuad(p_top, p_right, p_bot, p_left, is_sel ? ImColor(220, 38, 38, 255) : ImColor(217, 119, 6, 255), 2.0f);
+        } else {
+            // Hold: Step Box
+            float s = (is_sel || is_hov) ? 6.0f : 4.0f;
+            draw_list->AddRectFilled(ImVec2(px - s, py - s), ImVec2(px + s, py + s), ImColor(255, 255, 255, 255));
+            draw_list->AddRect(ImVec2(px - s, py - s), ImVec2(px + s, py + s), is_sel ? ImColor(220, 38, 38, 255) : ImColor(20, 25, 35, 255), 0.0f, 0, 2.0f);
+        }
+    }
+
+    // 7. Ghost Node & Tooltip (Hover Preview)
+    if (is_hovered && hovered_pt < 0 && hovered_tension < 0 && !s_is_dragging_pt && !s_is_dragging_tension) {
+        double hb = x_to_beat(mouse.x);
+        if (!io.KeyShift) hb = std::round(hb * 4.0) / 4.0;
+        float hv = snap ? snap->evaluate(hb) : 1.0f;
+        float gx = beat_to_x(hb);
+        float gy = val_to_y(hv);
+
+        draw_list->AddCircle(ImVec2(gx, gy), 6.0f, ImColor(31, 97, 217, 140), 0, 1.5f);
+        char tip[64];
+        float db = linear_to_db(hv);
+        std::snprintf(tip, sizeof(tip), "Bar %.2f | %.1f dB", (hb / 4.0) + 1.0, db);
+        draw_list->AddText(ImVec2(gx + 10.0f, gy - 16.0f), ImColor(31, 97, 217, 220), tip);
+    }
+
+    // 8. Live Transport Playhead Needle
+    if (current_playhead_beat >= 0.0 && current_playhead_beat <= total_beats) {
+        float hx = beat_to_x(current_playhead_beat);
+        draw_list->AddLine(ImVec2(hx, y), ImVec2(hx, y + h), ImColor(20, 25, 35, 240), 1.5f);
+        draw_list->AddTriangleFilled(ImVec2(hx - 5.0f, y), ImVec2(hx + 5.0f, y), ImVec2(hx, y + 8.0f), ImColor(20, 25, 35, 240));
+
+        float cur_v = snap ? snap->evaluate(current_playhead_beat) : 1.0f;
+        draw_list->AddCircleFilled(ImVec2(hx, val_to_y(cur_v)), 4.5f, ImColor(220, 38, 38, 255));
+    }
+
+    return modified;
+}
+
 } // namespace audio_core::ui
