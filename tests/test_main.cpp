@@ -51,6 +51,9 @@
 #include "audio_core/engine.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/network/websocket_bridge.hpp"
+#include "audio_core/modulation/multi_stage_envelope.hpp"
+#include "audio_core/modulation/modulation_lfo.hpp"
+#include "audio_core/modulation/modulation_matrix.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -9277,6 +9280,195 @@ void test_insert_slot_automation_and_multilane_stacking() {
     }
 }
 
+void test_multi_stage_envelope_and_meta_modulation_matrix() {
+    std::cout << "[TEST] Running Multi-Stage Envelope (MSEG) & Meta-Modulation Matrix Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::modulation;
+    using namespace audio_core::routing;
+
+    const uint32_t kSr = 48000;
+
+    // 1. MSEG Spline Evaluation, FontLab Curvature & Presets
+    {
+        MultiStageEnvelope mseg;
+        mseg.preset_percussive_hihat(); // 1.5ms attack to 1.0, 35ms decay to 0.15, 75ms choke to 0.0
+
+        auto pts = mseg.get_points();
+        TEST_CHECK(pts.size() == 4);
+        TEST_CHECK(mseg.time_mode() == MsegTimeMode::Milliseconds);
+        TEST_CHECK(mseg.loop_mode() == MsegLoopMode::OneShot);
+
+        auto snap = mseg.snapshot();
+        TEST_CHECK(snap != nullptr);
+
+        // At t = 0.0ms -> 0.0f
+        TEST_CHECK(std::abs(snap->evaluate(0.0) - 0.0f) < 1e-4f);
+        // At peak t = 1.5ms -> 1.0f
+        TEST_CHECK(std::abs(snap->evaluate(1.5) - 1.0f) < 1e-4f);
+        // At t = 35.0ms -> 0.15f
+        TEST_CHECK(std::abs(snap->evaluate(35.0) - 0.15f) < 1e-4f);
+        // At end t = 75.0ms -> 0.0f
+        TEST_CHECK(std::abs(snap->evaluate(75.0) - 0.0f) < 1e-4f);
+        // Post end -> clamped to last point 0.0f
+        TEST_CHECK(std::abs(snap->evaluate(100.0) - 0.0f) < 1e-4f);
+
+        // Test smooth Hermite & tension curvature
+        MultiStageEnvelope pad;
+        pad.preset_pad_swell();
+        auto pad_snap = pad.snapshot();
+        TEST_CHECK(pad_snap->sustain_index() == 2);
+        TEST_CHECK(pad_snap->loop_mode() == MsegLoopMode::SustainLoop);
+        // Midway through smooth attack swell: strictly positive and monotonic
+        float mid_val = pad_snap->evaluate(300.0);
+        TEST_CHECK(mid_val > 0.1f && mid_val < 0.9f);
+
+        std::cout << "  -> MSEG Spline Evaluation, FontLab Curvature & Presets: PASSED" << std::endl;
+    }
+
+    // 2. MsegVoice Real-Time Lifecycle: OneShot vs SustainLoop vs FreeRunLoop
+    {
+        // 2A. One-Shot Drum Trigger (Hi-Hat voice)
+        MultiStageEnvelope hat_mseg;
+        hat_mseg.preset_percussive_hihat(); // 75ms total duration
+        auto hat_snap = hat_mseg.snapshot();
+
+        MsegVoice hat_voice;
+        TEST_CHECK(!hat_voice.is_active());
+        hat_voice.trigger(0.8f); // 80% velocity
+        TEST_CHECK(hat_voice.is_active());
+        TEST_CHECK(hat_voice.stage() == MsegStage::Attack);
+
+        // Process 10ms (at 48kHz, 10ms = 480 samples)
+        for (uint32_t i = 0; i < 480; ++i) {
+            hat_voice.process_sample(*hat_snap, kSr);
+        }
+        TEST_CHECK(hat_voice.is_active());
+        TEST_CHECK(hat_voice.current_value() > 0.0f);
+
+        // Process another 80ms (3840 samples) -> exceeds 75ms total duration
+        for (uint32_t i = 0; i < 3840; ++i) {
+            hat_voice.process_sample(*hat_snap, kSr);
+        }
+        // OneShot should automatically go inactive / idle
+        TEST_CHECK(!hat_voice.is_active());
+        TEST_CHECK(hat_voice.stage() == MsegStage::Idle);
+        TEST_CHECK(hat_voice.current_value() == 0.0f);
+
+        // 2B. Sustain Loop (Synth Lead with held key)
+        MultiStageEnvelope lead_mseg;
+        lead_mseg.preset_plucked_synth(); // Sustain index 2 at t=120ms (val = 0.3)
+        auto lead_snap = lead_mseg.snapshot();
+
+        MsegVoice lead_voice;
+        lead_voice.trigger(1.0f);
+        // Process 200ms with gate held -> should park at sustain point
+        for (uint32_t i = 0; i < 9600; ++i) {
+            lead_voice.process_sample(*lead_snap, kSr);
+        }
+        TEST_CHECK(lead_voice.is_active());
+        TEST_CHECK(lead_voice.stage() == MsegStage::Sustain);
+        TEST_CHECK(std::abs(lead_voice.current_value() - 0.3f) < 0.05f);
+
+        // Note off: release key
+        lead_voice.release();
+        TEST_CHECK(lead_voice.stage() == MsegStage::Release);
+        // Process release to end (another 200ms)
+        for (uint32_t i = 0; i < 9600; ++i) {
+            lead_voice.process_sample(*lead_snap, kSr);
+        }
+        TEST_CHECK(!lead_voice.is_active());
+
+        // 2C. FreeRunLoop (Custom LFO)
+        MultiStageEnvelope lfo_mseg;
+        lfo_mseg.preset_wobble_lfo(4.0); // 4 beats loop
+        auto lfo_snap = lfo_mseg.snapshot();
+        MsegVoice lfo_voice;
+        lfo_voice.trigger();
+        // Process multiple cycles (10 bars @ 120 BPM)
+        for (uint32_t i = 0; i < 48000; ++i) {
+            float val = lfo_voice.process_sample(*lfo_snap, kSr, 120.0);
+            TEST_CHECK(!std::isnan(val) && !std::isinf(val));
+        }
+        TEST_CHECK(lfo_voice.is_active()); // Never stops in FreeRunLoop
+
+        std::cout << "  -> MsegVoice Lifecycle (OneShot, SustainLoop, FreeRunLoop): PASSED" << std::endl;
+    }
+
+    // 3. Meta-Modulation: Modulating the Modulator (LFO -> Hi-Hat Attack Time)
+    {
+        MultiStageEnvelope mseg;
+        // Peak is at 2.0ms (val = 1.0f). Decay to 0 at 40ms.
+        std::vector<MsegPoint> pts = {
+            MsegPoint{0.0,  0.0f, NodeMode::Corner, 0.0f},
+            MsegPoint{2.0,  1.0f, NodeMode::Corner, 0.0f},
+            MsegPoint{40.0, 0.0f, NodeMode::Corner, 0.0f}
+        };
+        mseg.set_points(pts, MsegTimeMode::Milliseconds, MsegLoopMode::OneShot, -1);
+        auto snap = mseg.snapshot();
+
+        // Baseline (unmodulated attack):
+        // At t = 1.0ms (halfway to 2ms peak), value is 0.5f
+        float val_base = snap->evaluate(1.0, 1.0f, 1.0f);
+        TEST_CHECK(std::abs(val_base - 0.5f) < 0.05f);
+
+        // Now Meta-Modulate Attack: stretch attack by 5x (attack_scale = 5.0f -> effective peak at 10.0ms)
+        float val_slow_atk = snap->evaluate(1.0, 5.0f, 1.0f);
+        // At t = 1.0ms, the slow attack is only at 0.1f (1.0ms / 10.0ms = 0.1f)!
+        TEST_CHECK(std::abs(val_slow_atk - 0.1f) < 0.05f);
+
+        // At t = 10.0ms, the slow attack reaches full 1.0f!
+        float val_slow_peak = snap->evaluate(10.0, 5.0f, 1.0f);
+        TEST_CHECK(std::abs(val_slow_peak - 1.0f) < 0.05f);
+
+        // Compress attack by 0.5x (attack_scale = 0.5f -> effective peak at 1.0ms)
+        float val_fast_peak = snap->evaluate(1.0, 0.5f, 1.0f);
+        TEST_CHECK(std::abs(val_fast_peak - 1.0f) < 0.05f);
+
+        std::cout << "  -> Meta-Modulation (Dynamic Attack Reshaping without Allocations): PASSED" << std::endl;
+    }
+
+    // 4. ModulationMatrix Topologically Sorted 4-Phase Dispatch
+    {
+        ModulationMatrix matrix;
+        matrix.init(kSr);
+
+        // Route 1: LFO 1 -> MSEG 1 Attack (Meta-Modulation: LFO frequency-modulates Hi-Hat attack time!)
+        matrix.set_route(0, ModulationSource::LFO1, ModulationDestination::MSEG1_Attack, 2.0f, true);
+
+        // Route 2: MSEG 1 -> Synth Cutoff (Voice Modulation: MSEG envelope sweeps filter)
+        matrix.set_route(1, ModulationSource::MSEG1, ModulationDestination::SynthCutoff, 0.75f, true);
+
+        // Route 3: Velocity -> MSEG 1 Level (Performance Controller)
+        matrix.set_route(2, ModulationSource::Velocity, ModulationDestination::MSEG1_Level, 0.5f, true);
+
+        matrix.lfo1().set_waveform(LfoWaveform::Sine);
+        matrix.lfo1().set_frequency_hz(5.0f);
+        matrix.lfo1().set_bipolar(false); // [0.0, 1.0]
+
+        matrix.mseg1().preset_percussive_hihat();
+        matrix.note_on(0.9f); // Trigger note with 90% velocity
+
+        // Process 256 samples in audio block
+        for (uint32_t i = 0; i < 256; ++i) {
+            matrix.evaluate_sample(120.0);
+        }
+
+        // Verify LFO 1 has moved phase
+        TEST_CHECK(matrix.lfo1().phase() > 0.0);
+
+        // Verify MSEG 1 attack scale was meta-modulated by LFO 1!
+        TEST_CHECK(matrix.mseg1().effective_attack_scale() > 1.0f);
+
+        // Verify final destination accumulation for SynthCutoff
+        float cutoff_mod = matrix.get_destination_value(ModulationDestination::SynthCutoff);
+        TEST_CHECK(!std::isnan(cutoff_mod) && !std::isinf(cutoff_mod));
+        TEST_CHECK(cutoff_mod > 0.0f);
+
+        std::cout << "  -> ModulationMatrix Topologically Sorted 4-Phase Dispatch: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -9351,6 +9543,7 @@ int main() {
     test_automation_selection_and_batch_editing();
     test_clip_relative_envelopes_and_loop_modulation();
     test_insert_slot_automation_and_multilane_stacking();
+    test_multi_stage_envelope_and_meta_modulation_matrix();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

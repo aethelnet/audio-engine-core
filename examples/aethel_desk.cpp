@@ -500,6 +500,33 @@ int main(int argc, char** argv) {
     float wasm_param1 = 0.55f;
     float wasm_param2 = 0.30f;
 
+    // Modulator Lab & Meta-Modulation Engine state
+    modulation::ModulationMatrix mod_matrix;
+    mod_matrix.init(kSampleRate);
+    mod_matrix.mseg1().preset_percussive_hihat();
+    mod_matrix.mseg2().preset_plucked_synth();
+    mod_matrix.lfo1().set_waveform(modulation::LfoWaveform::Sine);
+    mod_matrix.lfo1().set_frequency_hz(3.0f);
+    mod_matrix.lfo1().set_depth(0.85f);
+    mod_matrix.lfo2().set_waveform(modulation::LfoWaveform::SmoothRandom);
+    mod_matrix.lfo2().set_beat_sync(true);
+    mod_matrix.lfo2().set_beats_per_cycle(1.0);
+    mod_matrix.lfo2().set_depth(0.6f);
+
+    // Initial Default Routes:
+    // Route 0: LFO 1 -> MSEG 1 Attack (Modulating the Modulator! User's explicit request)
+    mod_matrix.set_route(0, modulation::ModulationSource::LFO1, modulation::ModulationDestination::MSEG1_Attack, 1.5f, true);
+    // Route 1: MSEG 1 -> Synth Cutoff
+    mod_matrix.set_route(1, modulation::ModulationSource::MSEG1, modulation::ModulationDestination::SynthCutoff, 0.75f, true);
+    // Route 2: Velocity -> MSEG 1 Level
+    mod_matrix.set_route(2, modulation::ModulationSource::Velocity, modulation::ModulationDestination::MSEG1_Level, 0.5f, true);
+    // Route 3: LFO 2 -> LFO 1 Rate (FM between modulators)
+    mod_matrix.set_route(3, modulation::ModulationSource::LFO2, modulation::ModulationDestination::LFO1_Rate, 0.35f, true);
+
+    int selected_modulator = 0; // 0=MSEG1 (Hi-Hat), 1=MSEG2 (Lead), 2=LFO1, 3=LFO2
+    int selected_mseg_node = 0;
+    float mod_preview_vel = 0.9f;
+
     // Universal Routing Matrix state: Pre-connect Track 1 Kick -> Track 2 Acid SC (120Hz Cytomic SVF)
     mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
     uint32_t selected_patch_id = 1;
@@ -621,6 +648,12 @@ int main(int argc, char** argv) {
                     playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
                 }
             }
+        }
+
+        // Advance Modulator Matrix at audio clock rate for real-time visual feedback
+        uint32_t mod_sim_frames = std::clamp(static_cast<uint32_t>(dt * 48000.0f), 1u, 1024u);
+        for (uint32_t s = 0; s < mod_sim_frames; ++s) {
+            mod_matrix.evaluate_sample(bpm);
         }
 
         // Lock-free telemetry query
@@ -4228,6 +4261,465 @@ int main(int argc, char** argv) {
                         wasm_tripped = !wasm_tripped;
                         wasm_gas_used = wasm_tripped ? 25.0f : 9.4f;
                     }
+
+                    ImGui::EndTabItem();
+                }
+
+                // ------------------------------------------------------------
+                // TAB 5: MODULATOR LAB // MSEG & LFO MATRIX
+                // ------------------------------------------------------------
+                if (ImGui::BeginTabItem("  MODULATOR LAB // MSEG & LFO MATRIX  ")) {
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
+                                       "Orderly Architect: Multi-Stage Envelope (MSEG) & Meta-Modulation Engine");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("| Bitwig Dragless Modulation Rings • Buchla/Maths Function Generator • Zero-Allocation RCU");
+                    ImGui::Separator();
+
+                    // Header Status & Trigger Bar
+                    ImGui::Text("Voice Trigger Preview:");
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ▶ NOTE ON (Vel 90%) ", ImVec2(160, 24))) {
+                        mod_matrix.note_on(mod_preview_vel);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ▶ SOFT TAP (Vel 35%) ", ImVec2(160, 24))) {
+                        mod_matrix.note_on(0.35f);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ■ NOTE OFF / RELEASE ", ImVec2(160, 24))) {
+                        mod_matrix.note_off();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ⟳ RETRIGGER HI-HAT ", ImVec2(160, 24))) {
+                        mod_matrix.mseg1_voice().trigger(mod_preview_vel);
+                    }
+
+                    ImGui::SameLine(0, 20);
+                    // Voice 1 & 2 live status
+                    auto stage_name = [](modulation::MsegStage st) -> const char* {
+                        switch (st) {
+                            case modulation::MsegStage::Idle: return "IDLE";
+                            case modulation::MsegStage::Attack: return "ATTACK";
+                            case modulation::MsegStage::Decay: return "DECAY";
+                            case modulation::MsegStage::Sustain: return "SUSTAIN";
+                            case modulation::MsegStage::Release: return "RELEASE";
+                        }
+                        return "OFF";
+                    };
+                    ImVec4 stage1_col = mod_matrix.mseg1_voice().is_active() ? ImVec4(0.12f, 0.38f, 0.85f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                    ImVec4 stage2_col = mod_matrix.mseg2_voice().is_active() ? ImVec4(0.85f, 0.48f, 0.05f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                    ImGui::TextColored(stage1_col, "[MSEG 1: %s | Val: %.2f]", stage_name(mod_matrix.mseg1_voice().stage()), mod_matrix.mseg1_voice().current_value());
+                    ImGui::SameLine();
+                    ImGui::TextColored(stage2_col, "[MSEG 2: %s | Val: %.2f]", stage_name(mod_matrix.mseg2_voice().stage()), mod_matrix.mseg2_voice().current_value());
+
+                    ImGui::Separator();
+
+                    // Modulator Selector Buttons
+                    const char* mod_tabs[4] = {
+                        "MSEG 1: Hi-Hat Percussion",
+                        "MSEG 2: Plucked Lead / Mod",
+                        "LFO 1: Primary Oscillator",
+                        "LFO 2: BeatSync Slew Random"
+                    };
+                    for (int m = 0; m < 4; ++m) {
+                        if (m > 0) ImGui::SameLine();
+                        bool is_sel = (selected_modulator == m);
+                        if (is_sel) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 0.9f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        }
+                        if (ImGui::Button(mod_tabs[m], ImVec2(200, 26))) {
+                            selected_modulator = m;
+                        }
+                        if (is_sel) {
+                            ImGui::PopStyleColor(2);
+                        }
+                    }
+
+                    ImGui::Spacing();
+
+                    // Split into Top (Inspector & Curve Editor) and Bottom (Modulation Matrix Table)
+                    const float content_h = ImGui::GetContentRegionAvail().y;
+                    const float top_h = std::max(220.0f, content_h * 0.52f);
+                    const float bot_h = std::max(160.0f, content_h - top_h - 10.0f);
+
+                    ImGui::BeginChild("ModulatorTopSection", ImVec2(0, top_h), false);
+                    {
+                        // Left column: Modulator Controls (Inspector)
+                        ImGui::BeginChild("ModulatorInspector", ImVec2(320, 0), true);
+                        {
+                            if (selected_modulator == 0 || selected_modulator == 1) {
+                                auto& cur_mseg = (selected_modulator == 0) ? mod_matrix.mseg1() : mod_matrix.mseg2();
+
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "%s PARAMETERS",
+                                                   (selected_modulator == 0) ? "MSEG 1 (PERCUSSIVE)" : "MSEG 2 (LEAD)");
+                                ImGui::Separator();
+
+                                // Presets
+                                ImGui::Text("Curated Presets:");
+                                if (ImGui::Button("Hi-Hat (75ms)")) {
+                                    cur_mseg.preset_percussive_hihat();
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Plucked")) {
+                                    cur_mseg.preset_plucked_synth();
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Pad Swell")) {
+                                    cur_mseg.preset_pad_swell();
+                                }
+                                if (ImGui::Button("Wobble LFO")) {
+                                    cur_mseg.preset_wobble_lfo();
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Buchla Maths")) {
+                                    cur_mseg.preset_buchla_maths();
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Text("Domain / Timing:");
+                                bool is_beats = (cur_mseg.time_mode() == modulation::MsegTimeMode::BeatSync);
+                                if (ImGui::RadioButton("Milliseconds", !is_beats)) {
+                                    auto pts = cur_mseg.get_points();
+                                    cur_mseg.set_points(pts, modulation::MsegTimeMode::Milliseconds, cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::RadioButton("Beat-Sync", is_beats)) {
+                                    auto pts = cur_mseg.get_points();
+                                    cur_mseg.set_points(pts, modulation::MsegTimeMode::BeatSync, cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                }
+
+                                ImGui::Text("Loop Topology:");
+                                int loop_m = static_cast<int>(cur_mseg.loop_mode());
+                                if (ImGui::RadioButton("OneShot", loop_m == 0)) {
+                                    auto pts = cur_mseg.get_points();
+                                    cur_mseg.set_points(pts, cur_mseg.time_mode(), modulation::MsegLoopMode::OneShot, cur_mseg.sustain_index());
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::RadioButton("Sustain", loop_m == 1)) {
+                                    auto pts = cur_mseg.get_points();
+                                    cur_mseg.set_points(pts, cur_mseg.time_mode(), modulation::MsegLoopMode::SustainLoop, cur_mseg.sustain_index());
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::RadioButton("FreeRun", loop_m == 2)) {
+                                    auto pts = cur_mseg.get_points();
+                                    cur_mseg.set_points(pts, cur_mseg.time_mode(), modulation::MsegLoopMode::FreeRunLoop, cur_mseg.sustain_index());
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "Meta-Modulation Inputs (Modulated Macros):");
+
+                                // Base Attack Scale
+                                float base_atk = cur_mseg.base_attack_scale();
+                                float eff_atk = cur_mseg.effective_attack_scale();
+                                float mod_atk = eff_atk - base_atk;
+                                const char* atk_badge = (selected_modulator == 0) ? "LFO 1" : "Mod";
+                                if (ui::DrawModulatedSlider("Attack Scale", &base_atk, 0.05f, 5.0f, mod_atk, "%.2fx", atk_badge, 280.0f)) {
+                                    cur_mseg.set_base_attack_scale(base_atk);
+                                }
+
+                                // Base Decay Scale
+                                float base_dec = cur_mseg.base_decay_scale();
+                                float eff_dec = cur_mseg.effective_decay_scale();
+                                float mod_dec = eff_dec - base_dec;
+                                if (ui::DrawModulatedSlider("Decay Scale", &base_dec, 0.05f, 5.0f, mod_dec, "%.2fx", nullptr, 280.0f)) {
+                                    cur_mseg.set_base_decay_scale(base_dec);
+                                }
+
+                                // Base Speed / TimeScale
+                                float base_spd = cur_mseg.base_time_scale();
+                                float eff_spd = cur_mseg.effective_time_scale();
+                                float mod_spd = eff_spd - base_spd;
+                                if (ui::DrawModulatedSlider("Time Scale (Speed)", &base_spd, 0.1f, 5.0f, mod_spd, "%.2fx", nullptr, 280.0f)) {
+                                    cur_mseg.set_base_time_scale(base_spd);
+                                }
+
+                                // Level Scale
+                                float base_lvl = cur_mseg.base_level_scale();
+                                float eff_lvl = cur_mseg.effective_level_scale();
+                                float mod_lvl = eff_lvl - base_lvl;
+                                if (ui::DrawModulatedSlider("Level Scale", &base_lvl, 0.0f, 2.0f, mod_lvl, "%.2f", nullptr, 280.0f)) {
+                                    cur_mseg.set_base_level_scale(base_lvl);
+                                }
+
+                                // Curvature Tension Offset
+                                float base_tens = cur_mseg.base_tension_offset();
+                                float eff_tens = cur_mseg.effective_tension_offset();
+                                float mod_tens = eff_tens - base_tens;
+                                if (ui::DrawModulatedSlider("Tension Bias", &base_tens, -1.0f, 1.0f, mod_tens, "%+.2f", nullptr, 280.0f)) {
+                                    cur_mseg.set_base_tension_offset(base_tens);
+                                }
+                            } else {
+                                // LFO 1 or LFO 2
+                                auto& cur_lfo = (selected_modulator == 2) ? mod_matrix.lfo1() : mod_matrix.lfo2();
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "%s PARAMETERS",
+                                                   (selected_modulator == 2) ? "LFO 1 (PRIMARY)" : "LFO 2 (SECONDARY)");
+                                ImGui::Separator();
+
+                                const char* wf_labels[] = { "Sine", "Triangle", "Saw Up", "Saw Down", "Square", "Sample & Hold", "Smooth Random Walk" };
+                                int cur_wf = static_cast<int>(cur_lfo.waveform());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::Combo("Waveform", &cur_wf, wf_labels, 7)) {
+                                    cur_lfo.set_waveform(static_cast<modulation::LfoWaveform>(cur_wf));
+                                }
+
+                                bool sync = cur_lfo.is_beat_sync();
+                                if (ImGui::Checkbox("Beat Sync", &sync)) {
+                                    cur_lfo.set_beat_sync(sync);
+                                }
+
+                                if (sync) {
+                                    const char* beat_rates[] = { "1/16 (0.25)", "1/8 (0.50)", "1/4 (1.00)", "1/2 (2.00)", "1 Bar (4.00)", "2 Bars (8.00)" };
+                                    const double beat_vals[] = { 0.25, 0.50, 1.00, 2.00, 4.00, 8.00 };
+                                    int b_idx = 2;
+                                    double cur_b = cur_lfo.beats_per_cycle();
+                                    for (int i = 0; i < 6; ++i) {
+                                        if (std::abs(cur_b - beat_vals[i]) < 0.05) b_idx = i;
+                                    }
+                                    ImGui::SetNextItemWidth(260);
+                                    if (ImGui::Combo("Beats / Cycle", &b_idx, beat_rates, 6)) {
+                                        cur_lfo.set_beats_per_cycle(beat_vals[b_idx]);
+                                    }
+                                } else {
+                                    float hz = cur_lfo.frequency_hz();
+                                    float eff_hz = cur_lfo.effective_rate_hz();
+                                    float mod_hz = eff_hz - hz;
+                                    if (ui::DrawModulatedSlider("Rate (Hz)", &hz, 0.05f, 50.0f, mod_hz, "%.2f Hz", "FM", 260.0f)) {
+                                        cur_lfo.set_frequency_hz(hz);
+                                    }
+                                }
+
+                                float depth = cur_lfo.depth();
+                                float eff_depth = cur_lfo.effective_depth();
+                                float mod_depth = eff_depth - depth;
+                                if (ui::DrawModulatedSlider("Depth", &depth, 0.0f, 1.0f, mod_depth, "%.2f", "AM", 260.0f)) {
+                                    cur_lfo.set_depth(depth);
+                                }
+
+                                bool bp = cur_lfo.is_bipolar();
+                                if (ImGui::Checkbox("Bipolar [-1.0 .. +1.0]", &bp)) {
+                                    cur_lfo.set_bipolar(bp);
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Text("Real-Time Output: ");
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "%+.3f", cur_lfo.current_value());
+                            }
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::SameLine();
+
+                        // Right column: Canvas (MSEG Spline Canvas or LFO Scope)
+                        ImGui::BeginChild("ModulatorCanvasPanel", ImVec2(0, 0), true);
+                        {
+                            if (selected_modulator == 0 || selected_modulator == 1) {
+                                auto& cur_mseg = (selected_modulator == 0) ? mod_matrix.mseg1() : mod_matrix.mseg2();
+                                auto& cur_voice = (selected_modulator == 0) ? mod_matrix.mseg1_voice() : mod_matrix.mseg2_voice();
+
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
+                                                   "BREAKPOINT SPLINE EDITOR // %s (Drag Nodes, Drag Tension Dots, Double-Click Add, Right-Click Delete)",
+                                                   (selected_modulator == 0) ? "MSEG 1 (PERCUSSIVE VOICE)" : "MSEG 2 (LEAD VOICE)");
+
+                                const float canvas_h = top_h - 68.0f;
+                                ui::DrawMsegCurveEditor("##MsegCanvas", cur_mseg, &cur_voice, ImVec2(0, canvas_h), &selected_mseg_node, true);
+
+                                // Node Inspector Footer
+                                auto pts = cur_mseg.get_points();
+                                if (selected_mseg_node >= 0 && selected_mseg_node < static_cast<int>(pts.size())) {
+                                    const auto& pt = pts[selected_mseg_node];
+                                    ImGui::Text("Selected Node #%d: Time: %.2f %s | Value: %.2f | Tension: %+.2f | Mode: %s",
+                                                selected_mseg_node,
+                                                pt.time,
+                                                (cur_mseg.time_mode() == modulation::MsegTimeMode::BeatSync) ? "beats" : "ms",
+                                                pt.value,
+                                                pt.tension,
+                                                (pt.node_mode == routing::NodeMode::Smooth) ? "Smooth (Hermite)" :
+                                                ((pt.node_mode == routing::NodeMode::Corner) ? "Corner (Linear)" : "Hold (Step)"));
+                                    ImGui::SameLine(0, 20);
+                                    if (ImGui::Button("Toggle Node Mode")) {
+                                        auto mod_pts = pts;
+                                        if (mod_pts[selected_mseg_node].node_mode == routing::NodeMode::Smooth) {
+                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Corner;
+                                        } else if (mod_pts[selected_mseg_node].node_mode == routing::NodeMode::Corner) {
+                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Hold;
+                                        } else {
+                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Smooth;
+                                        }
+                                        cur_mseg.set_points(mod_pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Set as Sustain Node")) {
+                                        cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), selected_mseg_node);
+                                    }
+                                }
+                            } else {
+                                // LFO Visualizer
+                                auto& cur_lfo = (selected_modulator == 2) ? mod_matrix.lfo1() : mod_matrix.lfo2();
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
+                                                   "LFO OSCILLOSCOPE // %s",
+                                                   (selected_modulator == 2) ? "LFO 1 (PRIMARY)" : "LFO 2 (SECONDARY)");
+                                const float scope_h = top_h - 40.0f;
+                                ui::DrawLfoOscilloscope("##LfoOsc", cur_lfo, ImVec2(0, scope_h));
+                            }
+                        }
+                        ImGui::EndChild();
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::Spacing();
+
+                    // Bottom section: 16-Route Modulation Matrix Table
+                    ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "BITWIG MODULATION MATRIX // 16 MODULATION ROUTES");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("| Direct Modulator-to-Modulator Routing (Meta-Modulation) & Synth Targets");
+
+                    ImGui::BeginChild("ModulationTableChild", ImVec2(0, bot_h), true);
+                    {
+                        struct ModSourceChoice {
+                            modulation::ModulationSource src;
+                            const char* name;
+                        };
+                        static const ModSourceChoice kSrcChoices[10] = {
+                            { modulation::ModulationSource::None,      "-- None --" },
+                            { modulation::ModulationSource::LFO1,      "LFO 1 (Free Osc)" },
+                            { modulation::ModulationSource::LFO2,      "LFO 2 (BeatSync / Slew)" },
+                            { modulation::ModulationSource::MSEG1,     "MSEG 1 (Voice Env)" },
+                            { modulation::ModulationSource::MSEG2,     "MSEG 2 (Mod Env)" },
+                            { modulation::ModulationSource::Velocity,  "Velocity" },
+                            { modulation::ModulationSource::KeyTrack,  "Key Tracking" },
+                            { modulation::ModulationSource::ModWheel,  "Mod Wheel (CC 1)" },
+                            { modulation::ModulationSource::PitchBend, "Pitch Bend" },
+                            { modulation::ModulationSource::RandomSH,  "Random S&H" }
+                        };
+
+                        struct ModDestChoice {
+                            modulation::ModulationDestination dst;
+                            const char* name;
+                        };
+                        static const ModDestChoice kDstChoices[21] = {
+                            { modulation::ModulationDestination::None,              "-- None --" },
+                            { modulation::ModulationDestination::MSEG1_Attack,      "MSEG 1: Attack Time (Meta-Mod)" },
+                            { modulation::ModulationDestination::MSEG1_Decay,       "MSEG 1: Decay Time (Meta-Mod)" },
+                            { modulation::ModulationDestination::MSEG1_TimeScale,   "MSEG 1: Speed / TimeScale" },
+                            { modulation::ModulationDestination::MSEG1_Level,       "MSEG 1: Level / Amplitude" },
+                            { modulation::ModulationDestination::MSEG1_Tension,     "MSEG 1: Tension / Curvature" },
+                            { modulation::ModulationDestination::MSEG2_Attack,      "MSEG 2: Attack Time (Meta-Mod)" },
+                            { modulation::ModulationDestination::MSEG2_Decay,       "MSEG 2: Decay Time (Meta-Mod)" },
+                            { modulation::ModulationDestination::MSEG2_TimeScale,   "MSEG 2: Speed / TimeScale" },
+                            { modulation::ModulationDestination::MSEG2_Level,       "MSEG 2: Level / Amplitude" },
+                            { modulation::ModulationDestination::MSEG2_Tension,     "MSEG 2: Tension / Curvature" },
+                            { modulation::ModulationDestination::LFO1_Rate,         "LFO 1: Frequency / Rate (FM)" },
+                            { modulation::ModulationDestination::LFO1_Depth,        "LFO 1: Depth (AM)" },
+                            { modulation::ModulationDestination::LFO2_Rate,         "LFO 2: Frequency / Rate (FM)" },
+                            { modulation::ModulationDestination::LFO2_Depth,        "LFO 2: Depth (AM)" },
+                            { modulation::ModulationDestination::SynthCutoff,       "Synth: Filter Cutoff" },
+                            { modulation::ModulationDestination::SynthResonance,    "Synth: Filter Resonance" },
+                            { modulation::ModulationDestination::SynthPitch,        "Synth: Pitch / Detune" },
+                            { modulation::ModulationDestination::SynthAmp,          "Synth: Amplifier Level" },
+                            { modulation::ModulationDestination::TrackSlot0_Param0, "Insert Slot 0: Param 0" },
+                            { modulation::ModulationDestination::TrackSlot0_Param1, "Insert Slot 0: Param 1" }
+                        };
+
+                        if (ImGui::BeginTable("ModMatrixTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                            ImGui::TableSetupColumn("Active", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+                            ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                            ImGui::TableSetupColumn("Destination", ImGuiTableColumnFlags_WidthFixed, 230.0f);
+                            ImGui::TableSetupColumn("Amount", ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("Live Signal", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                            ImGui::TableHeadersRow();
+
+                            const char* src_names[10];
+                            for (int i = 0; i < 10; ++i) src_names[i] = kSrcChoices[i].name;
+
+                            const char* dst_names[21];
+                            for (int i = 0; i < 21; ++i) dst_names[i] = kDstChoices[i].name;
+
+                            auto& routes = mod_matrix.routes();
+                            for (size_t r = 0; r < modulation::ModulationMatrix::kMaxRoutes; ++r) {
+                                auto& route = routes[r];
+                                ImGui::TableNextRow();
+
+                                // Column 0: Index
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Text("%zu", r + 1);
+
+                                // Column 1: Active
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::PushID(static_cast<int>(r));
+                                ImGui::Checkbox("##act", &route.active);
+
+                                // Column 2: Source
+                                ImGui::TableSetColumnIndex(2);
+                                int cur_src_idx = 0;
+                                for (int s = 0; s < 10; ++s) {
+                                    if (kSrcChoices[s].src == route.source) cur_src_idx = s;
+                                }
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::Combo("##src", &cur_src_idx, src_names, 10)) {
+                                    route.source = kSrcChoices[cur_src_idx].src;
+                                }
+
+                                // Column 3: Destination
+                                ImGui::TableSetColumnIndex(3);
+                                int cur_dst_idx = 0;
+                                for (int d = 0; d < 21; ++d) {
+                                    if (kDstChoices[d].dst == route.destination) cur_dst_idx = d;
+                                }
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::Combo("##dst", &cur_dst_idx, dst_names, 21)) {
+                                    route.destination = kDstChoices[cur_dst_idx].dst;
+                                }
+
+                                // Column 4: Amount
+                                ImGui::TableSetColumnIndex(4);
+                                ImGui::SetNextItemWidth(-1);
+                                ImGui::SliderFloat("##amt", &route.amount, -1.0f, 1.0f, "%+.2f");
+
+                                // Column 5: Live Signal Meter
+                                ImGui::TableSetColumnIndex(5);
+                                float src_sig = 0.0f;
+                                switch (route.source) {
+                                    case modulation::ModulationSource::LFO1: src_sig = mod_matrix.lfo1().current_value(); break;
+                                    case modulation::ModulationSource::LFO2: src_sig = mod_matrix.lfo2().current_value(); break;
+                                    case modulation::ModulationSource::MSEG1: src_sig = mod_matrix.mseg1_voice().current_value(); break;
+                                    case modulation::ModulationSource::MSEG2: src_sig = mod_matrix.mseg2_voice().current_value(); break;
+                                    case modulation::ModulationSource::Velocity: src_sig = mod_preview_vel; break;
+                                    case modulation::ModulationSource::KeyTrack: src_sig = 0.5f; break;
+                                    default: src_sig = 0.0f; break;
+                                }
+                                float live_delta = route.active ? (src_sig * route.amount) : 0.0f;
+
+                                // Draw miniature bi-directional meter
+                                ImDrawList* dl = ImGui::GetWindowDrawList();
+                                ImVec2 m_pos = ImGui::GetCursorScreenPos();
+                                const float m_w = 120.0f;
+                                const float m_h = 16.0f;
+                                dl->AddRectFilled(m_pos, ImVec2(m_pos.x + m_w, m_pos.y + m_h), ImColor(230, 234, 240, 255), 1.0f);
+                                const float center_x = m_pos.x + m_w * 0.5f;
+                                dl->AddLine(ImVec2(center_x, m_pos.y), ImVec2(center_x, m_pos.y + m_h), ImColor(180, 185, 195, 255), 1.0f);
+
+                                float bar_x = center_x + std::clamp(live_delta, -1.0f, 1.0f) * (m_w * 0.5f);
+                                ImU32 bar_col = (route.destination <= modulation::ModulationDestination::LFO2_Depth) ?
+                                                ImColor(217, 123, 13, 230) : ImColor(31, 97, 217, 230);
+                                if (std::abs(bar_x - center_x) > 1.0f) {
+                                    dl->AddRectFilled(ImVec2(std::min(center_x, bar_x), m_pos.y + 2.0f),
+                                                      ImVec2(std::max(center_x, bar_x), m_pos.y + m_h - 2.0f),
+                                                      bar_col, 1.0f);
+                                }
+                                char num_tag[16];
+                                std::snprintf(num_tag, sizeof(num_tag), "%+.2f", live_delta);
+                                dl->AddText(ImVec2(m_pos.x + 4.0f, m_pos.y + 1.0f), ImColor(26, 30, 40, 200), num_tag);
+
+                                ImGui::Dummy(ImVec2(m_w, m_h));
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                    ImGui::EndChild();
 
                     ImGui::EndTabItem();
                 }

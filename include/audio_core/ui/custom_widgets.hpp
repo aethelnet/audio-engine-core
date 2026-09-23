@@ -4,7 +4,11 @@
 #include "imgui_internal.h"
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/sampling/waveform_overview.hpp"
+#include "audio_core/modulation/multi_stage_envelope.hpp"
+#include "audio_core/modulation/modulation_lfo.hpp"
+#include "audio_core/modulation/modulation_matrix.hpp"
 #include <cmath>
+#include <numbers>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -1349,6 +1353,499 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         draw_list->AddCircleFilled(ImVec2(hx, val_to_y(cur_v)), 4.5f, ImColor(220, 38, 38, 255));
     }
 
+    return modified;
+}
+
+// ============================================================================
+// Bitwig-Style Modulated Parameter Slider
+// Base value slider + modulation excursion ribbon + live modulated needle indicator
+// ============================================================================
+inline bool DrawModulatedSlider(const char* label,
+                                float* base_val,
+                                float min_val,
+                                float max_val,
+                                float mod_offset,
+                                const char* format = "%.2f",
+                                const char* source_badge = nullptr,
+                                float width = 220.0f) {
+    ImGui::PushID(label);
+    ImGui::BeginGroup();
+
+    // 1. Label and Live Effective Value Badge
+    const float eff_val = std::clamp(*base_val + mod_offset, min_val, max_val);
+    const bool has_mod = (std::abs(mod_offset) > 0.001f);
+
+    ImGui::TextUnformatted(label);
+    if (has_mod) {
+        ImGui::SameLine();
+        if (source_badge) {
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "[%s: %+.2f]", source_badge, mod_offset);
+        } else {
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "[%+.2f]", mod_offset);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("-> Eff:");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), format, eff_val);
+    }
+
+    // 2. Base Slider
+    ImGui::SetNextItemWidth(width);
+    bool changed = ImGui::SliderFloat("##slider", base_val, min_val, max_val, format);
+
+    // 3. Bitwig-Style Modulation Arc / Ribbon under the slider
+    if (has_mod) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float ribbon_h = 4.0f;
+        ImVec2 p1 = ImVec2(p0.x + width, p0.y + ribbon_h);
+
+        // Background groove
+        dl->AddRectFilled(p0, p1, ImColor(220, 224, 230, 255), 1.0f);
+
+        // Normalize positions
+        const float range = std::max(1e-4f, max_val - min_val);
+        const float norm_base = std::clamp((*base_val - min_val) / range, 0.0f, 1.0f);
+        const float norm_eff  = std::clamp((eff_val - min_val) / range, 0.0f, 1.0f);
+
+        const float x_base = p0.x + norm_base * width;
+        const float x_eff  = p0.x + norm_eff * width;
+
+        // Modulation spread band (Amber ribbon)
+        const float ribbon_left = std::min(x_base, x_eff);
+        const float ribbon_right = std::max(x_base, x_eff);
+        dl->AddRectFilled(ImVec2(ribbon_left, p0.y), ImVec2(ribbon_right, p1.y),
+                          ImColor(217, 123, 13, 220), 1.0f);
+
+        // Base tick indicator (Cobalt vertical tick)
+        dl->AddLine(ImVec2(x_base, p0.y - 1.0f), ImVec2(x_base, p1.y + 1.0f),
+                    ImColor(31, 97, 217, 255), 1.5f);
+
+        // Live needle (Crimson glowing pip)
+        dl->AddCircleFilled(ImVec2(x_eff, p0.y + ribbon_h * 0.5f), 3.0f,
+                            ImColor(217, 46, 56, 255));
+
+        ImGui::Dummy(ImVec2(width, ribbon_h + 2.0f));
+    }
+
+    ImGui::EndGroup();
+    ImGui::PopID();
+    return changed;
+}
+
+// ============================================================================
+// Precision LFO Visualizer / Oscilloscope
+// Plots 2 full cycles of the waveform + real-time animated phase needle
+// ============================================================================
+inline void DrawLfoOscilloscope(const char* str_id,
+                                const modulation::ModulationLfo& lfo,
+                                ImVec2 size = ImVec2(0, 110)) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return;
+
+    if (size.x <= 0.0f) size.x = ImGui::GetContentRegionAvail().x;
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+    ImGui::ItemSize(bb);
+    ImGuiID id = window->GetID(str_id);
+    if (!ImGui::ItemAdd(bb, id)) return;
+
+    ImDrawList* dl = window->DrawList;
+    const float x = pos.x;
+    const float y = pos.y;
+    const float w = size.x;
+    const float h = size.y;
+
+    // Recessed background slot
+    dl->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(240, 243, 246, 255), 3.0f);
+    dl->AddRect(pos, ImVec2(x + w, y + h), ImColor(199, 204, 214, 255), 3.0f);
+
+    const float pad_x = 10.0f;
+    const float pad_y = 14.0f;
+    const float plot_x0 = x + pad_x;
+    const float plot_x1 = x + w - pad_x;
+    const float plot_y0 = y + pad_y;
+    const float plot_y1 = y + h - pad_y;
+    const float plot_w = plot_x1 - plot_x0;
+    const float plot_h = plot_y1 - plot_y0;
+    const float mid_y = plot_y0 + plot_h * 0.5f;
+
+    // Grid lines (quarter divisions)
+    dl->AddLine(ImVec2(plot_x0, mid_y), ImVec2(plot_x1, mid_y), ImColor(190, 196, 206, 160), 1.0f);
+    for (int q = 1; q < 4; ++q) {
+        float qx = plot_x0 + (static_cast<float>(q) / 4.0f) * plot_w;
+        dl->AddLine(ImVec2(qx, plot_y0), ImVec2(qx, plot_y1), ImColor(210, 215, 222, 120), 1.0f);
+    }
+
+    // Evaluate waveform across 2 full periods
+    constexpr int kSteps = 160;
+    std::vector<ImVec2> pts;
+    pts.reserve(kSteps);
+
+    const auto wf = lfo.waveform();
+    const bool bp = lfo.is_bipolar();
+    const float depth = lfo.effective_depth();
+
+    for (int i = 0; i < kSteps; ++i) {
+        float norm_p = (static_cast<float>(i) / static_cast<float>(kSteps - 1)) * 2.0f;
+        float phase_wrap = norm_p - std::floor(norm_p);
+
+        float raw = 0.0f;
+        switch (wf) {
+            case modulation::LfoWaveform::Sine:
+                raw = std::sin(phase_wrap * 2.0f * std::numbers::pi_v<float>);
+                break;
+            case modulation::LfoWaveform::Triangle:
+                raw = (phase_wrap < 0.5f) ? (4.0f * phase_wrap - 1.0f) : (3.0f - 4.0f * phase_wrap);
+                break;
+            case modulation::LfoWaveform::SawUp:
+                raw = (2.0f * phase_wrap) - 1.0f;
+                break;
+            case modulation::LfoWaveform::SawDown:
+                raw = 1.0f - (2.0f * phase_wrap);
+                break;
+            case modulation::LfoWaveform::Square:
+                raw = (phase_wrap < 0.5f) ? 1.0f : -1.0f;
+                break;
+            case modulation::LfoWaveform::SampleHold:
+            case modulation::LfoWaveform::SmoothRandom:
+                raw = std::sin(phase_wrap * 2.0f * std::numbers::pi_v<float>) * 0.7f +
+                      std::sin(phase_wrap * 6.0f * std::numbers::pi_v<float>) * 0.3f;
+                break;
+        }
+
+        float scaled_v = bp ? (raw * depth) : (((raw * 0.5f + 0.5f) * depth) * 2.0f - 1.0f);
+        float py = mid_y - (scaled_v * 0.45f * plot_h);
+        float px = plot_x0 + (static_cast<float>(i) / static_cast<float>(kSteps - 1)) * plot_w;
+        pts.push_back(ImVec2(px, py));
+    }
+
+    if (pts.size() >= 2) {
+        dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), ImColor(31, 97, 217, 240), 0, 2.0f);
+    }
+
+    // Glowing Live Phase Needle
+    double current_phase = lfo.phase();
+    float live_norm = static_cast<float>(current_phase) * 0.5f; // First cycle in 2-cycle plot
+    float live_x = plot_x0 + live_norm * plot_w;
+    float live_val = lfo.current_value();
+    float live_scaled = bp ? live_val : (live_val * 2.0f - 1.0f);
+    float live_y = mid_y - (live_scaled * 0.45f * plot_h);
+
+    dl->AddLine(ImVec2(live_x, plot_y0), ImVec2(live_x, plot_y1), ImColor(217, 123, 13, 200), 1.5f);
+    dl->AddCircleFilled(ImVec2(live_x, live_y), 5.0f, ImColor(217, 46, 56, 255));
+    dl->AddCircle(ImVec2(live_x, live_y), 8.0f, ImColor(217, 46, 56, 120), 0, 1.5f);
+
+    // Waveform Info Badge in Top Left
+    const char* wf_name = "SINE";
+    switch (wf) {
+        case modulation::LfoWaveform::Sine: wf_name = "SINE OSC"; break;
+        case modulation::LfoWaveform::Triangle: wf_name = "TRIANGLE OSC"; break;
+        case modulation::LfoWaveform::SawUp: wf_name = "RAMP UP"; break;
+        case modulation::LfoWaveform::SawDown: wf_name = "RAMP DOWN"; break;
+        case modulation::LfoWaveform::Square: wf_name = "SQUARE / PULSE"; break;
+        case modulation::LfoWaveform::SampleHold: wf_name = "SAMPLE & HOLD"; break;
+        case modulation::LfoWaveform::SmoothRandom: wf_name = "SMOOTH RANDOM WALK"; break;
+    }
+    dl->AddText(ImVec2(plot_x0 + 6.0f, plot_y0 + 2.0f), ImColor(31, 97, 217, 220), wf_name);
+
+    // Effective Rate & Depth in Top Right
+    char info_str[64];
+    if (lfo.is_beat_sync()) {
+        std::snprintf(info_str, sizeof(info_str), "%.2f Beats | Depth: %.0f%%", lfo.beats_per_cycle(), depth * 100.0f);
+    } else {
+        std::snprintf(info_str, sizeof(info_str), "%.2f Hz | Depth: %.0f%%", lfo.effective_rate_hz(), depth * 100.0f);
+    }
+    ImVec2 txt_sz = ImGui::CalcTextSize(info_str);
+    dl->AddText(ImVec2(plot_x1 - txt_sz.x - 6.0f, plot_y0 + 2.0f), ImColor(26, 30, 40, 200), info_str);
+}
+
+// ============================================================================
+// Multi-Stage Envelope (MSEG) Interactive Curve Editor
+// FontLab-grade Hermite splines, tension handles, real-time voice playhead needle,
+// live meta-modulated ghost curve, and breakpoint insertion/deletion.
+// ============================================================================
+inline bool DrawMsegCurveEditor(const char* str_id,
+                                modulation::MultiStageEnvelope& mseg,
+                                modulation::MsegVoice* voice = nullptr,
+                                ImVec2 size = ImVec2(0, 200),
+                                int* selected_point_out = nullptr,
+                                bool show_ghost_curve = true) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+
+    if (size.x <= 0.0f) size.x = ImGui::GetContentRegionAvail().x;
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+    ImGui::ItemSize(bb);
+    ImGuiID id = window->GetID(str_id);
+    if (!ImGui::ItemAdd(bb, id)) return false;
+
+    ImDrawList* dl = window->DrawList;
+    const float x = pos.x;
+    const float y = pos.y;
+    const float w = size.x;
+    const float h = size.y;
+
+    // Recessed drafting paper canvas
+    dl->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(244, 246, 249, 255), 2.0f);
+    dl->AddRect(pos, ImVec2(x + w, y + h), ImColor(199, 204, 214, 255), 2.0f);
+
+    const float pad_left = 48.0f;
+    const float pad_right = 16.0f;
+    const float pad_top = 22.0f;
+    const float pad_bot = 24.0f;
+
+    const float plot_x0 = x + pad_left;
+    const float plot_x1 = x + w - pad_right;
+    const float plot_y0 = y + pad_top;
+    const float plot_y1 = y + h - pad_bot;
+    const float plot_w = plot_x1 - plot_x0;
+    const float plot_h = plot_y1 - plot_y0;
+
+    auto pts = mseg.get_points();
+    if (pts.empty()) {
+        pts.push_back(modulation::MsegPoint{0.0, 0.0f, routing::NodeMode::Smooth, 0.0f});
+        pts.push_back(modulation::MsegPoint{50.0, 1.0f, routing::NodeMode::Smooth, 0.0f});
+        mseg.set_points(pts);
+    }
+
+    const bool is_beat_sync = (mseg.time_mode() == modulation::MsegTimeMode::BeatSync);
+    const double max_pt_t = pts.back().time;
+    const double total_t = is_beat_sync ? std::max(4.0, max_pt_t * 1.1) : std::max(50.0, max_pt_t * 1.15);
+
+    auto time_to_x = [&](double t) -> float {
+        return plot_x0 + static_cast<float>(std::clamp(t / total_t, 0.0, 1.0)) * plot_w;
+    };
+    auto x_to_time = [&](float px) -> double {
+        return std::clamp(static_cast<double>((px - plot_x0) / plot_w) * total_t, 0.0, total_t);
+    };
+    auto val_to_y = [&](float v) -> float {
+        return plot_y1 - std::clamp(v, 0.0f, 1.0f) * plot_h;
+    };
+    auto y_to_val = [&](float py) -> float {
+        return std::clamp((plot_y1 - py) / plot_h, 0.0f, 1.0f);
+    };
+
+    // 1. Grid Lines & Coordinate Rulers
+    const int num_time_divs = is_beat_sync ? 4 : 5;
+    for (int d = 0; d <= num_time_divs; ++d) {
+        double div_t = (total_t * static_cast<double>(d)) / static_cast<double>(num_time_divs);
+        float gx = time_to_x(div_t);
+        dl->AddLine(ImVec2(gx, plot_y0), ImVec2(gx, plot_y1), ImColor(210, 215, 222, 140), 1.0f);
+
+        char t_str[32];
+        if (is_beat_sync) {
+            std::snprintf(t_str, sizeof(t_str), "%.1f b", div_t);
+        } else {
+            std::snprintf(t_str, sizeof(t_str), "%.0f ms", div_t);
+        }
+        dl->AddText(ImVec2(gx - 12.0f, plot_y1 + 4.0f), ImColor(107, 117, 132, 220), t_str);
+    }
+
+    // Horizontal amplitude lines (0.0, 0.25, 0.5, 0.75, 1.0)
+    for (int a = 0; a <= 4; ++a) {
+        float norm_a = static_cast<float>(a) * 0.25f;
+        float gy = val_to_y(norm_a);
+        dl->AddLine(ImVec2(plot_x0, gy), ImVec2(plot_x1, gy), ImColor(210, 215, 222, 140), 1.0f);
+
+        char a_str[16];
+        std::snprintf(a_str, sizeof(a_str), "%.2f", norm_a);
+        dl->AddText(ImVec2(x + 8.0f, gy - 6.0f), ImColor(107, 117, 132, 220), a_str);
+    }
+
+    // 2. Sustain Loop Indicator
+    const int32_t sus_idx = mseg.sustain_index();
+    if (sus_idx >= 0 && sus_idx < static_cast<int32_t>(pts.size())) {
+        float sx = time_to_x(pts[sus_idx].time);
+        dl->AddLine(ImVec2(sx, plot_y0), ImVec2(sx, plot_y1), ImColor(217, 123, 13, 200), 1.5f);
+        dl->AddText(ImVec2(sx + 4.0f, plot_y0 + 2.0f), ImColor(217, 123, 13, 255), "SUSTAIN");
+    }
+
+    struct MsegDragState {
+        int active_node_idx = -1;
+        int active_tension_idx = -1;
+        int selected_idx = 0;
+    };
+    static std::unordered_map<ImGuiID, MsegDragState> s_drag_states;
+    MsegDragState& state = s_drag_states[id];
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 mouse = io.MousePos;
+    bool is_hovered = bb.Contains(mouse);
+    bool modified = false;
+
+    // 3. Render Evaluated Base Curve
+    auto snap = mseg.snapshot();
+    if (snap) {
+        std::vector<ImVec2> curve_coords;
+        const int steps = static_cast<int>(plot_w * 0.5f);
+        curve_coords.reserve(steps + 1);
+
+        for (int i = 0; i <= steps; ++i) {
+            float px = plot_x0 + (static_cast<float>(i) / static_cast<float>(steps)) * plot_w;
+            double t = x_to_time(px);
+            float v = snap->evaluate(t);
+            curve_coords.push_back(ImVec2(px, val_to_y(v)));
+        }
+
+        // Shaded fill under curve
+        if (curve_coords.size() >= 2) {
+            for (size_t i = 0; i + 1 < curve_coords.size(); ++i) {
+                ImVec2 p0 = curve_coords[i];
+                ImVec2 p1 = curve_coords[i + 1];
+                dl->AddQuadFilled(p0, p1, ImVec2(p1.x, plot_y1), ImVec2(p0.x, plot_y1), ImColor(31, 97, 217, 30));
+            }
+            dl->AddPolyline(curve_coords.data(), static_cast<int>(curve_coords.size()), ImColor(31, 97, 217, 255), 0, 2.5f);
+        }
+
+        // 4. Render Modulated Ghost Curve (When Meta-Modulation is active!)
+        const float eff_atk = mseg.effective_attack_scale();
+        const float eff_dec = mseg.effective_decay_scale();
+        const float eff_tens = mseg.effective_tension_offset();
+        const bool has_macro_mod = (std::abs(eff_atk - 1.0f) > 0.01f || std::abs(eff_dec - 1.0f) > 0.01f || std::abs(eff_tens) > 0.01f);
+
+        if (show_ghost_curve && has_macro_mod) {
+            std::vector<ImVec2> ghost_coords;
+            ghost_coords.reserve(steps + 1);
+            for (int i = 0; i <= steps; ++i) {
+                float px = plot_x0 + (static_cast<float>(i) / static_cast<float>(steps)) * plot_w;
+                double t = x_to_time(px);
+                float v = snap->evaluate(t, eff_atk, eff_dec, 1.0f, eff_tens);
+                ghost_coords.push_back(ImVec2(px, val_to_y(v)));
+            }
+            dl->AddPolyline(ghost_coords.data(), static_cast<int>(ghost_coords.size()), ImColor(217, 123, 13, 220), 0, 2.0f);
+        }
+    }
+
+    // 5. Tension Handle Dots (Midway between consecutive nodes)
+    for (size_t i = 0; i + 1 < pts.size(); ++i) {
+        double mid_t = 0.5 * (pts[i].time + pts[i + 1].time);
+        float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (pts[i].value + pts[i + 1].value);
+        ImVec2 t_pos(time_to_x(mid_t), val_to_y(mid_v));
+
+        const float hit_r = 7.0f;
+        bool is_t_hover = is_hovered && (std::hypot(mouse.x - t_pos.x, mouse.y - t_pos.y) <= hit_r);
+        bool is_t_drag = (state.active_tension_idx == static_cast<int>(i));
+
+        ImU32 t_col = (is_t_drag || is_t_hover) ? ImColor(217, 123, 13, 255) : ImColor(217, 123, 13, 180);
+        dl->AddCircleFilled(t_pos, is_t_hover ? 5.5f : 4.0f, t_col);
+        dl->AddCircle(t_pos, is_t_hover ? 7.0f : 5.0f, ImColor(26, 30, 40, 200), 0, 1.2f);
+
+        if (is_t_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            state.active_tension_idx = static_cast<int>(i);
+        }
+    }
+
+    // Tension dragging execution
+    if (state.active_tension_idx >= 0 && state.active_tension_idx + 1 < static_cast<int>(pts.size())) {
+        if (io.MouseDown[0]) {
+            pts[state.active_tension_idx].tension = std::clamp(pts[state.active_tension_idx].tension - io.MouseDelta.y * 0.015f, -1.0f, 1.0f);
+            mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
+            modified = true;
+        } else {
+            state.active_tension_idx = -1;
+        }
+    }
+
+    // 6. Breakpoint Nodes
+    int hovered_node = -1;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        ImVec2 n_pos(time_to_x(pts[i].time), val_to_y(pts[i].value));
+        const float node_radius = 6.0f;
+        bool is_node_hover = is_hovered && (std::hypot(mouse.x - n_pos.x, mouse.y - n_pos.y) <= node_radius + 3.0f);
+        if (is_node_hover) hovered_node = static_cast<int>(i);
+
+        bool is_selected = (state.selected_idx == static_cast<int>(i));
+        bool is_dragging = (state.active_node_idx == static_cast<int>(i));
+
+        ImU32 n_fill = (is_selected || is_dragging) ? ImColor(31, 97, 217, 255) : ImColor(252, 253, 254, 255);
+        ImU32 n_border = (is_selected || is_dragging) ? ImColor(26, 30, 40, 255) : ImColor(31, 97, 217, 255);
+
+        dl->AddRectFilled(ImVec2(n_pos.x - 5.0f, n_pos.y - 5.0f), ImVec2(n_pos.x + 5.0f, n_pos.y + 5.0f), n_fill, 1.5f);
+        dl->AddRect(ImVec2(n_pos.x - 5.0f, n_pos.y - 5.0f), ImVec2(n_pos.x + 5.0f, n_pos.y + 5.0f), n_border, 1.5f, 0, 1.8f);
+
+        // Node coordinate tag on hover/drag
+        if (is_node_hover || is_dragging) {
+            char tag[48];
+            if (is_beat_sync) {
+                std::snprintf(tag, sizeof(tag), "#%zu: %.2fb, %.2f", i, pts[i].time, pts[i].value);
+            } else {
+                std::snprintf(tag, sizeof(tag), "#%zu: %.1fms, %.2f", i, pts[i].time, pts[i].value);
+            }
+            dl->AddText(ImVec2(n_pos.x + 8.0f, n_pos.y - 14.0f), ImColor(26, 30, 40, 240), tag);
+        }
+    }
+
+    // Node click / drag handling
+    if (hovered_node >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        state.active_node_idx = hovered_node;
+        state.selected_idx = hovered_node;
+        if (selected_point_out) *selected_point_out = hovered_node;
+    }
+
+    if (state.active_node_idx >= 0 && state.active_node_idx < static_cast<int>(pts.size())) {
+        if (io.MouseDown[0]) {
+            double new_t = x_to_time(mouse.x);
+            float new_v = y_to_val(mouse.y);
+
+            size_t idx = static_cast<size_t>(state.active_node_idx);
+            if (idx == 0) {
+                pts[0].time = 0.0;
+                pts[0].value = new_v;
+            } else if (idx == pts.size() - 1) {
+                pts[idx].time = std::max(pts[idx - 1].time + 0.1, new_t);
+                pts[idx].value = new_v;
+            } else {
+                pts[idx].time = std::clamp(new_t, pts[idx - 1].time + 0.1, pts[idx + 1].time - 0.1);
+                pts[idx].value = new_v;
+            }
+            mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
+            modified = true;
+        } else {
+            state.active_node_idx = -1;
+        }
+    }
+
+    // Right click on node to delete
+    if (hovered_node > 0 && hovered_node < static_cast<int>(pts.size() - 1) && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        pts.erase(pts.begin() + hovered_node);
+        mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
+        state.selected_idx = std::min(state.selected_idx, static_cast<int>(pts.size() - 1));
+        modified = true;
+    }
+
+    // Double click to insert node
+    if (is_hovered && hovered_node < 0 && state.active_tension_idx < 0 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        double dbl_t = x_to_time(mouse.x);
+        float dbl_v = y_to_val(mouse.y);
+
+        size_t ins_idx = 0;
+        while (ins_idx < pts.size() && pts[ins_idx].time < dbl_t) {
+            ins_idx++;
+        }
+        pts.insert(pts.begin() + ins_idx, modulation::MsegPoint{dbl_t, dbl_v, routing::NodeMode::Smooth, 0.0f});
+        mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
+        state.selected_idx = static_cast<int>(ins_idx);
+        modified = true;
+    }
+
+    // 7. Real-Time Playhead Needle & Bouncing Bead
+    if (voice && voice->is_active()) {
+        double play_t = voice->playhead_time();
+        if (play_t >= 0.0 && play_t <= total_t) {
+            float px = time_to_x(play_t);
+            dl->AddLine(ImVec2(px, plot_y0), ImVec2(px, plot_y1), ImColor(217, 46, 56, 240), 1.5f);
+            dl->AddTriangleFilled(ImVec2(px - 5.0f, plot_y0), ImVec2(px + 5.0f, plot_y0), ImVec2(px, plot_y0 + 8.0f), ImColor(217, 46, 56, 240));
+
+            float cur_val = voice->current_value();
+            float py = val_to_y(cur_val);
+            dl->AddCircleFilled(ImVec2(px, py), 6.0f, ImColor(217, 46, 56, 255));
+            dl->AddCircle(ImVec2(px, py), 9.0f, ImColor(217, 46, 56, 120), 0, 1.5f);
+        }
+    }
+
+    if (selected_point_out) *selected_point_out = state.selected_idx;
     return modified;
 }
 
