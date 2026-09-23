@@ -4,6 +4,7 @@
 #include "audio_core/mixer_graph.hpp"
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/dsp/processor_factory.hpp"
+#include "audio_core/modulation/modulation_matrix.hpp"
 
 #include <string>
 #include <string_view>
@@ -405,6 +406,253 @@ struct TrackPresetData {
     std::vector<StepTriggerData> sequencer_steps{};
 };
 
+// ============================================================================
+// Modulation Matrix & Polyphonic Synthesizer Session Serialization
+// ============================================================================
+
+struct ModulationRouteData {
+    uint8_t source{0};
+    uint8_t destination{0};
+    float amount{0.0f};
+    bool active{false};
+    bool bipolar{true};
+};
+
+struct LfoData {
+    uint8_t waveform{0};
+    bool bipolar{true};
+    float frequency_hz{1.0f};
+    bool beat_sync{false};
+    double beats_per_cycle{1.0};
+    float depth{1.0f};
+};
+
+struct MsegPointData {
+    double time{0.0};
+    float value{0.0f};
+    uint8_t node_mode{0};
+    float tension{0.0f};
+};
+
+struct MsegData {
+    uint8_t time_mode{0};
+    uint8_t loop_mode{0};
+    int32_t sustain_idx{-1};
+    float base_time_scale{1.0f};
+    float base_attack_scale{1.0f};
+    float base_decay_scale{1.0f};
+    float base_level_scale{1.0f};
+    float base_tension_offset{0.0f};
+    std::vector<MsegPointData> points{};
+};
+
+struct PolySynthData {
+    size_t polyphony_limit{16};
+    uint8_t play_mode{0};
+    uint8_t osc1_waveform{0};
+    uint8_t osc2_waveform{0};
+    float osc_mix{0.5f};
+    float osc2_detune_cents{0.0f};
+    int osc2_octave_offset{0};
+    uint8_t filter_type{0};
+    float base_cutoff{2000.0f};
+    float resonance_q{0.707f};
+    float filter_env_amount{0.0f};
+    float keytrack_amount{0.0f};
+    float velocity_to_filter{0.0f};
+    float velocity_to_amp{1.0f};
+    float voice_pan_spread{0.0f};
+    float glide_time_ms{0.0f};
+    float master_level{1.0f};
+};
+
+struct ModulationMatrixData {
+    std::vector<ModulationRouteData> routes{};
+    LfoData lfo1{};
+    LfoData lfo2{};
+    MsegData mseg1{};
+    MsegData mseg2{};
+    PolySynthData poly_synth{};
+    bool has_data{false};
+
+    [[nodiscard]] std::string to_json(int indent = 2) const {
+        std::ostringstream ss;
+        std::string ind(indent, ' ');
+        std::string ind2(indent + 2, ' ');
+        std::string ind3(indent + 4, ' ');
+
+        ss << "{\n";
+        // Routes
+        ss << ind2 << "\"routes\": [\n";
+        for (size_t i = 0; i < routes.size(); ++i) {
+            const auto& r = routes[i];
+            ss << ind3 << "{\"src\": " << static_cast<int>(r.source)
+               << ", \"dst\": " << static_cast<int>(r.destination)
+               << ", \"amount\": " << r.amount
+               << ", \"active\": " << (r.active ? "true" : "false")
+               << ", \"bipolar\": " << (r.bipolar ? "true" : "false")
+               << "}" << (i + 1 < routes.size() ? ",\n" : "\n");
+        }
+        ss << ind2 << "],\n";
+
+        // LFO1
+        ss << ind2 << "\"lfo1\": {\n";
+        ss << ind3 << "\"waveform\": " << static_cast<int>(lfo1.waveform) << ",\n";
+        ss << ind3 << "\"bipolar\": " << (lfo1.bipolar ? "true" : "false") << ",\n";
+        ss << ind3 << "\"freq_hz\": " << lfo1.frequency_hz << ",\n";
+        ss << ind3 << "\"beat_sync\": " << (lfo1.beat_sync ? "true" : "false") << ",\n";
+        ss << ind3 << "\"beats_per_cycle\": " << lfo1.beats_per_cycle << ",\n";
+        ss << ind3 << "\"depth\": " << lfo1.depth << "\n";
+        ss << ind2 << "},\n";
+
+        // LFO2
+        ss << ind2 << "\"lfo2\": {\n";
+        ss << ind3 << "\"waveform\": " << static_cast<int>(lfo2.waveform) << ",\n";
+        ss << ind3 << "\"bipolar\": " << (lfo2.bipolar ? "true" : "false") << ",\n";
+        ss << ind3 << "\"freq_hz\": " << lfo2.frequency_hz << ",\n";
+        ss << ind3 << "\"beat_sync\": " << (lfo2.beat_sync ? "true" : "false") << ",\n";
+        ss << ind3 << "\"beats_per_cycle\": " << lfo2.beats_per_cycle << ",\n";
+        ss << ind3 << "\"depth\": " << lfo2.depth << "\n";
+        ss << ind2 << "},\n";
+
+        // Helper lambda for MSEG JSON
+        auto dump_mseg = [&](const std::string& name, const MsegData& m, bool has_comma) {
+            ss << ind2 << "\"" << name << "\": {\n";
+            ss << ind3 << "\"time_mode\": " << static_cast<int>(m.time_mode) << ",\n";
+            ss << ind3 << "\"loop_mode\": " << static_cast<int>(m.loop_mode) << ",\n";
+            ss << ind3 << "\"sustain_idx\": " << m.sustain_idx << ",\n";
+            ss << ind3 << "\"base_time_scale\": " << m.base_time_scale << ",\n";
+            ss << ind3 << "\"base_attack_scale\": " << m.base_attack_scale << ",\n";
+            ss << ind3 << "\"base_decay_scale\": " << m.base_decay_scale << ",\n";
+            ss << ind3 << "\"base_level_scale\": " << m.base_level_scale << ",\n";
+            ss << ind3 << "\"base_tension_offset\": " << m.base_tension_offset << ",\n";
+            ss << ind3 << "\"points\": [";
+            for (size_t p = 0; p < m.points.size(); ++p) {
+                const auto& pt = m.points[p];
+                ss << "{\"t\":" << pt.time << ",\"v\":" << pt.value
+                   << ",\"m\":" << static_cast<int>(pt.node_mode) << ",\"tau\":" << pt.tension << "}"
+                   << (p + 1 < m.points.size() ? "," : "");
+            }
+            ss << "]\n";
+            ss << ind2 << "}" << (has_comma ? ",\n" : "\n");
+        };
+
+        dump_mseg("mseg1", mseg1, true);
+        dump_mseg("mseg2", mseg2, true);
+
+        // PolySynth
+        ss << ind2 << "\"poly_synth\": {\n";
+        ss << ind3 << "\"polyphony_limit\": " << poly_synth.polyphony_limit << ",\n";
+        ss << ind3 << "\"play_mode\": " << static_cast<int>(poly_synth.play_mode) << ",\n";
+        ss << ind3 << "\"osc1_waveform\": " << static_cast<int>(poly_synth.osc1_waveform) << ",\n";
+        ss << ind3 << "\"osc2_waveform\": " << static_cast<int>(poly_synth.osc2_waveform) << ",\n";
+        ss << ind3 << "\"osc_mix\": " << poly_synth.osc_mix << ",\n";
+        ss << ind3 << "\"osc2_detune_cents\": " << poly_synth.osc2_detune_cents << ",\n";
+        ss << ind3 << "\"osc2_octave_offset\": " << poly_synth.osc2_octave_offset << ",\n";
+        ss << ind3 << "\"filter_type\": " << static_cast<int>(poly_synth.filter_type) << ",\n";
+        ss << ind3 << "\"base_cutoff\": " << poly_synth.base_cutoff << ",\n";
+        ss << ind3 << "\"resonance_q\": " << poly_synth.resonance_q << ",\n";
+        ss << ind3 << "\"filter_env_amount\": " << poly_synth.filter_env_amount << ",\n";
+        ss << ind3 << "\"keytrack_amount\": " << poly_synth.keytrack_amount << ",\n";
+        ss << ind3 << "\"velocity_to_filter\": " << poly_synth.velocity_to_filter << ",\n";
+        ss << ind3 << "\"velocity_to_amp\": " << poly_synth.velocity_to_amp << ",\n";
+        ss << ind3 << "\"voice_pan_spread\": " << poly_synth.voice_pan_spread << ",\n";
+        ss << ind3 << "\"glide_time_ms\": " << poly_synth.glide_time_ms << ",\n";
+        ss << ind3 << "\"master_level\": " << poly_synth.master_level << "\n";
+        ss << ind2 << "}\n";
+
+        ss << ind << "}";
+        return ss.str();
+    }
+
+    static std::optional<ModulationMatrixData> from_json_val(const json::Value& val) {
+        if (!val.is_object()) return std::nullopt;
+        ModulationMatrixData mdata;
+        mdata.has_data = true;
+
+        if (auto* r_arr = val.get("routes")) {
+            if (r_arr->is_array()) {
+                for (const auto& item : r_arr->arr_val) {
+                    if (!item.is_object()) continue;
+                    ModulationRouteData r;
+                    if (auto* s = item.get("src")) r.source = static_cast<uint8_t>(s->as_uint(0));
+                    if (auto* d = item.get("dst")) r.destination = static_cast<uint8_t>(d->as_uint(0));
+                    if (auto* a = item.get("amount")) r.amount = a->as_float(0.0f);
+                    if (auto* act = item.get("active")) r.active = act->as_bool(false);
+                    if (auto* bp = item.get("bipolar")) r.bipolar = bp->as_bool(true);
+                    mdata.routes.push_back(r);
+                }
+            }
+        }
+
+        auto parse_lfo = [](const json::Value* obj, LfoData& out) {
+            if (!obj || !obj->is_object()) return;
+            if (auto* w = obj->get("waveform")) out.waveform = static_cast<uint8_t>(w->as_uint(0));
+            if (auto* b = obj->get("bipolar")) out.bipolar = b->as_bool(true);
+            if (auto* f = obj->get("freq_hz")) out.frequency_hz = f->as_float(1.0f);
+            if (auto* bs = obj->get("beat_sync")) out.beat_sync = bs->as_bool(false);
+            if (auto* bpc = obj->get("beats_per_cycle")) out.beats_per_cycle = bpc->as_double(1.0);
+            if (auto* d = obj->get("depth")) out.depth = d->as_float(1.0f);
+        };
+
+        parse_lfo(val.get("lfo1"), mdata.lfo1);
+        parse_lfo(val.get("lfo2"), mdata.lfo2);
+
+        auto parse_mseg = [](const json::Value* obj, MsegData& out) {
+            if (!obj || !obj->is_object()) return;
+            if (auto* tm = obj->get("time_mode")) out.time_mode = static_cast<uint8_t>(tm->as_uint(0));
+            if (auto* lm = obj->get("loop_mode")) out.loop_mode = static_cast<uint8_t>(lm->as_uint(0));
+            if (auto* si = obj->get("sustain_idx")) out.sustain_idx = si->as_int(-1);
+            if (auto* bts = obj->get("base_time_scale")) out.base_time_scale = bts->as_float(1.0f);
+            if (auto* bas = obj->get("base_attack_scale")) out.base_attack_scale = bas->as_float(1.0f);
+            if (auto* bds = obj->get("base_decay_scale")) out.base_decay_scale = bds->as_float(1.0f);
+            if (auto* bls = obj->get("base_level_scale")) out.base_level_scale = bls->as_float(1.0f);
+            if (auto* bto = obj->get("base_tension_offset")) out.base_tension_offset = bto->as_float(0.0f);
+
+            if (auto* pa = obj->get("points")) {
+                if (pa->is_array()) {
+                    for (const auto& pv : pa->arr_val) {
+                        if (!pv.is_object()) continue;
+                        MsegPointData ptd;
+                        if (auto* t = pv.get("t")) ptd.time = t->as_double(0.0);
+                        if (auto* v = pv.get("v")) ptd.value = v->as_float(0.0f);
+                        if (auto* m = pv.get("m")) ptd.node_mode = static_cast<uint8_t>(m->as_uint(0));
+                        if (auto* tau = pv.get("tau")) ptd.tension = tau->as_float(0.0f);
+                        out.points.push_back(ptd);
+                    }
+                }
+            }
+        };
+
+        parse_mseg(val.get("mseg1"), mdata.mseg1);
+        parse_mseg(val.get("mseg2"), mdata.mseg2);
+
+        if (auto* ps = val.get("poly_synth")) {
+            if (ps->is_object()) {
+                if (auto* pl = ps->get("polyphony_limit")) mdata.poly_synth.polyphony_limit = pl->as_uint(16);
+                if (auto* pm = ps->get("play_mode")) mdata.poly_synth.play_mode = static_cast<uint8_t>(pm->as_uint(0));
+                if (auto* o1 = ps->get("osc1_waveform")) mdata.poly_synth.osc1_waveform = static_cast<uint8_t>(o1->as_uint(0));
+                if (auto* o2 = ps->get("osc2_waveform")) mdata.poly_synth.osc2_waveform = static_cast<uint8_t>(o2->as_uint(0));
+                if (auto* om = ps->get("osc_mix")) mdata.poly_synth.osc_mix = om->as_float(0.5f);
+                if (auto* od = ps->get("osc2_detune_cents")) mdata.poly_synth.osc2_detune_cents = od->as_float(0.0f);
+                if (auto* oo = ps->get("osc2_octave_offset")) mdata.poly_synth.osc2_octave_offset = oo->as_int(0);
+                if (auto* ft = ps->get("filter_type")) mdata.poly_synth.filter_type = static_cast<uint8_t>(ft->as_uint(0));
+                if (auto* bc = ps->get("base_cutoff")) mdata.poly_synth.base_cutoff = bc->as_float(2000.0f);
+                if (auto* rq = ps->get("resonance_q")) mdata.poly_synth.resonance_q = rq->as_float(0.707f);
+                if (auto* fea = ps->get("filter_env_amount")) mdata.poly_synth.filter_env_amount = fea->as_float(0.0f);
+                if (auto* kta = ps->get("keytrack_amount")) mdata.poly_synth.keytrack_amount = kta->as_float(0.0f);
+                if (auto* vtf = ps->get("velocity_to_filter")) mdata.poly_synth.velocity_to_filter = vtf->as_float(0.0f);
+                if (auto* vta = ps->get("velocity_to_amp")) mdata.poly_synth.velocity_to_amp = vta->as_float(1.0f);
+                if (auto* vps = ps->get("voice_pan_spread")) mdata.poly_synth.voice_pan_spread = vps->as_float(0.0f);
+                if (auto* gt = ps->get("glide_time_ms")) mdata.poly_synth.glide_time_ms = gt->as_float(0.0f);
+                if (auto* ml = ps->get("master_level")) mdata.poly_synth.master_level = ml->as_float(1.0f);
+            }
+        }
+
+        return mdata;
+    }
+};
+
 struct ProjectSessionData {
     std::string project_name{"Untitled Project"};
     uint32_t sample_rate{48000};
@@ -413,6 +661,7 @@ struct ProjectSessionData {
     bool master_limiter_enabled{true};
     RackPresetData master_rack{};
     std::vector<TrackPresetData> tracks{};
+    std::optional<ModulationMatrixData> modulation_matrix{std::nullopt};
 
     [[nodiscard]] std::string to_json() const {
         std::ostringstream ss;
@@ -538,8 +787,11 @@ struct ProjectSessionData {
             ss << "      ]\n";
             ss << "    }" << (t + 1 < tracks.size() ? ",\n" : "\n");
         }
-        ss << "  ]\n";
-        ss << "}";
+        ss << "  ]";
+        if (modulation_matrix.has_value()) {
+            ss << ",\n  \"modulation_matrix\": " << modulation_matrix->to_json(2);
+        }
+        ss << "\n}";
         return ss.str();
     }
 
@@ -687,6 +939,11 @@ struct ProjectSessionData {
                 }
             }
         }
+
+        if (auto* mm_val = val.get("modulation_matrix")) {
+            data.modulation_matrix = ModulationMatrixData::from_json_val(*mm_val);
+        }
+
         return data;
     }
 };
@@ -739,13 +996,177 @@ public:
         }
     }
 
-    static ProjectSessionData extract_session(const MixerGraph& mixer, const clock::TimelineClock& clock, const std::string& name = "Untitled Project") {
+    static ModulationMatrixData extract_modulation_matrix(const modulation::ModulationMatrix& matrix) {
+        ModulationMatrixData mdata;
+        mdata.has_data = true;
+
+        for (const auto& r : matrix.routes()) {
+            if (r.active || r.source != modulation::ModulationSource::None) {
+                mdata.routes.push_back(ModulationRouteData{
+                    .source = static_cast<uint8_t>(r.source),
+                    .destination = static_cast<uint8_t>(r.destination),
+                    .amount = r.amount,
+                    .active = r.active,
+                    .bipolar = r.bipolar
+                });
+            }
+        }
+
+        const auto& lfo1 = matrix.lfo1();
+        mdata.lfo1.waveform = static_cast<uint8_t>(lfo1.waveform());
+        mdata.lfo1.bipolar = lfo1.is_bipolar();
+        mdata.lfo1.frequency_hz = lfo1.frequency_hz();
+        mdata.lfo1.beat_sync = lfo1.is_beat_sync();
+        mdata.lfo1.beats_per_cycle = lfo1.beats_per_cycle();
+        mdata.lfo1.depth = lfo1.depth();
+
+        const auto& lfo2 = matrix.lfo2();
+        mdata.lfo2.waveform = static_cast<uint8_t>(lfo2.waveform());
+        mdata.lfo2.bipolar = lfo2.is_bipolar();
+        mdata.lfo2.frequency_hz = lfo2.frequency_hz();
+        mdata.lfo2.beat_sync = lfo2.is_beat_sync();
+        mdata.lfo2.beats_per_cycle = lfo2.beats_per_cycle();
+        mdata.lfo2.depth = lfo2.depth();
+
+        auto extract_mseg = [](const modulation::MultiStageEnvelope& mseg, MsegData& out) {
+            out.time_mode = static_cast<uint8_t>(mseg.time_mode());
+            out.loop_mode = static_cast<uint8_t>(mseg.loop_mode());
+            out.sustain_idx = mseg.sustain_index();
+            out.base_time_scale = mseg.base_time_scale();
+            out.base_attack_scale = mseg.base_attack_scale();
+            out.base_decay_scale = mseg.base_decay_scale();
+            out.base_level_scale = mseg.base_level_scale();
+            out.base_tension_offset = mseg.base_tension_offset();
+
+            for (const auto& pt : mseg.get_points()) {
+                out.points.push_back(MsegPointData{
+                    .time = pt.time,
+                    .value = pt.value,
+                    .node_mode = static_cast<uint8_t>(pt.node_mode),
+                    .tension = pt.tension
+                });
+            }
+        };
+
+        extract_mseg(matrix.mseg1(), mdata.mseg1);
+        extract_mseg(matrix.mseg2(), mdata.mseg2);
+
+        const auto& ps = matrix.poly_synth();
+        mdata.poly_synth.polyphony_limit = ps.polyphony_limit();
+        mdata.poly_synth.play_mode = static_cast<uint8_t>(ps.play_mode());
+        mdata.poly_synth.osc1_waveform = static_cast<uint8_t>(ps.osc1_waveform());
+        mdata.poly_synth.osc2_waveform = static_cast<uint8_t>(ps.osc2_waveform());
+        mdata.poly_synth.osc_mix = ps.osc_mix();
+        mdata.poly_synth.osc2_detune_cents = ps.osc2_detune_cents();
+        mdata.poly_synth.osc2_octave_offset = ps.osc2_octave_offset();
+        mdata.poly_synth.filter_type = static_cast<uint8_t>(ps.filter_type());
+        mdata.poly_synth.base_cutoff = ps.base_cutoff();
+        mdata.poly_synth.resonance_q = ps.resonance_q();
+        mdata.poly_synth.filter_env_amount = ps.filter_env_amount();
+        mdata.poly_synth.keytrack_amount = ps.keytrack_amount();
+        mdata.poly_synth.velocity_to_filter = ps.velocity_to_filter();
+        mdata.poly_synth.velocity_to_amp = ps.velocity_to_amp();
+        mdata.poly_synth.voice_pan_spread = ps.voice_pan_spread();
+        mdata.poly_synth.glide_time_ms = ps.glide_time_ms();
+        mdata.poly_synth.master_level = ps.master_level();
+
+        return mdata;
+    }
+
+    static void apply_modulation_matrix(modulation::ModulationMatrix& matrix, const ModulationMatrixData& data) {
+        if (!data.has_data) return;
+
+        for (size_t i = 0; i < modulation::ModulationMatrix::kMaxRoutes; ++i) {
+            matrix.clear_route(i);
+        }
+
+        for (size_t i = 0; i < data.routes.size() && i < modulation::ModulationMatrix::kMaxRoutes; ++i) {
+            const auto& r = data.routes[i];
+            matrix.set_route(i,
+                             static_cast<modulation::ModulationSource>(r.source),
+                             static_cast<modulation::ModulationDestination>(r.destination),
+                             r.amount,
+                             r.active,
+                             r.bipolar);
+        }
+
+        auto& lfo1 = matrix.lfo1();
+        lfo1.set_waveform(static_cast<modulation::LfoWaveform>(data.lfo1.waveform));
+        lfo1.set_bipolar(data.lfo1.bipolar);
+        lfo1.set_frequency_hz(data.lfo1.frequency_hz);
+        lfo1.set_beat_sync(data.lfo1.beat_sync);
+        lfo1.set_beats_per_cycle(data.lfo1.beats_per_cycle);
+        lfo1.set_depth(data.lfo1.depth);
+
+        auto& lfo2 = matrix.lfo2();
+        lfo2.set_waveform(static_cast<modulation::LfoWaveform>(data.lfo2.waveform));
+        lfo2.set_bipolar(data.lfo2.bipolar);
+        lfo2.set_frequency_hz(data.lfo2.frequency_hz);
+        lfo2.set_beat_sync(data.lfo2.beat_sync);
+        lfo2.set_beats_per_cycle(data.lfo2.beats_per_cycle);
+        lfo2.set_depth(data.lfo2.depth);
+
+        auto apply_mseg = [](modulation::MultiStageEnvelope& mseg, const MsegData& m) {
+            mseg.set_base_time_scale(m.base_time_scale);
+            mseg.set_base_attack_scale(m.base_attack_scale);
+            mseg.set_base_decay_scale(m.base_decay_scale);
+            mseg.set_base_level_scale(m.base_level_scale);
+            mseg.set_base_tension_offset(m.base_tension_offset);
+
+            if (!m.points.empty()) {
+                std::vector<modulation::MsegPoint> pts;
+                pts.reserve(m.points.size());
+                for (const auto& pt : m.points) {
+                    pts.push_back(modulation::MsegPoint{
+                        .time = pt.time,
+                        .value = pt.value,
+                        .node_mode = static_cast<routing::NodeMode>(pt.node_mode),
+                        .tension = pt.tension
+                    });
+                }
+                mseg.set_points(std::move(pts),
+                                static_cast<modulation::MsegTimeMode>(m.time_mode),
+                                static_cast<modulation::MsegLoopMode>(m.loop_mode),
+                                m.sustain_idx);
+            }
+        };
+
+        apply_mseg(matrix.mseg1(), data.mseg1);
+        apply_mseg(matrix.mseg2(), data.mseg2);
+
+        auto& ps = matrix.poly_synth();
+        ps.set_polyphony_limit(data.poly_synth.polyphony_limit);
+        ps.set_play_mode(static_cast<modulation::PolyphonyPlayMode>(data.poly_synth.play_mode));
+        ps.set_osc1_waveform(static_cast<dsp::Waveform>(data.poly_synth.osc1_waveform));
+        ps.set_osc2_waveform(static_cast<dsp::Waveform>(data.poly_synth.osc2_waveform));
+        ps.set_osc_mix(data.poly_synth.osc_mix);
+        ps.set_osc2_detune_cents(data.poly_synth.osc2_detune_cents);
+        ps.set_osc2_octave_offset(data.poly_synth.osc2_octave_offset);
+        ps.set_filter_type(static_cast<dsp::FilterType>(data.poly_synth.filter_type));
+        ps.set_base_cutoff(data.poly_synth.base_cutoff);
+        ps.set_resonance_q(data.poly_synth.resonance_q);
+        ps.set_filter_env_amount(data.poly_synth.filter_env_amount);
+        ps.set_keytrack_amount(data.poly_synth.keytrack_amount);
+        ps.set_velocity_to_filter(data.poly_synth.velocity_to_filter);
+        ps.set_velocity_to_amp(data.poly_synth.velocity_to_amp);
+        ps.set_voice_pan_spread(data.poly_synth.voice_pan_spread);
+        ps.set_glide_time_ms(data.poly_synth.glide_time_ms);
+        ps.set_master_level(data.poly_synth.master_level);
+    }
+
+    static ProjectSessionData extract_session(const MixerGraph& mixer, const clock::TimelineClock& clock,
+                                              const std::string& name = "Untitled Project",
+                                              const modulation::ModulationMatrix* mod_matrix = nullptr) {
         ProjectSessionData data;
         data.project_name = name;
         data.sample_rate = mixer.sample_rate();
         data.bpm = clock.bpm();
         data.master_volume = mixer.master_volume();
         data.master_limiter_enabled = mixer.is_master_limiter_enabled();
+
+        if (mod_matrix) {
+            data.modulation_matrix = extract_modulation_matrix(*mod_matrix);
+        }
 
         // Extract tracks
         for (uint32_t t = 0; t < mixer.track_count(); ++t) {
@@ -848,10 +1269,15 @@ public:
         return data;
     }
 
-    static bool apply_session(MixerGraph& mixer, clock::TimelineClock& clock, const ProjectSessionData& data) {
+    static bool apply_session(MixerGraph& mixer, clock::TimelineClock& clock, const ProjectSessionData& data,
+                              modulation::ModulationMatrix* mod_matrix = nullptr) {
         clock.set_bpm(data.bpm);
         mixer.set_master_volume(data.master_volume);
         mixer.set_master_limiter_enabled(data.master_limiter_enabled);
+
+        if (mod_matrix && data.modulation_matrix.has_value()) {
+            apply_modulation_matrix(*mod_matrix, *data.modulation_matrix);
+        }
 
         for (const auto& tdata : data.tracks) {
             Track* trk = nullptr;
@@ -964,15 +1390,17 @@ public:
 
     // High-Level File Persistence
     static bool save_session_file(const std::string& filepath, const MixerGraph& mixer,
-                                  const clock::TimelineClock& clock, const std::string& name = "Untitled Project") {
-        auto data = extract_session(mixer, clock, name);
+                                  const clock::TimelineClock& clock, const std::string& name = "Untitled Project",
+                                  const modulation::ModulationMatrix* mod_matrix = nullptr) {
+        auto data = extract_session(mixer, clock, name, mod_matrix);
         std::ofstream file(filepath);
         if (!file.is_open()) return false;
         file << data.to_json();
         return true;
     }
 
-    static bool load_session_file(const std::string& filepath, MixerGraph& mixer, clock::TimelineClock& clock) {
+    static bool load_session_file(const std::string& filepath, MixerGraph& mixer, clock::TimelineClock& clock,
+                                  modulation::ModulationMatrix* mod_matrix = nullptr) {
         std::ifstream file(filepath);
         if (!file.is_open()) return false;
         std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -980,7 +1408,7 @@ public:
         if (!parsed) return false;
         auto data = ProjectSessionData::from_json_val(*parsed);
         if (!data) return false;
-        return apply_session(mixer, clock, *data);
+        return apply_session(mixer, clock, *data, mod_matrix);
     }
 
     static bool save_rack_preset_file(const std::string& filepath, const Track& track, const std::string& name = "User Preset") {

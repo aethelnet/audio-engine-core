@@ -3396,7 +3396,6 @@ void test_liquid_ode_trapezoidal_integration_filter_and_bus_summing() {
     auto goertzel_mag = [](const float* data, size_t N, float target_hz, float sr) -> float {
         float k = target_hz * N / sr;
         float omega = 2.0f * std::numbers::pi_v<float> * k / N;
-        float c = std::cos(omega), s = std::sin(omega);
         float real_part = 0.0f, imag_part = 0.0f;
         for (size_t n = 0; n < N; ++n) {
             float angle = -omega * n;
@@ -9830,6 +9829,250 @@ void test_hardware_midi_and_automatic_track_routing() {
     }
 }
 
+void test_alsa_sequencer_and_modulation_session_serialization() {
+    std::cout << "[TEST 73] Running ALSA Sequencer Loopback & Modulation Session Serialization..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::midi;
+
+    // ========================================================================
+    // Part A: ALSA Sequencer (snd_seq) Ingestion & Kernel Loopback
+    // ========================================================================
+    {
+        HardwareMidiReceiver rx;
+        bool seq_opened = rx.open_alsa_sequencer("Aethel Desk Test", "Test In");
+
+        if (seq_opened && rx.has_alsa_seq()) {
+            TEST_CHECK(rx.is_connected());
+            TEST_CHECK(rx.seq_client_id() >= 0);
+            TEST_CHECK(rx.seq_port_id() >= 0);
+            TEST_CHECK(!rx.seq_port_name().empty());
+
+            modulation::ModulationMatrix matrix;
+            matrix.init(48000);
+
+            // 1. Loopback Note-On Event via direct ALSA Sequencer write
+            struct snd_seq_event ev_on{};
+            ev_on.type = SNDRV_SEQ_EVENT_NOTEON;
+            ev_on.flags = 0;
+            ev_on.tag = 0;
+            ev_on.queue = SNDRV_SEQ_QUEUE_DIRECT;
+            ev_on.source.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_on.source.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_on.dest.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_on.dest.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_on.data.note.channel = 0;
+            ev_on.data.note.note = 64; // E4
+            ev_on.data.note.velocity = 110;
+
+            bool sent_on = rx.send_seq_event(ev_on);
+            TEST_CHECK(sent_on);
+
+            // Wait briefly for poll thread to dispatch to lock-free queue
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+            size_t drained = rx.drain_to(matrix);
+            TEST_CHECK(drained >= 1);
+            TEST_CHECK(matrix.poly_synth().active_voice_count() >= 1);
+
+            // 2. Loopback Pitch Bend Event
+            struct snd_seq_event ev_pb{};
+            ev_pb.type = SNDRV_SEQ_EVENT_PITCHBEND;
+            ev_pb.flags = 0;
+            ev_pb.tag = 0;
+            ev_pb.queue = SNDRV_SEQ_QUEUE_DIRECT;
+            ev_pb.source.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_pb.source.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_pb.dest.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_pb.dest.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_pb.data.control.channel = 0;
+            ev_pb.data.control.value = 4096; // +0.5 normalised pitchbend
+
+            bool sent_pb = rx.send_seq_event(ev_pb);
+            TEST_CHECK(sent_pb);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            rx.drain_to(matrix);
+            TEST_CHECK(matrix.pitch_bend() > 0.45f && matrix.pitch_bend() < 0.55f);
+
+            // 3. Loopback Note-Off Event
+            struct snd_seq_event ev_off{};
+            ev_off.type = SNDRV_SEQ_EVENT_NOTEOFF;
+            ev_off.flags = 0;
+            ev_off.tag = 0;
+            ev_off.queue = SNDRV_SEQ_QUEUE_DIRECT;
+            ev_off.source.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_off.source.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_off.dest.client = static_cast<unsigned char>(rx.seq_client_id());
+            ev_off.dest.port = static_cast<unsigned char>(rx.seq_port_id());
+            ev_off.data.note.channel = 0;
+            ev_off.data.note.note = 64;
+            ev_off.data.note.velocity = 0;
+
+            bool sent_off = rx.send_seq_event(ev_off);
+            TEST_CHECK(sent_off);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            rx.drain_to(matrix);
+
+            rx.close_device();
+            TEST_CHECK(!rx.is_connected());
+
+            std::cout << "  -> ALSA Sequencer Client/Port Loopback & Event Parsing: PASSED" << std::endl;
+        } else {
+            std::cout << "  -> ALSA Sequencer /dev/snd/seq unavailable in sandbox, skipping kernel loopback" << std::endl;
+        }
+    }
+
+    // ========================================================================
+    // Part B: ModulationMatrix & PolySynth Session Serialization Roundtrip
+    // ========================================================================
+    {
+        modulation::ModulationMatrix source_matrix;
+        source_matrix.init(48000);
+
+        // Configure custom routes
+        source_matrix.set_route(0, modulation::ModulationSource::LFO1, modulation::ModulationDestination::SynthCutoff, 0.75f, true, true);
+        source_matrix.set_route(1, modulation::ModulationSource::MSEG1, modulation::ModulationDestination::SynthPitch, -0.4f, true, false);
+        source_matrix.set_route(2, modulation::ModulationSource::ModWheel, modulation::ModulationDestination::LFO1_Rate, 0.5f, true, true);
+
+        // Configure LFO1 & LFO2
+        source_matrix.lfo1().set_waveform(modulation::LfoWaveform::Triangle);
+        source_matrix.lfo1().set_frequency_hz(4.5f);
+        source_matrix.lfo1().set_depth(0.85f);
+        source_matrix.lfo1().set_beat_sync(true);
+        source_matrix.lfo1().set_beats_per_cycle(0.5);
+        source_matrix.lfo1().set_bipolar(false);
+
+        source_matrix.lfo2().set_waveform(modulation::LfoWaveform::SampleHold);
+        source_matrix.lfo2().set_frequency_hz(12.0f);
+        source_matrix.lfo2().set_depth(0.6f);
+
+        // Configure MSEG1
+        source_matrix.mseg1().set_base_attack_scale(1.25f);
+        source_matrix.mseg1().set_base_decay_scale(0.8f);
+        std::vector<modulation::MsegPoint> custom_pts = {
+            {0.0, 0.0f, routing::NodeMode::Corner, 0.0f},
+            {25.0, 1.0f, routing::NodeMode::Smooth, 0.3f},
+            {100.0, 0.5f, routing::NodeMode::Smooth, -0.2f},
+            {300.0, 0.0f, routing::NodeMode::Hold, 0.0f}
+        };
+        source_matrix.mseg1().set_points(custom_pts, modulation::MsegTimeMode::Milliseconds, modulation::MsegLoopMode::SustainLoop, 2);
+
+        // Configure PolySynth
+        source_matrix.poly_synth().set_polyphony_limit(8);
+        source_matrix.poly_synth().set_play_mode(modulation::PolyphonyPlayMode::Unison4x);
+        source_matrix.poly_synth().set_osc1_waveform(dsp::Waveform::Saw);
+        source_matrix.poly_synth().set_osc2_waveform(dsp::Waveform::Square);
+        source_matrix.poly_synth().set_osc_mix(0.65f);
+        source_matrix.poly_synth().set_osc2_detune_cents(14.5f);
+        source_matrix.poly_synth().set_osc2_octave_offset(-1);
+        source_matrix.poly_synth().set_filter_type(dsp::FilterType::Bandpass);
+        source_matrix.poly_synth().set_base_cutoff(1850.0f);
+        source_matrix.poly_synth().set_resonance_q(3.2f);
+        source_matrix.poly_synth().set_filter_env_amount(1500.0f);
+        source_matrix.poly_synth().set_keytrack_amount(0.45f);
+        source_matrix.poly_synth().set_velocity_to_filter(0.6f);
+        source_matrix.poly_synth().set_velocity_to_amp(0.85f);
+        source_matrix.poly_synth().set_voice_pan_spread(0.75f);
+        source_matrix.poly_synth().set_glide_time_ms(35.0f);
+        source_matrix.poly_synth().set_master_level(0.92f);
+
+        // Capture session
+        MixerGraph mixer(256, false, 48000);
+        mixer.clock().set_bpm(130.0);
+
+        auto session_data = serialization::SessionSerializer::extract_session(mixer, mixer.clock(), "ModMatrix Session", &source_matrix);
+        TEST_CHECK(session_data.modulation_matrix.has_value());
+
+        std::string json_str = session_data.to_json();
+        TEST_CHECK(!json_str.empty());
+        TEST_CHECK(json_str.find("\"modulation_matrix\"") != std::string::npos);
+        TEST_CHECK(json_str.find("\"poly_synth\"") != std::string::npos);
+
+        // Parse from JSON
+        auto parsed_val = serialization::json::Parser::parse(json_str);
+        TEST_CHECK(parsed_val.has_value());
+        auto restored_data = serialization::ProjectSessionData::from_json_val(*parsed_val);
+        TEST_CHECK(restored_data.has_value());
+        TEST_CHECK(restored_data->modulation_matrix.has_value());
+
+        // Apply to a fresh ModulationMatrix
+        modulation::ModulationMatrix target_matrix;
+        target_matrix.init(48000);
+        MixerGraph mixer2(256, false, 48000);
+        mixer2.clock().set_bpm(120.0);
+
+        bool applied = serialization::SessionSerializer::apply_session(mixer2, mixer2.clock(), *restored_data, &target_matrix);
+        TEST_CHECK(applied);
+
+        // Verify bit-exact parameter preservation
+        TEST_CHECK(target_matrix.routes()[0].active == true);
+        TEST_CHECK(target_matrix.routes()[0].source == modulation::ModulationSource::LFO1);
+        TEST_CHECK(target_matrix.routes()[0].destination == modulation::ModulationDestination::SynthCutoff);
+        TEST_CHECK(std::abs(target_matrix.routes()[0].amount - 0.75f) < 1e-4f);
+        TEST_CHECK(target_matrix.routes()[1].active == true);
+        TEST_CHECK(target_matrix.routes()[1].bipolar == false);
+        TEST_CHECK(std::abs(target_matrix.routes()[1].amount - (-0.4f)) < 1e-4f);
+        TEST_CHECK(target_matrix.routes()[2].active == true);
+        TEST_CHECK(target_matrix.routes()[3].active == false);
+
+        TEST_CHECK(target_matrix.lfo1().waveform() == modulation::LfoWaveform::Triangle);
+        TEST_CHECK(std::abs(target_matrix.lfo1().frequency_hz() - 4.5f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.lfo1().depth() - 0.85f) < 1e-4f);
+        TEST_CHECK(target_matrix.lfo1().is_beat_sync() == true);
+        TEST_CHECK(std::abs(target_matrix.lfo1().beats_per_cycle() - 0.5) < 1e-4);
+        TEST_CHECK(target_matrix.lfo1().is_bipolar() == false);
+
+        TEST_CHECK(target_matrix.lfo2().waveform() == modulation::LfoWaveform::SampleHold);
+        TEST_CHECK(std::abs(target_matrix.lfo2().frequency_hz() - 12.0f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.lfo2().depth() - 0.6f) < 1e-4f);
+
+        TEST_CHECK(std::abs(target_matrix.mseg1().base_attack_scale() - 1.25f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.mseg1().base_decay_scale() - 0.8f) < 1e-4f);
+        TEST_CHECK(target_matrix.mseg1().time_mode() == modulation::MsegTimeMode::Milliseconds);
+        TEST_CHECK(target_matrix.mseg1().loop_mode() == modulation::MsegLoopMode::SustainLoop);
+        TEST_CHECK(target_matrix.mseg1().sustain_index() == 2);
+
+        auto res_pts = target_matrix.mseg1().get_points();
+        TEST_CHECK(res_pts.size() == 4);
+        TEST_CHECK(std::abs(res_pts[1].time - 25.0) < 1e-4);
+        TEST_CHECK(std::abs(res_pts[1].value - 1.0f) < 1e-4f);
+        TEST_CHECK(std::abs(res_pts[2].tension - (-0.2f)) < 1e-4f);
+
+        TEST_CHECK(target_matrix.poly_synth().polyphony_limit() == 8);
+        TEST_CHECK(target_matrix.poly_synth().play_mode() == modulation::PolyphonyPlayMode::Unison4x);
+        TEST_CHECK(target_matrix.poly_synth().osc1_waveform() == dsp::Waveform::Saw);
+        TEST_CHECK(target_matrix.poly_synth().osc2_waveform() == dsp::Waveform::Square);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().osc_mix() - 0.65f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().osc2_detune_cents() - 14.5f) < 1e-4f);
+        TEST_CHECK(target_matrix.poly_synth().osc2_octave_offset() == -1);
+        TEST_CHECK(target_matrix.poly_synth().filter_type() == dsp::FilterType::Bandpass);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().base_cutoff() - 1850.0f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().resonance_q() - 3.2f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().filter_env_amount() - 1500.0f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().keytrack_amount() - 0.45f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().velocity_to_filter() - 0.6f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().velocity_to_amp() - 0.85f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().voice_pan_spread() - 0.75f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().glide_time_ms() - 35.0f) < 1e-4f);
+        TEST_CHECK(std::abs(target_matrix.poly_synth().master_level() - 0.92f) < 1e-4f);
+
+        // File-based session persistence test
+        const std::string tmp_file = "/tmp/aethel_session_modmatrix_test.json";
+        TEST_CHECK(serialization::SessionSerializer::save_session_file(tmp_file, mixer, mixer.clock(), "File Test", &source_matrix));
+
+        modulation::ModulationMatrix file_matrix;
+        file_matrix.init(48000);
+        TEST_CHECK(serialization::SessionSerializer::load_session_file(tmp_file, mixer2, mixer2.clock(), &file_matrix));
+        TEST_CHECK(file_matrix.poly_synth().polyphony_limit() == 8);
+        TEST_CHECK(file_matrix.poly_synth().play_mode() == modulation::PolyphonyPlayMode::Unison4x);
+        TEST_CHECK(std::abs(file_matrix.poly_synth().base_cutoff() - 1850.0f) < 1e-4f);
+        std::remove(tmp_file.c_str());
+
+        std::cout << "  -> ModulationMatrix & PolySynth Session Serialization Roundtrip: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -9907,6 +10150,7 @@ int main() {
     test_multi_stage_envelope_and_meta_modulation_matrix();
     test_polyphonic_mseg_synth_and_voice_allocator();
     test_hardware_midi_and_automatic_track_routing();
+    test_alsa_sequencer_and_modulation_session_serialization();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
