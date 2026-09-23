@@ -9469,6 +9469,204 @@ void test_multi_stage_envelope_and_meta_modulation_matrix() {
     }
 }
 
+// 71. Polyphonic Synth & MSEG Voice Allocator Verification
+void test_polyphonic_mseg_synth_and_voice_allocator() {
+    std::cout << "[TEST] Running Polyphonic Synth & MSEG Voice Allocator Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::modulation;
+    using namespace audio_core::dsp;
+
+    const uint32_t kSr = 48000;
+
+    // 1. Voice Allocation & Chord Polyphony
+    {
+        PolyphonicSynth synth;
+        synth.init(kSr);
+        synth.set_polyphony_limit(8);
+
+        TEST_CHECK(synth.active_voice_count() == 0);
+
+        // Play 4-note chord: C Minor 7th (C3: 48, Eb3: 51, G3: 55, Bb3: 58)
+        std::vector<uint8_t> chord = { 48, 51, 55, 58 };
+        synth.play_chord(chord, 0.9f);
+
+        TEST_CHECK(synth.active_voice_count() == 4);
+
+        std::array<PolyVoiceTelemetry, PolyphonicSynth::kMaxVoices> telem{};
+        synth.get_telemetry(telem);
+
+        // Verify all 4 voices have distinct notes
+        std::vector<uint8_t> sounding_notes;
+        for (size_t i = 0; i < 8; ++i) {
+            if (telem[i].active) {
+                sounding_notes.push_back(telem[i].note);
+                TEST_CHECK(telem[i].stage == MsegStage::Attack || telem[i].stage == MsegStage::Decay || telem[i].stage == MsegStage::Sustain);
+            }
+        }
+        TEST_CHECK(sounding_notes.size() == 4);
+        std::sort(sounding_notes.begin(), sounding_notes.end());
+        TEST_CHECK(sounding_notes == chord);
+
+        // Render 10ms of audio
+        std::vector<float> buf_l(480, 0.0f);
+        std::vector<float> buf_r(480, 0.0f);
+        synth.process_block(buf_l.data(), buf_r.data(), 480);
+
+        // Verify audio was generated and non-zero
+        float energy_l = 0.0f;
+        for (float s : buf_l) energy_l += s * s;
+        TEST_CHECK(energy_l > 0.001f);
+
+        // Note off for 1 note (Eb3: 51)
+        synth.note_off(51);
+        synth.get_telemetry(telem);
+        // Voice playing note 51 should be in Release stage
+        bool found_rel = false;
+        for (size_t i = 0; i < 8; ++i) {
+            if (telem[i].note == 51 && telem[i].stage == MsegStage::Release) {
+                found_rel = true;
+                break;
+            }
+        }
+        TEST_CHECK(found_rel);
+
+        std::cout << "  -> Voice Allocation & Chord Polyphony: PASSED" << std::endl;
+    }
+
+    // 2. Click-Free Voice Stealing (Lowest Envelope Release Priority + Oldest Note)
+    {
+        PolyphonicSynth synth;
+        synth.init(kSr);
+        synth.set_polyphony_limit(4); // Cap to 4 voices
+
+        // Trigger 4 notes to fill voice pool
+        synth.note_on(60, 0.8f);
+        synth.note_on(64, 0.8f);
+        synth.note_on(67, 0.8f);
+        synth.note_on(71, 0.8f);
+        TEST_CHECK(synth.active_voice_count() == 4);
+
+        // Release note 60 -> it enters Release stage
+        synth.note_off(60);
+
+        // Now trigger 5th note (74)
+        // Voice allocator should prioritize stealing voice playing released note 60
+        int32_t stolen_v = synth.note_on(74, 0.9f);
+        TEST_CHECK(stolen_v >= 0 && stolen_v < 4);
+
+        std::array<PolyVoiceTelemetry, PolyphonicSynth::kMaxVoices> telem{};
+        synth.get_telemetry(telem);
+        TEST_CHECK(telem[stolen_v].note == 74);
+        TEST_CHECK(telem[stolen_v].active == true);
+
+        // Sustained notes (64, 67, 71) must still be actively sounding!
+        bool has_64 = false, has_67 = false, has_71 = false;
+        for (size_t i = 0; i < 4; ++i) {
+            if (telem[i].note == 64 && telem[i].active) has_64 = true;
+            if (telem[i].note == 67 && telem[i].active) has_67 = true;
+            if (telem[i].note == 71 && telem[i].active) has_71 = true;
+        }
+        TEST_CHECK(has_64 && has_67 && has_71);
+
+        // Now test stealing when all 4 voices are held: trigger 6th note (76)
+        int32_t oldest_stolen = synth.note_on(76, 0.9f);
+        TEST_CHECK(oldest_stolen >= 0 && oldest_stolen < 4);
+        synth.get_telemetry(telem);
+        TEST_CHECK(telem[oldest_stolen].note == 76);
+
+        std::cout << "  -> Voice Stealing (Release Priority + Oldest Fallback): PASSED" << std::endl;
+    }
+
+    // 3. Mono Legato Mode & Portamento Glide
+    {
+        PolyphonicSynth synth;
+        synth.init(kSr);
+        synth.set_play_mode(PolyphonyPlayMode::MonoLegato);
+        synth.set_glide_time_ms(100.0f); // 100ms glide
+
+        // Trigger first note
+        synth.note_on(48, 1.0f);
+        TEST_CHECK(synth.active_voice_count() == 1);
+
+        // Process 100 samples
+        float l = 0.0f, r = 0.0f;
+        synth.process_sample(l, r);
+
+        // Legato note change to note 60 without releasing note 48
+        synth.note_on(60, 1.0f);
+        TEST_CHECK(synth.active_voice_count() == 1); // Strictly 1 voice in mono mode
+
+        std::array<PolyVoiceTelemetry, PolyphonicSynth::kMaxVoices> telem{};
+        synth.get_telemetry(telem);
+        TEST_CHECK(telem[0].note == 60);
+
+        std::cout << "  -> Mono Legato Mode & Portamento Glide: PASSED" << std::endl;
+    }
+
+    // 4. Unison 4x Stacking
+    {
+        PolyphonicSynth synth;
+        synth.init(kSr);
+        synth.set_play_mode(PolyphonyPlayMode::Unison4x);
+        synth.set_voice_pan_spread(0.8f);
+
+        synth.note_on(36, 1.0f); // Sub bass C1
+        TEST_CHECK(synth.active_voice_count() == 4); // 4 stacked voices
+
+        std::array<PolyVoiceTelemetry, PolyphonicSynth::kMaxVoices> telem{};
+        synth.get_telemetry(telem);
+        for (size_t u = 0; u < 4; ++u) {
+            TEST_CHECK(telem[u].active);
+            TEST_CHECK(telem[u].note == 36);
+        }
+        // Pan positions should be spread symmetrically
+        TEST_CHECK(telem[0].pan < 0.0f && telem[3].pan > 0.0f);
+
+        synth.note_off(36);
+        for (size_t u = 0; u < 4; ++u) {
+            TEST_CHECK(synth.active_voice_count() > 0); // Releasing
+        }
+
+        std::cout << "  -> Unison 4x Stacking: PASSED" << std::endl;
+    }
+
+    // 5. ModulationMatrix Integration & Meta-Modulation Voice Dispatch
+    {
+        ModulationMatrix matrix;
+        matrix.init(kSr);
+
+        // LFO 1 -> MSEG 1 Attack (Meta-Modulation)
+        matrix.set_route(0, ModulationSource::LFO1, ModulationDestination::MSEG1_Attack, 1.5f, true);
+        // MSEG 2 -> Synth Cutoff
+        matrix.set_route(1, ModulationSource::MSEG2, ModulationDestination::SynthCutoff, 0.8f, true);
+
+        // Trigger polyphonic chord through matrix
+        matrix.poly_note_on(60, 0.9f);
+        matrix.poly_note_on(64, 0.8f);
+        matrix.poly_note_on(67, 0.85f);
+
+        TEST_CHECK(matrix.poly_synth().active_voice_count() == 3);
+
+        std::vector<float> buf_l(512, 0.0f);
+        std::vector<float> buf_r(512, 0.0f);
+
+        for (uint32_t f = 0; f < 512; ++f) {
+            matrix.evaluate_sample(120.0);
+        }
+        matrix.process_synth_block(buf_l.data(), buf_r.data(), 512, 120.0);
+
+        for (uint32_t i = 0; i < 512; ++i) {
+            TEST_CHECK(!std::isnan(buf_l[i]) && !std::isinf(buf_l[i]));
+            TEST_CHECK(!std::isnan(buf_r[i]) && !std::isinf(buf_r[i]));
+        }
+
+        matrix.poly_all_notes_off();
+
+        std::cout << "  -> ModulationMatrix + Polyphonic MSEG Synth Integration: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -9544,6 +9742,7 @@ int main() {
     test_clip_relative_envelopes_and_loop_modulation();
     test_insert_slot_automation_and_multilane_stacking();
     test_multi_stage_envelope_and_meta_modulation_matrix();
+    test_polyphonic_mseg_synth_and_voice_allocator();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

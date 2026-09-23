@@ -1849,4 +1849,165 @@ inline bool DrawMsegCurveEditor(const char* str_id,
     return modified;
 }
 
+// ============================================================================
+// Orderly Architect: Polyphonic 16-Voice Telemetry Matrix Grid
+// Renders up to 16 voice cards displaying voice allocation, MIDI note,
+// dual MSEG envelope levels (Amp & Mod), release status, and stereo pan pip.
+// ============================================================================
+inline void DrawPolyVoiceTelemetryGrid(const char* str_id,
+                                       const std::array<modulation::PolyVoiceTelemetry, 16>& telem,
+                                       ImVec2 size = ImVec2(0, 0),
+                                       size_t poly_limit = 16) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return;
+
+    const ImGuiID id = window->GetID(str_id);
+
+    float avail_w = ImGui::GetContentRegionAvail().x;
+    if (size.x > 0.0f) avail_w = size.x;
+
+    const ImVec2 pos = window->DC.CursorPos;
+    ImDrawList* dl = window->DrawList;
+
+    // Grid configuration: 4 columns if space permits, else 2 columns
+    const int cols = (avail_w >= 540.0f) ? 4 : 2;
+    const int rows = 16 / cols;
+    const float spacing = 6.0f;
+    const float card_w = (avail_w - (cols - 1) * spacing) / static_cast<float>(cols);
+    const float card_h = 68.0f;
+    const float total_h = rows * card_h + (rows - 1) * spacing;
+
+    const ImRect bb(pos, ImVec2(pos.x + avail_w, pos.y + total_h));
+    ImGui::ItemSize(bb);
+    if (!ImGui::ItemAdd(bb, id)) return;
+
+    static const char* kNoteNames[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+
+    for (int idx = 0; idx < 16; ++idx) {
+        int r = idx / cols;
+        int c = idx % cols;
+        float cx = pos.x + c * (card_w + spacing);
+        float cy = pos.y + r * (card_h + spacing);
+        ImVec2 card_min(cx, cy);
+        ImVec2 card_max(cx + card_w, cy + card_h);
+
+        const auto& v = telem[idx];
+        const bool within_limit = (static_cast<size_t>(idx) < poly_limit);
+
+        // 1. Card Background & Border
+        ImU32 bg_col = ImColor(248, 250, 252, 255);
+        ImU32 border_col = ImColor(218, 222, 230, 255);
+        if (!within_limit) {
+            bg_col = ImColor(238, 240, 244, 160);
+            border_col = ImColor(210, 214, 220, 140);
+        } else if (v.active) {
+            bg_col = ImColor(255, 255, 255, 255);
+            border_col = (v.stage == modulation::MsegStage::Release) ?
+                         ImColor(217, 123, 13, 220) : // Amber when releasing
+                         ImColor(31, 97, 217, 230);   // Blueprint Cobalt when held
+        }
+        dl->AddRectFilled(card_min, card_max, bg_col, 3.0f);
+        dl->AddRect(card_min, card_max, border_col, 3.0f, 0, v.active ? 1.5f : 1.0f);
+
+        // 2. Card Header: Voice #ID & Status Pill
+        char v_title[32];
+        std::snprintf(v_title, sizeof(v_title), "VOICE #%02d", idx + 1);
+        ImU32 title_col = within_limit ? ImColor(26, 30, 40, 240) : ImColor(140, 145, 155, 200);
+        dl->AddText(ImVec2(cx + 6.0f, cy + 4.0f), title_col, v_title);
+
+        if (!within_limit) {
+            dl->AddText(ImVec2(card_max.x - 30.0f, cy + 4.0f), ImColor(160, 165, 175, 200), "OFF");
+            continue;
+        }
+
+        // Stage & Active Badges
+        const char* st_text = "IDLE";
+        ImU32 st_bg = ImColor(230, 234, 240, 255);
+        ImU32 st_fg = ImColor(107, 117, 132, 255);
+        switch (v.stage) {
+            case modulation::MsegStage::Attack:
+                st_text = "ATK";
+                st_bg = ImColor(215, 238, 255, 255);
+                st_fg = ImColor(16, 85, 185, 255);
+                break;
+            case modulation::MsegStage::Decay:
+                st_text = "DEC";
+                st_bg = ImColor(255, 240, 215, 255);
+                st_fg = ImColor(190, 95, 10, 255);
+                break;
+            case modulation::MsegStage::Sustain:
+                st_text = "SUS";
+                st_bg = ImColor(215, 250, 225, 255);
+                st_fg = ImColor(15, 135, 55, 255);
+                break;
+            case modulation::MsegStage::Release:
+                st_text = "REL";
+                st_bg = ImColor(255, 225, 215, 255);
+                st_fg = ImColor(200, 50, 20, 255);
+                break;
+            case modulation::MsegStage::Idle:
+            default:
+                break;
+        }
+
+        // Draw Stage Pill
+        float pill_w = 26.0f;
+        float pill_h = 13.0f;
+        float pill_x = card_max.x - pill_w - 6.0f;
+        float pill_y = cy + 4.0f;
+        dl->AddRectFilled(ImVec2(pill_x, pill_y), ImVec2(pill_x + pill_w, pill_y + pill_h), st_bg, 2.0f);
+        dl->AddText(ImVec2(pill_x + 3.0f, pill_y - 1.0f), st_fg, st_text);
+
+        // 3. Middle Line: Note Name / Octave & Velocity
+        if (v.active) {
+            int oct = static_cast<int>(v.note) / 12 - 1;
+            char note_str[32];
+            std::snprintf(note_str, sizeof(note_str), "%s%d (%u) • %d%%",
+                          kNoteNames[v.note % 12], oct, v.note, static_cast<int>(v.velocity * 100.0f));
+            dl->AddText(ImVec2(cx + 6.0f, cy + 19.0f), ImColor(31, 97, 217, 255), note_str);
+        } else {
+            dl->AddText(ImVec2(cx + 6.0f, cy + 19.0f), ImColor(150, 155, 165, 200), "-- Idle --");
+        }
+
+        // 4. Dual Envelope Meters: Amp (Blue) and Mod (Amber)
+        const float bar_x = cx + 32.0f;
+        const float bar_w = std::max(20.0f, card_w - 66.0f);
+        const float bar_h = 4.0f;
+
+        // Amp meter (Row 1)
+        const float amp_y = cy + 36.0f;
+        dl->AddText(ImVec2(cx + 6.0f, amp_y - 2.0f), ImColor(70, 75, 85, 220), "AMP");
+        dl->AddRectFilled(ImVec2(bar_x, amp_y), ImVec2(bar_x + bar_w, amp_y + bar_h), ImColor(228, 232, 238, 255), 1.0f);
+        if (v.amp_level > 0.005f) {
+            float fill_w = std::clamp(v.amp_level, 0.0f, 1.0f) * bar_w;
+            dl->AddRectFilled(ImVec2(bar_x, amp_y), ImVec2(bar_x + fill_w, amp_y + bar_h), ImColor(31, 97, 217, 230), 1.0f);
+        }
+        char amp_val_str[16];
+        std::snprintf(amp_val_str, sizeof(amp_val_str), "%.2f", v.amp_level);
+        dl->AddText(ImVec2(bar_x + bar_w + 4.0f, amp_y - 2.0f), ImColor(70, 75, 85, 200), amp_val_str);
+
+        // Mod meter (Row 2)
+        const float mod_y = cy + 46.0f;
+        dl->AddText(ImVec2(cx + 6.0f, mod_y - 2.0f), ImColor(70, 75, 85, 220), "MOD");
+        dl->AddRectFilled(ImVec2(bar_x, mod_y), ImVec2(bar_x + bar_w, mod_y + bar_h), ImColor(228, 232, 238, 255), 1.0f);
+        if (v.mod_level > 0.005f) {
+            float fill_w = std::clamp(v.mod_level, 0.0f, 1.0f) * bar_w;
+            dl->AddRectFilled(ImVec2(bar_x, mod_y), ImVec2(bar_x + fill_w, mod_y + bar_h), ImColor(217, 123, 13, 230), 1.0f);
+        }
+        char mod_val_str[16];
+        std::snprintf(mod_val_str, sizeof(mod_val_str), "%.2f", v.mod_level);
+        dl->AddText(ImVec2(bar_x + bar_w + 4.0f, mod_y - 2.0f), ImColor(70, 75, 85, 200), mod_val_str);
+
+        // 5. Stereo Pan Pip Line (Row 3)
+        const float pan_y = cy + 57.0f;
+        const float pan_line_x0 = cx + 24.0f;
+        const float pan_line_x1 = card_max.x - 24.0f;
+        dl->AddText(ImVec2(cx + 6.0f, pan_y - 3.0f), ImColor(120, 125, 135, 220), "L");
+        dl->AddText(ImVec2(card_max.x - 14.0f, pan_y - 3.0f), ImColor(120, 125, 135, 220), "R");
+        dl->AddLine(ImVec2(pan_line_x0, pan_y + 1.0f), ImVec2(pan_line_x1, pan_y + 1.0f), ImColor(210, 215, 222, 200), 1.0f);
+        float pip_cx = pan_line_x0 + (pan_line_x1 - pan_line_x0) * 0.5f * (v.pan + 1.0f);
+        dl->AddCircleFilled(ImVec2(pip_cx, pan_y + 1.0f), 2.5f, v.active ? ImColor(31, 97, 217, 240) : ImColor(170, 175, 185, 200));
+    }
+}
+
 } // namespace audio_core::ui

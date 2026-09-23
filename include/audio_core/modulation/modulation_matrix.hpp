@@ -3,6 +3,7 @@
 #include "audio_core/types.hpp"
 #include "audio_core/modulation/multi_stage_envelope.hpp"
 #include "audio_core/modulation/modulation_lfo.hpp"
+#include "audio_core/modulation/polyphonic_synth.hpp"
 #include <array>
 #include <string_view>
 #include <algorithm>
@@ -138,12 +139,15 @@ public:
         m_lfo2.reset();
         m_mseg1_voice.reset();
         m_mseg2_voice.reset();
+        m_poly_synth.reset();
     }
 
     void init(uint32_t sample_rate) noexcept {
         m_sample_rate = sample_rate;
         m_lfo1.init(sample_rate);
         m_lfo2.init(sample_rate);
+        m_poly_synth.init(sample_rate);
+        m_poly_synth.bind_envelopes(&m_mseg1, &m_mseg2);
     }
 
     // Route management
@@ -204,6 +208,36 @@ public:
     void note_off() noexcept {
         m_mseg1_voice.release();
         m_mseg2_voice.release();
+    }
+
+    // Polyphonic Synthesizer Access & Note Management
+    [[nodiscard]] PolyphonicSynth& poly_synth() noexcept { return m_poly_synth; }
+    [[nodiscard]] const PolyphonicSynth& poly_synth() const noexcept { return m_poly_synth; }
+
+    int32_t poly_note_on(uint8_t note, float velocity = 1.0f) noexcept {
+        m_velocity = velocity;
+        m_key_track = static_cast<float>(note) / 127.0f;
+        // Trigger both monophonic preview voices AND allocate polyphonic synth voice
+        m_mseg1_voice.trigger(velocity);
+        m_mseg2_voice.trigger(velocity);
+        return m_poly_synth.note_on(note, velocity);
+    }
+
+    void poly_note_off(uint8_t note) noexcept {
+        m_poly_synth.note_off(note);
+    }
+
+    void poly_all_notes_off() noexcept {
+        m_mseg1_voice.release();
+        m_mseg2_voice.release();
+        m_poly_synth.all_notes_off();
+    }
+
+    void process_synth_block(float* out_l, float* out_r, uint32_t frames, double bpm = 120.0) noexcept {
+        const float mod_c = get_destination_value(ModulationDestination::SynthCutoff);
+        const float mod_p = get_destination_value(ModulationDestination::SynthPitch);
+        const float mod_a = get_destination_value(ModulationDestination::SynthAmp);
+        m_poly_synth.process_block(out_l, out_r, frames, bpm, mod_c, mod_p, mod_a);
     }
 
     // ========================================================================
@@ -330,6 +364,7 @@ private:
 
     MsegVoice m_mseg1_voice;
     MsegVoice m_mseg2_voice;
+    PolyphonicSynth m_poly_synth;
 
     float m_velocity{1.0f};
     float m_key_track{0.5f};

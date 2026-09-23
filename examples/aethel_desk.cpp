@@ -650,11 +650,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Advance Modulator Matrix at audio clock rate for real-time visual feedback
+        // Advance Modulator Matrix & Polyphonic Voice Pool at audio clock rate for real-time visual feedback
         uint32_t mod_sim_frames = std::clamp(static_cast<uint32_t>(dt * 48000.0f), 1u, 1024u);
+        float synth_sim_l[1024];
+        float synth_sim_r[1024];
         for (uint32_t s = 0; s < mod_sim_frames; ++s) {
             mod_matrix.evaluate_sample(bpm);
         }
+        mod_matrix.process_synth_block(synth_sim_l, synth_sim_r, mod_sim_frames, bpm);
 
         // Lock-free telemetry query
         mixer.capture_telemetry_snapshot(telemetry);
@@ -4275,60 +4278,71 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("| Bitwig Dragless Modulation Rings • Buchla/Maths Function Generator • Zero-Allocation RCU");
                     ImGui::Separator();
 
-                    // Header Status & Trigger Bar
-                    ImGui::Text("Voice Trigger Preview:");
+                    // Header Status & Trigger Bar: Polyphonic Chords & Voice Audition
+                    ImGui::Text("Poly Chords & Audition:");
                     ImGui::SameLine();
-                    if (ImGui::Button(" ▶ NOTE ON (Vel 90%) ", ImVec2(160, 24))) {
-                        mod_matrix.note_on(mod_preview_vel);
+                    if (ImGui::Button(" ▶ C MIN 9TH ", ImVec2(115, 24))) {
+                        mod_matrix.poly_all_notes_off();
+                        mod_matrix.poly_note_on(48, 0.90f); // C3
+                        mod_matrix.poly_note_on(51, 0.85f); // Eb3
+                        mod_matrix.poly_note_on(55, 0.85f); // G3
+                        mod_matrix.poly_note_on(58, 0.80f); // Bb3
+                        mod_matrix.poly_note_on(62, 0.75f); // D4
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button(" ▶ SOFT TAP (Vel 35%) ", ImVec2(160, 24))) {
-                        mod_matrix.note_on(0.35f);
+                    if (ImGui::Button(" ▶ F MAJ 7TH ", ImVec2(115, 24))) {
+                        mod_matrix.poly_all_notes_off();
+                        mod_matrix.poly_note_on(53, 0.90f); // F3
+                        mod_matrix.poly_note_on(57, 0.85f); // A3
+                        mod_matrix.poly_note_on(60, 0.85f); // C4
+                        mod_matrix.poly_note_on(64, 0.80f); // E4
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button(" ■ NOTE OFF / RELEASE ", ImVec2(160, 24))) {
-                        mod_matrix.note_off();
+                    if (ImGui::Button(" ▶ D DORIAN LEAD ", ImVec2(130, 24))) {
+                        mod_matrix.poly_all_notes_off();
+                        mod_matrix.poly_note_on(50, 0.95f); // D3
+                        mod_matrix.poly_note_on(53, 0.85f); // F3
+                        mod_matrix.poly_note_on(57, 0.85f); // A3
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button(" ⟳ RETRIGGER HI-HAT ", ImVec2(160, 24))) {
+                    if (ImGui::Button(" ▶ UNISON 4X ", ImVec2(110, 24))) {
+                        mod_matrix.poly_synth().set_play_mode(modulation::PolyphonyPlayMode::Unison4x);
+                        mod_matrix.poly_note_on(48, 0.95f);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ■ RELEASE ALL ", ImVec2(115, 24))) {
+                        mod_matrix.poly_all_notes_off();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" ⟳ HI-HAT ", ImVec2(90, 24))) {
                         mod_matrix.mseg1_voice().trigger(mod_preview_vel);
                     }
 
-                    ImGui::SameLine(0, 20);
-                    // Voice 1 & 2 live status
-                    auto stage_name = [](modulation::MsegStage st) -> const char* {
-                        switch (st) {
-                            case modulation::MsegStage::Idle: return "IDLE";
-                            case modulation::MsegStage::Attack: return "ATTACK";
-                            case modulation::MsegStage::Decay: return "DECAY";
-                            case modulation::MsegStage::Sustain: return "SUSTAIN";
-                            case modulation::MsegStage::Release: return "RELEASE";
-                        }
-                        return "OFF";
-                    };
-                    ImVec4 stage1_col = mod_matrix.mseg1_voice().is_active() ? ImVec4(0.12f, 0.38f, 0.85f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-                    ImVec4 stage2_col = mod_matrix.mseg2_voice().is_active() ? ImVec4(0.85f, 0.48f, 0.05f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-                    ImGui::TextColored(stage1_col, "[MSEG 1: %s | Val: %.2f]", stage_name(mod_matrix.mseg1_voice().stage()), mod_matrix.mseg1_voice().current_value());
-                    ImGui::SameLine();
-                    ImGui::TextColored(stage2_col, "[MSEG 2: %s | Val: %.2f]", stage_name(mod_matrix.mseg2_voice().stage()), mod_matrix.mseg2_voice().current_value());
+                    ImGui::SameLine(0, 15);
+                    size_t act_voices = mod_matrix.poly_synth().active_voice_count();
+                    ImVec4 v_col = (act_voices > 0) ? ImVec4(0.12f, 0.65f, 0.35f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                    ImGui::TextColored(v_col, "[VOICES: %zu / %zu ACTIVE]", act_voices, mod_matrix.poly_synth().polyphony_limit());
 
                     ImGui::Separator();
 
-                    // Modulator Selector Buttons
-                    const char* mod_tabs[4] = {
+                    // Modulator Selector Buttons (5 Tabs)
+                    const char* mod_tabs[5] = {
                         "MSEG 1: Hi-Hat Percussion",
                         "MSEG 2: Plucked Lead / Mod",
                         "LFO 1: Primary Oscillator",
-                        "LFO 2: BeatSync Slew Random"
+                        "LFO 2: BeatSync Slew Random",
+                        "POLY SYNTH // VOICE POOL (16v)"
                     };
-                    for (int m = 0; m < 4; ++m) {
+                    for (int m = 0; m < 5; ++m) {
                         if (m > 0) ImGui::SameLine();
                         bool is_sel = (selected_modulator == m);
                         if (is_sel) {
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 0.9f));
+                            ImVec4 btn_col = (m == 4) ? ImVec4(0.16f, 0.52f, 0.32f, 0.95f) : ImVec4(0.12f, 0.38f, 0.85f, 0.9f);
+                            ImGui::PushStyleColor(ImGuiCol_Button, btn_col);
                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                         }
-                        if (ImGui::Button(mod_tabs[m], ImVec2(200, 26))) {
+                        const float tab_w = (m == 4) ? 230.0f : 185.0f;
+                        if (ImGui::Button(mod_tabs[m], ImVec2(tab_w, 26))) {
                             selected_modulator = m;
                         }
                         if (is_sel) {
@@ -4449,7 +4463,7 @@ int main(int argc, char** argv) {
                                 if (ui::DrawModulatedSlider("Tension Bias", &base_tens, -1.0f, 1.0f, mod_tens, "%+.2f", nullptr, 280.0f)) {
                                     cur_mseg.set_base_tension_offset(base_tens);
                                 }
-                            } else {
+                            } else if (selected_modulator == 2 || selected_modulator == 3) {
                                 // LFO 1 or LFO 2
                                 auto& cur_lfo = (selected_modulator == 2) ? mod_matrix.lfo1() : mod_matrix.lfo2();
                                 ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "%s PARAMETERS",
@@ -4505,13 +4519,118 @@ int main(int argc, char** argv) {
                                 ImGui::Text("Real-Time Output: ");
                                 ImGui::SameLine();
                                 ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "%+.3f", cur_lfo.current_value());
+                            } else if (selected_modulator == 4) {
+                                // Polyphonic Synth Voice Pool Parameters
+                                ImGui::TextColored(ImVec4(0.16f, 0.65f, 0.38f, 1.0f), "POLYPHONIC SYNTH PARAMETERS");
+                                ImGui::Separator();
+
+                                const char* play_mode_names[] = { "Polyphonic (16-Voice)", "Mono Legato (Glide)", "Unison 4x (Detuned)" };
+                                int cur_mode = static_cast<int>(mod_matrix.poly_synth().play_mode());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::Combo("Play Mode", &cur_mode, play_mode_names, 3)) {
+                                    mod_matrix.poly_synth().set_play_mode(static_cast<modulation::PolyphonyPlayMode>(cur_mode));
+                                }
+
+                                int poly_lim = static_cast<int>(mod_matrix.poly_synth().polyphony_limit());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderInt("Voice Limit", &poly_lim, 1, 16)) {
+                                    mod_matrix.poly_synth().set_polyphony_limit(static_cast<size_t>(poly_lim));
+                                }
+
+                                float glide = mod_matrix.poly_synth().glide_time_ms();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Portamento Glide", &glide, 0.0f, 300.0f, "%.1f ms")) {
+                                    mod_matrix.poly_synth().set_glide_time_ms(glide);
+                                }
+
+                                float pan_spr = mod_matrix.poly_synth().voice_pan_spread();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Stereo Pan Spread", &pan_spr, 0.0f, 1.0f, "%.2f")) {
+                                    mod_matrix.poly_synth().set_voice_pan_spread(pan_spr);
+                                }
+
+                                float m_lvl = mod_matrix.poly_synth().master_level();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Master Level", &m_lvl, 0.0f, 1.5f, "%.2f")) {
+                                    mod_matrix.poly_synth().set_master_level(m_lvl);
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.85f, 0.65f, 0.15f, 1.0f), "DUAL OSCILLATORS (polyBLEP)");
+                                ImGui::Separator();
+
+                                const char* osc_wf_names[] = { "Sine", "Triangle", "Saw", "Square", "Noise" };
+                                int osc1_wf = static_cast<int>(mod_matrix.poly_synth().osc1_waveform());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::Combo("Osc 1 Wave", &osc1_wf, osc_wf_names, 5)) {
+                                    mod_matrix.poly_synth().set_osc1_waveform(static_cast<dsp::Waveform>(osc1_wf));
+                                }
+
+                                int osc2_wf = static_cast<int>(mod_matrix.poly_synth().osc2_waveform());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::Combo("Osc 2 Wave", &osc2_wf, osc_wf_names, 5)) {
+                                    mod_matrix.poly_synth().set_osc2_waveform(static_cast<dsp::Waveform>(osc2_wf));
+                                }
+
+                                float osc_mix = mod_matrix.poly_synth().osc_mix();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Osc Mix (1 vs 2)", &osc_mix, 0.0f, 1.0f, "%.2f")) {
+                                    mod_matrix.poly_synth().set_osc_mix(osc_mix);
+                                }
+
+                                float osc2_det = mod_matrix.poly_synth().osc2_detune_cents();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Osc 2 Detune", &osc2_det, -50.0f, 50.0f, "%+.1f cents")) {
+                                    mod_matrix.poly_synth().set_osc2_detune_cents(osc2_det);
+                                }
+
+                                int osc2_oct = mod_matrix.poly_synth().osc2_octave_offset();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderInt("Osc 2 Octave", &osc2_oct, -2, 2)) {
+                                    mod_matrix.poly_synth().set_osc2_octave_offset(osc2_oct);
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "PER-VOICE BIQUAD FILTER");
+                                ImGui::Separator();
+
+                                const char* flt_names[] = { "LowPass", "HighPass", "BandPass", "Notch" };
+                                int flt_type = static_cast<int>(mod_matrix.poly_synth().filter_type());
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::Combo("Filter Type", &flt_type, flt_names, 4)) {
+                                    mod_matrix.poly_synth().set_filter_type(static_cast<dsp::FilterType>(flt_type));
+                                }
+
+                                float f_cut = mod_matrix.poly_synth().base_cutoff();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Cutoff (Hz)", &f_cut, 40.0f, 18000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic)) {
+                                    mod_matrix.poly_synth().set_base_cutoff(f_cut);
+                                }
+
+                                float f_res = mod_matrix.poly_synth().resonance_q();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Resonance (Q)", &f_res, 0.5f, 18.0f, "%.2f")) {
+                                    mod_matrix.poly_synth().set_resonance_q(f_res);
+                                }
+
+                                float f_env = mod_matrix.poly_synth().filter_env_amount();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Filter Env Amt", &f_env, -8000.0f, 8000.0f, "%+.0f Hz")) {
+                                    mod_matrix.poly_synth().set_filter_env_amount(f_env);
+                                }
+
+                                float f_kt = mod_matrix.poly_synth().keytrack_amount();
+                                ImGui::SetNextItemWidth(260);
+                                if (ImGui::SliderFloat("Key Tracking", &f_kt, 0.0f, 1.0f, "%.2f")) {
+                                    mod_matrix.poly_synth().set_keytrack_amount(f_kt);
+                                }
                             }
                         }
                         ImGui::EndChild();
 
                         ImGui::SameLine();
 
-                        // Right column: Canvas (MSEG Spline Canvas or LFO Scope)
+                        // Right column: Canvas (MSEG Spline Canvas or LFO Scope or Polyphonic Telemetry Grid)
                         ImGui::BeginChild("ModulatorCanvasPanel", ImVec2(0, 0), true);
                         {
                             if (selected_modulator == 0 || selected_modulator == 1) {
@@ -4554,7 +4673,7 @@ int main(int argc, char** argv) {
                                         cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), selected_mseg_node);
                                     }
                                 }
-                            } else {
+                            } else if (selected_modulator == 2 || selected_modulator == 3) {
                                 // LFO Visualizer
                                 auto& cur_lfo = (selected_modulator == 2) ? mod_matrix.lfo1() : mod_matrix.lfo2();
                                 ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f),
@@ -4562,6 +4681,16 @@ int main(int argc, char** argv) {
                                                    (selected_modulator == 2) ? "LFO 1 (PRIMARY)" : "LFO 2 (SECONDARY)");
                                 const float scope_h = top_h - 40.0f;
                                 ui::DrawLfoOscilloscope("##LfoOsc", cur_lfo, ImVec2(0, scope_h));
+                            } else if (selected_modulator == 4) {
+                                // 16-Voice Runtime Telemetry Grid
+                                ImGui::TextColored(ImVec4(0.16f, 0.65f, 0.38f, 1.0f),
+                                                   "16-VOICE RUNTIME TELEMETRY GRID // Click-Free Voice Stealing Pool");
+                                ImGui::SameLine();
+                                ImGui::TextDisabled("| Dual MSEG Dynamic Levels • Stereo Pan Tracking • Zero-Allocation POD");
+
+                                std::array<modulation::PolyVoiceTelemetry, 16> poly_telem;
+                                mod_matrix.poly_synth().get_telemetry(poly_telem);
+                                ui::DrawPolyVoiceTelemetryGrid("##VoicePoolGrid", poly_telem, ImVec2(0, 0), mod_matrix.poly_synth().polyphony_limit());
                             }
                         }
                         ImGui::EndChild();
