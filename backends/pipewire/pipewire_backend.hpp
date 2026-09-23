@@ -23,6 +23,10 @@ struct DiscoveredStreamPair {
     std::string port_r;
     bool is_hardware_capture{false};
     bool is_monitor{false};
+    bool is_mono{false};
+    uint32_t node_id{0};
+    uint32_t channel_count{2};
+    std::string physical_port_name;
 };
 
 // ============================================================================
@@ -33,6 +37,8 @@ struct DiscoveredStreamPair {
 // 1. Live Stream Discovery: Asynchronous crawler for Linux apps and devices
 // 2. 1-Click Track Patching: Connect external audio directly to any channel strip
 // 3. Selective Ingestion: Respects TrackInputMode (Clip vs Stream vs Merge)
+// 4. Multi-Channel Hardware I/O: Discrete mono and stereo routing per track
+// 5. Dynamic Master Sink Switching: Seamless DAC / soundcard switching on the fly
 // ============================================================================
 class PipeWireBackend {
 public:
@@ -56,11 +62,21 @@ public:
     void refresh_discovery();
     [[nodiscard]] std::vector<DiscoveredStreamPair> get_available_sources() const;
     [[nodiscard]] std::vector<DiscoveredStreamPair> get_available_sinks() const;
+    [[nodiscard]] std::vector<DiscoveredStreamPair> get_hardware_inputs() const;
+    [[nodiscard]] std::vector<DiscoveredStreamPair> get_app_sources() const;
 
-    // Real-time Dynamic Port Patching (Connecting external apps to tracks)
+    // Real-time Dynamic Port Patching (Connecting external apps/hardware to tracks)
     bool link_source_to_track(const DiscoveredStreamPair& stream, uint32_t track_id);
     bool unlink_source_from_track(const DiscoveredStreamPair& stream, uint32_t track_id);
     bool unlink_all_for_track(uint32_t track_id);
+    [[nodiscard]] std::optional<DiscoveredStreamPair> get_track_source(uint32_t track_id) const;
+    [[nodiscard]] bool is_track_linked(uint32_t track_id) const;
+
+    // Master Audio Hardware Output Device Selection (Dynamic DAC / Sink Switching)
+    bool connect_master_to_sink(const std::string& sink_node_name);
+    bool disconnect_master_output();
+    [[nodiscard]] std::string active_master_sink_node_name() const;
+    [[nodiscard]] std::string active_master_sink_display_name() const;
 
     // AoIP Network Receiver Integration
     void set_aoip_receiver(network::AoipReceiver* receiver) noexcept;

@@ -81,6 +81,10 @@ public:
         m_target_bus.store(-1, std::memory_order_relaxed);
         m_seq_send_a_bus.store(-1, std::memory_order_relaxed);
         m_seq_send_b_bus.store(-1, std::memory_order_relaxed);
+        m_input_gain.store(1.0f, std::memory_order_relaxed);
+        m_input_phase_invert.store(false, std::memory_order_relaxed);
+        m_input_meter_peak_l.store(0.0f, std::memory_order_relaxed);
+        m_input_meter_peak_r.store(0.0f, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -106,6 +110,10 @@ public:
         m_mute_group_mask.store(0, std::memory_order_relaxed);
         m_seq_send_a_bus.store(-1, std::memory_order_relaxed);
         m_seq_send_b_bus.store(-1, std::memory_order_relaxed);
+        m_input_gain.store(1.0f, std::memory_order_relaxed);
+        m_input_phase_invert.store(false, std::memory_order_relaxed);
+        m_input_meter_peak_l.store(0.0f, std::memory_order_relaxed);
+        m_input_meter_peak_r.store(0.0f, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -215,6 +223,18 @@ public:
         m_meter_peak_r.store(0.0f, std::memory_order_relaxed);
         m_meter_rms_l.store(0.0f, std::memory_order_relaxed);
         m_meter_rms_r.store(0.0f, std::memory_order_relaxed);
+        m_input_meter_peak_l.store(0.0f, std::memory_order_relaxed);
+        m_input_meter_peak_r.store(0.0f, std::memory_order_relaxed);
+    }
+
+    void set_input_gain(float gain) noexcept { m_input_gain.store(std::max(0.0f, gain), std::memory_order_relaxed); }
+    [[nodiscard]] float input_gain() const noexcept { return m_input_gain.load(std::memory_order_relaxed); }
+
+    void set_input_phase_invert(bool invert) noexcept { m_input_phase_invert.store(invert, std::memory_order_relaxed); }
+    [[nodiscard]] bool input_phase_invert() const noexcept { return m_input_phase_invert.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] std::pair<float, float> input_meter() const noexcept {
+        return { m_input_meter_peak_l.load(std::memory_order_relaxed), m_input_meter_peak_r.load(std::memory_order_relaxed) };
     }
 
     void set_console_type(dsp::ConsoleType type) noexcept {
@@ -445,6 +465,27 @@ public:
         Sample* left = m_buffer.view().channel(0);
         Sample* right = m_buffer.view().channel(1);
 
+        // Pre-Insert Input Gain (Trim), Phase Invert & Input Metering
+        float in_g = m_input_gain.load(std::memory_order_relaxed);
+        bool in_inv = m_input_phase_invert.load(std::memory_order_relaxed);
+        float mult = in_inv ? -in_g : in_g;
+
+        float in_peak_l = 0.0f;
+        float in_peak_r = 0.0f;
+
+        for (uint32_t i = 0; i < frames; ++i) {
+            if (mult != 1.0f) {
+                left[i] *= mult;
+                right[i] *= mult;
+            }
+            float al = std::abs(left[i]);
+            float ar = std::abs(right[i]);
+            if (al > in_peak_l) in_peak_l = al;
+            if (ar > in_peak_r) in_peak_r = ar;
+        }
+        m_input_meter_peak_l.store(in_peak_l, std::memory_order_relaxed);
+        m_input_meter_peak_r.store(in_peak_r, std::memory_order_relaxed);
+
         // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, MultiHeadOde, PurestDrive, WASM)
         for (size_t s = 0; s < m_slots.size(); ++s) {
             const Sample* sc_l = nullptr;
@@ -570,6 +611,10 @@ private:
     std::atomic<double> m_clip_playhead{0.0};
     std::atomic<bool> m_sync_to_transport{false};
     std::atomic<TrackInputMode> m_input_mode{TrackInputMode::InternalClip};
+    std::atomic<float> m_input_gain{1.0f};
+    std::atomic<bool> m_input_phase_invert{false};
+    std::atomic<float> m_input_meter_peak_l{0.0f};
+    std::atomic<float> m_input_meter_peak_r{0.0f};
     sampling::VariSpeedStreamer m_streamer;
 
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};

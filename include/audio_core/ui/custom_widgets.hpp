@@ -16,6 +16,11 @@ inline float linear_to_db(float lin) noexcept {
     return 20.0f * std::log10(lin);
 }
 
+inline float db_to_linear(float db) noexcept {
+    if (db <= -96.0f) return 0.0f;
+    return std::pow(10.0f, db / 20.0f);
+}
+
 // Map dB [-60 dB .. +6 dB] to normalized [0.0 .. 1.0]
 inline float db_to_normalized(float db) noexcept {
     constexpr float kMinDb = -60.0f;

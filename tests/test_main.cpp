@@ -1043,10 +1043,59 @@ void test_pipewire_stream_discovery_and_linking() {
     // Attempt link: mode updates to PipeWireStream
     pw.link_source_to_track(mock_stream, trk1->id());
     TEST_CHECK(trk1->input_mode() == TrackInputMode::PipeWireStream);
+    TEST_CHECK(pw.is_track_linked(trk1->id()));
+    auto active_src = pw.get_track_source(trk1->id());
+    TEST_CHECK(active_src.has_value());
+    TEST_CHECK(active_src->node_name == "test_player");
+
+    // Test Mono stream linking
+    DiscoveredStreamPair mock_mono{};
+    mock_mono.node_name = "test_mic";
+    mock_mono.display_name = "Mock USB Mic (Mono)";
+    mock_mono.port_l = "test_mic:capture_MONO";
+    mock_mono.port_r = "test_mic:capture_MONO";
+    mock_mono.is_mono = true;
+    mock_mono.is_hardware_capture = true;
+
+    pw.link_source_to_track(mock_mono, trk1->id());
+    TEST_CHECK(pw.is_track_linked(trk1->id()));
+    TEST_CHECK(pw.get_track_source(trk1->id())->is_mono);
 
     // Unlink: mode restores to InternalClip
-    pw.unlink_source_from_track(mock_stream, trk1->id());
+    pw.unlink_source_from_track(mock_mono, trk1->id());
     TEST_CHECK(trk1->input_mode() == TrackInputMode::InternalClip);
+    TEST_CHECK(!pw.is_track_linked(trk1->id()));
+
+    // 2b. Master Output Sink Switching & Disconnection
+    if (!sinks.empty()) {
+        bool connected = pw.connect_master_to_sink(sinks[0].node_name);
+        // Could be true or false depending on whether backend filter is connected, but method shouldn't crash
+        (void)connected;
+    }
+    pw.disconnect_master_output();
+    TEST_CHECK(pw.active_master_sink_node_name().empty());
+
+    // 2c. Pre-Insert Input Gain (Trim), Phase Invert & Input Metering
+    trk1->buffer().clear();
+    for (uint32_t f = 0; f < 256; ++f) {
+        trk1->buffer().view().channel(0)[f] = 0.5f;
+        trk1->buffer().view().channel(1)[f] = 0.5f;
+    }
+    trk1->set_input_gain(1.5f);
+    trk1->set_input_phase_invert(true);
+    TEST_CHECK(trk1->input_gain() == 1.5f);
+    TEST_CHECK(trk1->input_phase_invert() == true);
+
+    trk1->process_channel_strip(256);
+    auto [in_pk_l, in_pk_r] = trk1->input_meter();
+    TEST_CHECK(std::abs(in_pk_l - 0.75f) < 1e-4f);
+    TEST_CHECK(std::abs(in_pk_r - 0.75f) < 1e-4f);
+    // Polarity flipped: samples became negative before inserts
+    TEST_CHECK(trk1->buffer().view().channel(0)[0] < 0.0f);
+
+    // Restore track trim and phase
+    trk1->set_input_gain(1.0f);
+    trk1->set_input_phase_invert(false);
 
     // 3. AoIP Receiver Integration
     network::AoipReceiver aoip_rx(14849);

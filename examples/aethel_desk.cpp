@@ -523,6 +523,7 @@ int main(int argc, char** argv) {
     bool open_bounce_modal = false;
     bool open_save_rack_modal = false;
     bool open_load_rack_modal = false;
+    bool open_hardware_io_modal = false;
 
     auto sync_ui_from_mixer = [&]() {
         for (int i = 0; i < 4; ++i) {
@@ -755,13 +756,16 @@ int main(int argc, char** argv) {
             if (pw_online) {
                 auto sources = pw.get_available_sources();
                 auto sinks = pw.get_available_sinks();
-                ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "[PW: %zu SRC / %zu SNK]", sources.size(), sinks.size());
+                if (ImGui::Button("[ HARDWARE I/O ]", ImVec2(125, 32))) {
+                    pw.refresh_discovery();
+                    open_hardware_io_modal = true;
+                }
+                ImGui::SameLine(0, 6);
+                ImGui::TextColored(ImVec4(0.12f, 0.55f, 0.95f, 1.0f), "[HW: %zu IN / %zu OUT]", sources.size(), sinks.size());
             } else {
-                ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.20f, 1.0f), "[PW: OFFLINE]");
-            }
-            ImGui::SameLine(0, 4);
-            if (ImGui::SmallButton("RESCAN")) {
-                pw.refresh_discovery();
+                if (ImGui::Button("[ HW: OFFLINE ]", ImVec2(115, 32))) {
+                    open_hardware_io_modal = true;
+                }
             }
 
             ImGui::SameLine(0, 12);
@@ -2170,13 +2174,14 @@ int main(int argc, char** argv) {
                             }
                             ImGui::Separator();
 
-                            // INPUT SELECTION (Zähl AM1 Clean Slate Routing to PipeWire / Dante / Clip)
+                            // INPUT SELECTION & PRE-INSERT GAIN/PHASE STAGING
                             auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             TrackInputMode in_mode = trk_ptr ? trk_ptr->input_mode() : TrackInputMode::InternalClip;
                             const char* mode_labels[4] = { "CLIP", "PIPEWIRE", "MERGE", "AOIP" };
                             int cur_mode_idx = static_cast<int>(in_mode);
 
-                            ImGui::TextDisabled("Input:");
+                            // Row 1: Input Mode & Phase Invert Button
+                            ImGui::TextDisabled("In:");
                             ImGui::SameLine();
                             ImGui::SetNextItemWidth(90);
                             if (ImGui::Combo("##InMode", &cur_mode_idx, mode_labels, 4)) {
@@ -2188,18 +2193,69 @@ int main(int argc, char** argv) {
                                     }
                                 }
                             }
+                            ImGui::SameLine();
+                            bool phase_inv = trk_ptr ? trk_ptr->input_phase_invert() : false;
+                            if (phase_inv) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            }
+                            if (ImGui::Button("Ø##Phase", ImVec2(26, 20))) {
+                                if (trk_ptr) trk_ptr->set_input_phase_invert(!phase_inv);
+                            }
+                            if (phase_inv) ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pre-insert Phase Invert (180° Polarity Reversal)");
 
-                            // Dynamic contextual input controls
+                            // Row 2: Input Trim (-24 dB .. +24 dB) & Pre-insert Input Peak LED
+                            ImGui::TextDisabled("Trim:");
+                            ImGui::SameLine();
+                            float cur_gain_db = ui::linear_to_db(trk_ptr ? trk_ptr->input_gain() : 1.0f);
+                            if (cur_gain_db < -24.0f) cur_gain_db = -24.0f;
+                            if (cur_gain_db > 24.0f) cur_gain_db = 24.0f;
+                            ImGui::SetNextItemWidth(100);
+                            if (ImGui::SliderFloat("##Trim", &cur_gain_db, -24.0f, 24.0f, "%+.1f dB")) {
+                                if (trk_ptr) trk_ptr->set_input_gain(ui::db_to_linear(cur_gain_db));
+                            }
+                            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                if (trk_ptr) trk_ptr->set_input_gain(1.0f);
+                            }
+                            ImGui::SameLine();
+                            auto in_meters = trk_ptr ? trk_ptr->input_meter() : std::pair<float, float>{0.0f, 0.0f};
+                            float in_peak = std::max(in_meters.first, in_meters.second);
+                            ImVec4 led_col = (in_peak >= 0.999f) ? ImVec4(0.95f, 0.15f, 0.15f, 1.0f) :
+                                             ((in_peak >= 0.005f) ? ImVec4(0.20f, 0.85f, 0.35f, 1.0f) : ImVec4(0.45f, 0.50f, 0.55f, 0.5f));
+                            ImGui::TextColored(led_col, "●");
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::SetTooltip("Pre-insert Input Level: %.1f dBFS\n(Double-click Trim to reset 0.0 dB)", ui::linear_to_db(in_peak));
+                            }
+
+                            // Row 3: Dynamic Contextual Hardware / AoIP Patching
                             if (in_mode == TrackInputMode::PipeWireStream || in_mode == TrackInputMode::MergeAll) {
+                                auto linked_src = pw.get_track_source(t + 1);
+                                if (linked_src.has_value()) {
+                                    ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.35f, 1.0f), "● [%s] %.16s",
+                                                       linked_src->is_mono ? "1ch" : "2ch",
+                                                       linked_src->display_name.c_str());
+                                } else {
+                                    ImGui::TextDisabled("○ External unlinked");
+                                }
+
                                 auto sources = pw.get_available_sources();
                                 static int sel_pw_source[4] = { 0, 0, 0, 0 };
                                 if (!sources.empty()) {
                                     if (sel_pw_source[t] >= static_cast<int>(sources.size())) sel_pw_source[t] = 0;
-                                    ImGui::SetNextItemWidth(120);
-                                    if (ImGui::BeginCombo("##PWSrc", sources[sel_pw_source[t]].display_name.c_str())) {
+                                    ImGui::SetNextItemWidth(110);
+                                    char combo_preview[64];
+                                    std::snprintf(combo_preview, sizeof(combo_preview), "[%s] %.12s",
+                                                  sources[sel_pw_source[t]].is_hardware_capture ? (sources[sel_pw_source[t]].is_mono ? "HW1" : "HW2") : "APP",
+                                                  sources[sel_pw_source[t]].display_name.c_str());
+                                    if (ImGui::BeginCombo("##PWSrc", combo_preview)) {
                                         for (size_t s_idx = 0; s_idx < sources.size(); ++s_idx) {
                                             bool is_selected = (sel_pw_source[t] == static_cast<int>(s_idx));
-                                            if (ImGui::Selectable(sources[s_idx].display_name.c_str(), is_selected)) {
+                                            char item_name[128];
+                                            std::snprintf(item_name, sizeof(item_name), "[%s] %s",
+                                                          sources[s_idx].is_hardware_capture ? (sources[s_idx].is_mono ? "HW 1ch" : "HW 2ch") : "APP",
+                                                          sources[s_idx].display_name.c_str());
+                                            if (ImGui::Selectable(item_name, is_selected)) {
                                                 sel_pw_source[t] = static_cast<int>(s_idx);
                                             }
                                         }
@@ -2214,7 +2270,7 @@ int main(int argc, char** argv) {
                                         pw.unlink_all_for_track(t + 1);
                                     }
                                 } else {
-                                    ImGui::TextDisabled("No PW streams");
+                                    ImGui::TextDisabled("No PW streams found");
                                 }
                             } else if (in_mode == TrackInputMode::NetworkAoip) {
                                 ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "Dante Ch %d/%d (UDP:4848)", t * 2 + 1, t * 2 + 2);
@@ -3595,6 +3651,377 @@ int main(int argc, char** argv) {
             }
             ImGui::SameLine();
             if (ImGui::Button("CANCEL", ImVec2(80, 28))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        // ------------------------------------------------------------
+        // HARDWARE AUDIO I/O MANAGER MODAL DIALOG
+        // ------------------------------------------------------------
+        if (open_hardware_io_modal) {
+            ImGui::OpenPopup("Hardware Audio I/O Manager");
+            open_hardware_io_modal = false;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(860, 640), ImGuiCond_FirstUseEver);
+        if (ImGui::BeginPopupModal("Hardware Audio I/O Manager", nullptr, ImGuiWindowFlags_None)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "HARDWARE AUDIO I/O MATRIX & DEVICE ROUTER");
+            ImGui::SameLine();
+            if (pw_online) {
+                ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.35f, 1.0f), "[ PIPEWIRE ACTIVE (48 kHz / 32-bit Float) ]");
+            } else {
+                ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "[ PIPEWIRE OFFLINE ]");
+            }
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // Top Action Bar
+            if (ImGui::Button("REFRESH DISCOVERY", ImVec2(160, 26))) {
+                pw.refresh_discovery();
+            }
+            ImGui::SameLine(0, 15);
+            auto hw_inputs = pw.get_hardware_inputs();
+            auto app_sources = pw.get_app_sources();
+            auto sinks = pw.get_available_sinks();
+            ImGui::TextDisabled("Found: %zu HW Inputs (%zu App Streams) | %zu Output Sinks (DACs)",
+                                hw_inputs.size(), app_sources.size(), sinks.size());
+
+            ImGui::SameLine(ImGui::GetWindowWidth() - 90);
+            if (ImGui::Button("CLOSE", ImVec2(75, 26))) {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            // SECTION 1: MASTER AUDIO OUTPUT (DAC ROUTING)
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "1. MASTER AUDIO OUTPUT (DAC / SINK ROUTING)");
+            std::string active_sink_disp = pw.active_master_sink_display_name();
+            std::string active_sink_node = pw.active_master_sink_node_name();
+            if (active_sink_disp.empty()) {
+                ImGui::Text("Active Master DAC: [None / Disconnected]");
+            } else {
+                ImGui::Text("Active Master DAC: ");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.12f, 0.70f, 0.35f, 1.0f), "%s", active_sink_disp.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%s)", active_sink_node.c_str());
+            }
+
+            static int sel_sink_idx = 0;
+            if (!sinks.empty()) {
+                if (sel_sink_idx >= static_cast<int>(sinks.size())) sel_sink_idx = 0;
+                ImGui::SetNextItemWidth(380);
+                if (ImGui::BeginCombo("##MasterSinkCombo", sinks[sel_sink_idx].display_name.c_str())) {
+                    for (size_t i = 0; i < sinks.size(); ++i) {
+                        bool is_sel = (sel_sink_idx == static_cast<int>(i));
+                        char sink_item[256];
+                        std::snprintf(sink_item, sizeof(sink_item), "%s (Node %u)", sinks[i].display_name.c_str(), sinks[i].node_id);
+                        if (ImGui::Selectable(sink_item, is_sel)) {
+                            sel_sink_idx = static_cast<int>(i);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("SWITCH MASTER DAC", ImVec2(160, 24))) {
+                    pw.connect_master_to_sink(sinks[sel_sink_idx].node_name);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("DISCONNECT DAC", ImVec2(130, 24))) {
+                    pw.disconnect_master_output();
+                }
+            } else {
+                ImGui::TextDisabled("No output audio sinks discovered.");
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            // SECTION 2: MULTI-CHANNEL HARDWARE INPUT ROUTING MATRIX
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "2. HARDWARE & APPLICATION INPUT ROUTING MATRIX");
+
+            if (ImGui::BeginTabBar("HardwareIoTabBar")) {
+                if (ImGui::BeginTabItem("  PHYSICAL HARDWARE INPUTS (ADCs)  ")) {
+                    if (hw_inputs.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("No physical hardware capture devices detected.");
+                    } else {
+                        if (ImGui::BeginTable("HwInputsTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 180))) {
+                            ImGui::TableSetupColumn("Device / Port", ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                            ImGui::TableSetupColumn("Node ID", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                            ImGui::TableSetupColumn("Physical Port", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                            ImGui::TableSetupColumn("Direct Track Patch", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                            ImGui::TableHeadersRow();
+
+                            Track* track_arr[4] = { trk0, trk1, trk2, trk3 };
+
+                            for (size_t i = 0; i < hw_inputs.size(); ++i) {
+                                const auto& src = hw_inputs[i];
+                                ImGui::TableNextRow();
+                                ImGui::PushID(static_cast<int>(i));
+
+                                // Col 0: Device Name
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(src.display_name.c_str());
+
+                                // Col 1: Type
+                                ImGui::TableSetColumnIndex(1);
+                                if (src.is_mono) {
+                                    ImGui::TextColored(ImVec4(0.85f, 0.65f, 0.15f, 1.0f), "MONO");
+                                } else {
+                                    ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "STEREO");
+                                }
+
+                                // Col 2: Node ID
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::Text("%u", src.node_id);
+
+                                // Col 3: Physical Port
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::TextDisabled("%s", src.physical_port_name.empty() ? src.port_l.c_str() : src.physical_port_name.c_str());
+
+                                // Col 4: Direct Track Patch Buttons [-> T1] [-> T2] [-> T3] [-> T4]
+                                ImGui::TableSetColumnIndex(4);
+                                for (uint32_t t = 1; t <= 4; ++t) {
+                                    auto linked_src = pw.get_track_source(t);
+                                    bool is_active = linked_src.has_value() &&
+                                                     linked_src->node_name == src.node_name &&
+                                                     linked_src->port_l == src.port_l;
+                                    char btn_lbl[32];
+                                    std::snprintf(btn_lbl, sizeof(btn_lbl), "T%u##hw_%zu", t, i);
+                                    if (is_active) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.65f, 0.30f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    }
+                                    if (ImGui::Button(btn_lbl, ImVec2(46, 20))) {
+                                        if (is_active) {
+                                            pw.unlink_all_for_track(t);
+                                        } else {
+                                            if (track_arr[t - 1]) track_arr[t - 1]->set_input_mode(TrackInputMode::PipeWireStream);
+                                            pw.link_source_to_track(src, t);
+                                        }
+                                    }
+                                    if (is_active) ImGui::PopStyleColor(2);
+                                    if (ImGui::IsItemHovered()) {
+                                        ImGui::SetTooltip("%s Track %u to %s", is_active ? "Unlink" : "Patch", t, src.display_name.c_str());
+                                    }
+                                    if (t < 4) ImGui::SameLine();
+                                }
+
+                                // Col 5: Clear / Unlink
+                                ImGui::TableSetColumnIndex(5);
+                                if (ImGui::SmallButton("UNLINK")) {
+                                    for (uint32_t t = 1; t <= 4; ++t) {
+                                        auto linked_src = pw.get_track_source(t);
+                                        if (linked_src.has_value() &&
+                                            linked_src->node_name == src.node_name &&
+                                            linked_src->port_l == src.port_l) {
+                                            pw.unlink_all_for_track(t);
+                                        }
+                                    }
+                                }
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("  APPLICATION STREAMS (JACK / PIPEWIRE)  ")) {
+                    if (app_sources.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("No external audio applications detected.");
+                    } else {
+                        if (ImGui::BeginTable("AppSourcesTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 180))) {
+                            ImGui::TableSetupColumn("Application / Client", ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("Node ID", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                            ImGui::TableSetupColumn("Ports (L/R)", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                            ImGui::TableSetupColumn("Direct Track Patch", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                            ImGui::TableHeadersRow();
+
+                            Track* track_arr[4] = { trk0, trk1, trk2, trk3 };
+
+                            for (size_t i = 0; i < app_sources.size(); ++i) {
+                                const auto& src = app_sources[i];
+                                ImGui::TableNextRow();
+                                ImGui::PushID(static_cast<int>(1000 + i));
+
+                                // Col 0: App Name
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(src.display_name.c_str());
+
+                                // Col 1: Node ID
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::Text("%u", src.node_id);
+
+                                // Col 2: Ports
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TextDisabled("%s / %s", src.port_l.c_str(), src.port_r.c_str());
+
+                                // Col 3: Direct Track Patch Buttons
+                                ImGui::TableSetColumnIndex(3);
+                                for (uint32_t t = 1; t <= 4; ++t) {
+                                    auto linked_src = pw.get_track_source(t);
+                                    bool is_active = linked_src.has_value() &&
+                                                     linked_src->node_name == src.node_name &&
+                                                     linked_src->port_l == src.port_l;
+                                    char btn_lbl[32];
+                                    std::snprintf(btn_lbl, sizeof(btn_lbl), "T%u##app_%zu", t, i);
+                                    if (is_active) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.65f, 0.30f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    }
+                                    if (ImGui::Button(btn_lbl, ImVec2(46, 20))) {
+                                        if (is_active) {
+                                            pw.unlink_all_for_track(t);
+                                        } else {
+                                            if (track_arr[t - 1]) track_arr[t - 1]->set_input_mode(TrackInputMode::PipeWireStream);
+                                            pw.link_source_to_track(src, t);
+                                        }
+                                    }
+                                    if (is_active) ImGui::PopStyleColor(2);
+                                    if (ImGui::IsItemHovered()) {
+                                        ImGui::SetTooltip("%s Track %u to %s", is_active ? "Unlink" : "Patch", t, src.display_name.c_str());
+                                    }
+                                    if (t < 4) ImGui::SameLine();
+                                }
+
+                                // Col 4: Clear / Unlink
+                                ImGui::TableSetColumnIndex(4);
+                                if (ImGui::SmallButton("UNLINK")) {
+                                    for (uint32_t t = 1; t <= 4; ++t) {
+                                        auto linked_src = pw.get_track_source(t);
+                                        if (linked_src.has_value() &&
+                                            linked_src->node_name == src.node_name &&
+                                            linked_src->port_l == src.port_l) {
+                                            pw.unlink_all_for_track(t);
+                                        }
+                                    }
+                                }
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            // SECTION 3: CHANNEL STRIP INPUT STAGING & METERING OVERVIEW
+            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "3. CHANNEL STRIP INPUT STAGING & REAL-TIME METERING");
+            if (ImGui::BeginTable("TrackInputOverviewTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, 140))) {
+                ImGui::TableSetupColumn("Track", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                ImGui::TableSetupColumn("Input Mode", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                ImGui::TableSetupColumn("Source Routing", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Trim Gain", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Phase", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+                ImGui::TableSetupColumn("Input Peak", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Reset", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                ImGui::TableHeadersRow();
+
+                Track* track_arr[4] = { trk0, trk1, trk2, trk3 };
+                const char* t_names[4] = { "1: Kick / 808", "2: Acid 303", "3: Vocal", "4: Drums" };
+                const char* m_labels[4] = { "CLIP", "PIPEWIRE", "MERGE", "AOIP" };
+
+                for (uint32_t t = 0; t < 4; ++t) {
+                    Track* trk = track_arr[t];
+                    if (!trk) continue;
+
+                    ImGui::TableNextRow();
+                    ImGui::PushID(static_cast<int>(5000 + t));
+
+                    // Col 0: Track
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%s", t_names[t]);
+
+                    // Col 1: Mode
+                    ImGui::TableSetColumnIndex(1);
+                    int cur_m = static_cast<int>(trk->input_mode());
+                    ImGui::SetNextItemWidth(80);
+                    if (ImGui::Combo("##TblMode", &cur_m, m_labels, 4)) {
+                        trk->set_input_mode(static_cast<TrackInputMode>(cur_m));
+                        if (static_cast<TrackInputMode>(cur_m) == TrackInputMode::InternalClip) {
+                            pw.unlink_all_for_track(t + 1);
+                        }
+                    }
+
+                    // Col 2: Source Routing
+                    ImGui::TableSetColumnIndex(2);
+                    auto linked_src = pw.get_track_source(t + 1);
+                    if (linked_src.has_value()) {
+                        ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.35f, 1.0f), "● [%s] %s",
+                                           linked_src->is_hardware_capture ? (linked_src->is_mono ? "HW-1ch" : "HW-2ch") : "APP",
+                                           linked_src->display_name.c_str());
+                    } else if (trk->input_mode() == TrackInputMode::NetworkAoip) {
+                        ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.85f, 1.0f), "Dante Ch %d/%d (UDP:4848)", t * 2 + 1, t * 2 + 2);
+                    } else if (trk->input_mode() == TrackInputMode::InternalClip) {
+                        ImGui::TextDisabled("Internal Clip Engine");
+                    } else {
+                        ImGui::TextDisabled("— Unlinked —");
+                    }
+
+                    // Col 3: Trim Gain
+                    ImGui::TableSetColumnIndex(3);
+                    float cur_trim_db = ui::linear_to_db(trk->input_gain());
+                    if (cur_trim_db < -24.0f) cur_trim_db = -24.0f;
+                    if (cur_trim_db > 24.0f) cur_trim_db = 24.0f;
+                    ImGui::SetNextItemWidth(100);
+                    if (ImGui::SliderFloat("##TblTrim", &cur_trim_db, -24.0f, 24.0f, "%+.1f dB")) {
+                        trk->set_input_gain(ui::db_to_linear(cur_trim_db));
+                    }
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        trk->set_input_gain(1.0f);
+                    }
+
+                    // Col 4: Phase
+                    ImGui::TableSetColumnIndex(4);
+                    bool ph = trk->input_phase_invert();
+                    if (ph) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::Button("Ø##TblPh", ImVec2(28, 20))) {
+                        trk->set_input_phase_invert(!ph);
+                    }
+                    if (ph) ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pre-insert Phase Invert");
+
+                    // Col 5: Input Peak Meter
+                    ImGui::TableSetColumnIndex(5);
+                    auto in_m = trk->input_meter();
+                    float pk = std::max(in_m.first, in_m.second);
+                    float pk_db = ui::linear_to_db(pk);
+                    ImVec4 pk_col = (pk >= 0.999f) ? ImVec4(0.95f, 0.15f, 0.15f, 1.0f) :
+                                    ((pk >= 0.005f) ? ImVec4(0.20f, 0.85f, 0.35f, 1.0f) : ImVec4(0.45f, 0.50f, 0.55f, 0.6f));
+                    ImGui::TextColored(pk_col, "%+.1f dB", pk_db);
+
+                    // Col 6: Reset / Unlink
+                    ImGui::TableSetColumnIndex(6);
+                    if (ImGui::SmallButton("RESET")) {
+                        trk->set_input_gain(1.0f);
+                        trk->set_input_phase_invert(false);
+                        pw.unlink_all_for_track(t + 1);
+                    }
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Button("DONE", ImVec2(100, 28))) {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();

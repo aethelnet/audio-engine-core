@@ -88,6 +88,9 @@ struct PipeWireBackend::Impl {
     // Active native link proxies
     std::unordered_map<uint32_t, std::vector<struct pw_proxy*>> track_links;
     std::vector<struct pw_proxy*> master_links;
+    std::string active_master_sink_node;
+    std::string active_master_sink_display;
+    std::unordered_map<uint32_t, DiscoveredStreamPair> active_track_sources;
 
     // Discovered Streams Snapshot
     mutable std::mutex discovery_mutex;
@@ -303,38 +306,75 @@ struct PipeWireBackend::Impl {
         return link;
     }
 
-    void auto_connect_master_output() {
+    bool connect_sink_internal(const std::string& sink_name_or_id) {
         if (!core || our_node_id == 0 || our_master_out_l_id == 0 || our_master_out_r_id == 0) {
-            return;
+            return false;
         }
 
-        std::lock_guard<std::mutex> lock(registry_mutex);
+        if (loop) pw_thread_loop_lock(loop);
+        for (auto* proxy : master_links) {
+            if (proxy) pw_proxy_destroy(proxy);
+        }
+        master_links.clear();
+        active_master_sink_node.clear();
+        active_master_sink_display.clear();
+        if (loop) pw_thread_loop_unlock(loop);
 
-        // Find primary output sink (Speakers / Headphones)
+        if (sink_name_or_id.empty()) return true;
+
         uint32_t sink_node_id = 0;
-        for (const auto& [nid, ninfo] : nodes) {
-            if (nid == our_node_id) continue;
-            if (ninfo.media_class == "Audio/Sink" || ninfo.name.rfind("alsa_output", 0) == 0) {
-                sink_node_id = nid;
-                break;
+        std::string display_name;
+
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex);
+            for (const auto& [nid, ninfo] : nodes) {
+                if (nid == our_node_id) continue;
+                if (ninfo.name == sink_name_or_id || (!ninfo.description.empty() && ninfo.description == sink_name_or_id)) {
+                    sink_node_id = nid;
+                    display_name = !ninfo.description.empty() ? ninfo.description : ninfo.name;
+                    break;
+                }
+            }
+
+            if (sink_node_id == 0) {
+                try {
+                    uint32_t parsed_id = static_cast<uint32_t>(std::stoul(sink_name_or_id));
+                    if (nodes.find(parsed_id) != nodes.end()) {
+                        sink_node_id = parsed_id;
+                        display_name = !nodes[parsed_id].description.empty() ? nodes[parsed_id].description : nodes[parsed_id].name;
+                    }
+                } catch (...) {}
             }
         }
 
-        if (sink_node_id == 0) return;
+        if (sink_node_id == 0) return false;
 
         uint32_t sink_port_l = 0;
         uint32_t sink_port_r = 0;
 
-        for (const auto& [pid, pinfo] : ports) {
-            if (pinfo.node_id != sink_node_id || pinfo.direction != "in") continue;
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex);
+            for (const auto& [pid, pinfo] : ports) {
+                if (pinfo.node_id != sink_node_id || pinfo.direction != "in") continue;
 
-            if (pinfo.channel == "FL" || pinfo.name.find("playback_FL") != std::string::npos ||
-                pinfo.name.find("playback_0") != std::string::npos || pinfo.name.find("1") != std::string::npos) {
-                if (sink_port_l == 0) sink_port_l = pid;
-            } else if (pinfo.channel == "FR" || pinfo.name.find("playback_FR") != std::string::npos ||
-                       pinfo.name.find("playback_1") != std::string::npos || pinfo.name.find("2") != std::string::npos) {
-                if (sink_port_r == 0) sink_port_r = pid;
+                if (pinfo.channel == "FL" || pinfo.name.find("playback_FL") != std::string::npos ||
+                    pinfo.name.find("playback_0") != std::string::npos || pinfo.name.find("1") != std::string::npos) {
+                    if (sink_port_l == 0) sink_port_l = pid;
+                } else if (pinfo.channel == "FR" || pinfo.name.find("playback_FR") != std::string::npos ||
+                           pinfo.name.find("playback_1") != std::string::npos || pinfo.name.find("2") != std::string::npos) {
+                    if (sink_port_r == 0) sink_port_r = pid;
+                }
             }
+
+            if (sink_port_l == 0) {
+                for (const auto& [pid, pinfo] : ports) {
+                    if (pinfo.node_id == sink_node_id && pinfo.direction == "in") {
+                        sink_port_l = pid;
+                        break;
+                    }
+                }
+            }
+            if (sink_port_r == 0) sink_port_r = sink_port_l;
         }
 
         if (sink_port_l != 0 && our_master_out_l_id != 0) {
@@ -345,6 +385,37 @@ struct PipeWireBackend::Impl {
         if (sink_port_r != 0 && our_master_out_r_id != 0) {
             auto* link_r = create_native_link(our_node_id, our_master_out_r_id, sink_node_id, sink_port_r);
             if (link_r) master_links.push_back(link_r);
+        }
+
+        active_master_sink_node = sink_name_or_id;
+        active_master_sink_display = display_name;
+        return !master_links.empty();
+    }
+
+    void auto_connect_master_output() {
+        if (!core || our_node_id == 0 || our_master_out_l_id == 0 || our_master_out_r_id == 0) {
+            return;
+        }
+
+        if (!active_master_sink_node.empty()) {
+            connect_sink_internal(active_master_sink_node);
+            return;
+        }
+
+        std::string sink_to_connect;
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex);
+            for (const auto& [nid, ninfo] : nodes) {
+                if (nid == our_node_id) continue;
+                if (ninfo.media_class == "Audio/Sink" || ninfo.name.rfind("alsa_output", 0) == 0) {
+                    sink_to_connect = ninfo.name;
+                    break;
+                }
+            }
+        }
+
+        if (!sink_to_connect.empty()) {
+            connect_sink_internal(sink_to_connect);
         }
     }
 };
@@ -570,49 +641,109 @@ void PipeWireBackend::refresh_discovery() {
             else if (pinfo.direction == "in") in_ports.push_back(pinfo);
         }
 
-        auto build_pair = [&](const std::vector<Impl::PwPortInfo>& port_list, bool is_sink) -> std::optional<DiscoveredStreamPair> {
-            if (port_list.empty()) return std::nullopt;
-            DiscoveredStreamPair pair{};
-            pair.node_name = ninfo.name;
-            if (!ninfo.description.empty()) {
-                pair.display_name = ninfo.description;
-            } else if (!ninfo.app_name.empty()) {
-                pair.display_name = ninfo.app_name;
-            } else {
-                pair.display_name = ninfo.name;
-            }
+        std::string dev_name = !ninfo.description.empty() ? ninfo.description : (!ninfo.app_name.empty() ? ninfo.app_name : ninfo.name);
 
-            if (!is_sink) {
-                if (ninfo.name.rfind("alsa_input", 0) == 0) {
-                    pair.is_hardware_capture = true;
-                } else if (ninfo.name.rfind("alsa_output", 0) == 0) {
-                    pair.is_monitor = true;
-                }
-            }
+        bool is_hw_capture = (ninfo.media_class == "Audio/Source" || ninfo.media_class.find("Source") != std::string::npos || ninfo.name.rfind("alsa_input", 0) == 0);
+        bool is_monitor = (ninfo.media_class == "Audio/Sink" || ninfo.name.rfind("alsa_output", 0) == 0);
 
-            for (const auto& p : port_list) {
+        // Sort out_ports by ID
+        std::sort(out_ports.begin(), out_ports.end(), [](const Impl::PwPortInfo& a, const Impl::PwPortInfo& b) {
+            return a.id < b.id;
+        });
+
+        // 1. Process Output Ports (Capture Sources & Apps)
+        if (!out_ports.empty()) {
+            // Find FL and FR (or 1 and 2)
+            const Impl::PwPortInfo* p_fl = nullptr;
+            const Impl::PwPortInfo* p_fr = nullptr;
+
+            for (const auto& p : out_ports) {
                 if (p.channel == "FL" || p.name.find("FL") != std::string::npos ||
-                    p.name.find("capture_1") != std::string::npos || p.name.find("playback_FL") != std::string::npos ||
-                    p.name.find("playback_0") != std::string::npos || p.name.find("1") != std::string::npos) {
-                    if (pair.port_l.empty()) pair.port_l = ninfo.name + ":" + p.name;
+                    p.name.find("capture_1") != std::string::npos || p.name.find("1") != std::string::npos) {
+                    if (!p_fl) p_fl = &p;
                 } else if (p.channel == "FR" || p.name.find("FR") != std::string::npos ||
-                           p.name.find("capture_2") != std::string::npos || p.name.find("playback_FR") != std::string::npos ||
-                           p.name.find("playback_1") != std::string::npos || p.name.find("2") != std::string::npos) {
-                    if (pair.port_r.empty()) pair.port_r = ninfo.name + ":" + p.name;
+                           p.name.find("capture_2") != std::string::npos || p.name.find("2") != std::string::npos) {
+                    if (!p_fr) p_fr = &p;
                 }
             }
 
-            if (pair.port_l.empty() && !port_list.empty()) pair.port_l = ninfo.name + ":" + port_list[0].name;
-            if (pair.port_r.empty()) pair.port_r = pair.port_l;
+            // A. If multiple ports exist, add primary Stereo Pair
+            if (out_ports.size() >= 2) {
+                DiscoveredStreamPair pair{};
+                pair.node_id = nid;
+                pair.node_name = ninfo.name;
+                pair.display_name = dev_name + " (In 1+2 / Stereo)";
+                pair.port_l = ninfo.name + ":" + (p_fl ? p_fl->name : out_ports[0].name);
+                pair.port_r = ninfo.name + ":" + (p_fr ? p_fr->name : out_ports[1].name);
+                pair.is_hardware_capture = is_hw_capture;
+                pair.is_monitor = is_monitor;
+                pair.is_mono = false;
+                pair.channel_count = 2;
+                sources.push_back(std::move(pair));
 
-            return pair;
-        };
+                // If > 2 ports (e.g. 4, 8, 16 channel interfaces), add subsequent pairs (3+4, 5+6...)
+                for (size_t p = 2; p + 1 < out_ports.size(); p += 2) {
+                    DiscoveredStreamPair sub_pair{};
+                    sub_pair.node_id = nid;
+                    sub_pair.node_name = ninfo.name;
+                    sub_pair.display_name = dev_name + " (In " + std::to_string(p + 1) + "+" + std::to_string(p + 2) + " / Stereo)";
+                    sub_pair.port_l = ninfo.name + ":" + out_ports[p].name;
+                    sub_pair.port_r = ninfo.name + ":" + out_ports[p + 1].name;
+                    sub_pair.is_hardware_capture = is_hw_capture;
+                    sub_pair.is_monitor = is_monitor;
+                    sub_pair.is_mono = false;
+                    sub_pair.channel_count = 2;
+                    sources.push_back(std::move(sub_pair));
+                }
+            }
 
-        if (auto src_pair = build_pair(out_ports, false)) {
-            sources.push_back(std::move(*src_pair));
+            // B. Add Granular Mono Sources for each port
+            for (size_t p = 0; p < out_ports.size(); ++p) {
+                const auto& port = out_ports[p];
+                DiscoveredStreamPair mono_pair{};
+                mono_pair.node_id = nid;
+                mono_pair.node_name = ninfo.name;
+                mono_pair.port_l = ninfo.name + ":" + port.name;
+                mono_pair.port_r = mono_pair.port_l;
+                mono_pair.is_hardware_capture = is_hw_capture;
+                mono_pair.is_monitor = is_monitor;
+                mono_pair.is_mono = true;
+                mono_pair.channel_count = 1;
+
+                std::string ch_name = !port.channel.empty() ? port.channel : port.name;
+                if (out_ports.size() == 1) {
+                    mono_pair.display_name = dev_name + " (Mono)";
+                } else {
+                    mono_pair.display_name = dev_name + " - In " + ch_name + " (Mono)";
+                }
+                sources.push_back(std::move(mono_pair));
+            }
         }
-        if (auto sink_pair = build_pair(in_ports, true)) {
-            sinks.push_back(std::move(*sink_pair));
+
+        // 2. Process Input Ports (Playback Sinks)
+        if (!in_ports.empty()) {
+            DiscoveredStreamPair sink_pair{};
+            sink_pair.node_id = nid;
+            sink_pair.node_name = ninfo.name;
+            sink_pair.display_name = dev_name;
+            sink_pair.is_hardware_capture = false;
+            sink_pair.is_monitor = false;
+            sink_pair.is_mono = (in_ports.size() == 1);
+            sink_pair.channel_count = static_cast<uint32_t>(in_ports.size());
+
+            for (const auto& p : in_ports) {
+                if (p.channel == "FL" || p.name.find("FL") != std::string::npos ||
+                    p.name.find("playback_FL") != std::string::npos || p.name.find("playback_0") != std::string::npos || p.name.find("1") != std::string::npos) {
+                    if (sink_pair.port_l.empty()) sink_pair.port_l = ninfo.name + ":" + p.name;
+                } else if (p.channel == "FR" || p.name.find("FR") != std::string::npos ||
+                           p.name.find("playback_FR") != std::string::npos || p.name.find("playback_1") != std::string::npos || p.name.find("2") != std::string::npos) {
+                    if (sink_pair.port_r.empty()) sink_pair.port_r = ninfo.name + ":" + p.name;
+                }
+            }
+            if (sink_pair.port_l.empty() && !in_ports.empty()) sink_pair.port_l = ninfo.name + ":" + in_ports[0].name;
+            if (sink_pair.port_r.empty()) sink_pair.port_r = sink_pair.port_l;
+
+            sinks.push_back(std::move(sink_pair));
         }
     }
 
@@ -631,8 +762,29 @@ std::vector<DiscoveredStreamPair> PipeWireBackend::get_available_sinks() const {
     return m_impl->discovered_sinks;
 }
 
+std::vector<DiscoveredStreamPair> PipeWireBackend::get_hardware_inputs() const {
+    auto all = get_available_sources();
+    std::vector<DiscoveredStreamPair> hw;
+    for (const auto& s : all) {
+        if (s.is_hardware_capture) hw.push_back(s);
+    }
+    return hw;
+}
+
+std::vector<DiscoveredStreamPair> PipeWireBackend::get_app_sources() const {
+    auto all = get_available_sources();
+    std::vector<DiscoveredStreamPair> apps;
+    for (const auto& s : all) {
+        if (!s.is_hardware_capture && !s.is_monitor) apps.push_back(s);
+    }
+    return apps;
+}
+
 bool PipeWireBackend::link_source_to_track(const DiscoveredStreamPair& stream, uint32_t track_id) {
     if (stream.port_l.empty() || track_id == 0 || track_id > MixerGraph::kMaxTracks) return false;
+
+    // Unlink any existing links for this track first to prevent double-patching
+    unlink_all_for_track(track_id);
 
     auto* track = m_impl->mixer.get_track(track_id);
     if (track) {
@@ -651,7 +803,7 @@ bool PipeWireBackend::link_source_to_track(const DiscoveredStreamPair& stream, u
         {
             std::lock_guard<std::mutex> lock(m_impl->registry_mutex);
             for (const auto& [nid, ninfo] : m_impl->nodes) {
-                if (ninfo.name == stream.node_name) {
+                if (ninfo.name == stream.node_name || nid == stream.node_id) {
                     src_node_id = nid;
                     break;
                 }
@@ -661,22 +813,26 @@ bool PipeWireBackend::link_source_to_track(const DiscoveredStreamPair& stream, u
                 for (const auto& [pid, pinfo] : m_impl->ports) {
                     if (pinfo.node_id != src_node_id) continue;
                     std::string full_name = stream.node_name + ":" + pinfo.name;
-                    if (full_name == stream.port_l) src_port_l_id = pid;
-                    if (full_name == stream.port_r) src_port_r_id = pid;
+                    if (full_name == stream.port_l || pinfo.name == stream.port_l) src_port_l_id = pid;
+                    if (full_name == stream.port_r || pinfo.name == stream.port_r) src_port_r_id = pid;
                 }
             }
         }
 
         if (src_node_id != 0 && our_in_l != 0 && src_port_l_id != 0) {
+            uint32_t right_target = (stream.is_mono || src_port_r_id == 0) ? src_port_l_id : src_port_r_id;
+
             auto* link_l = m_impl->create_native_link(src_node_id, src_port_l_id, m_impl->our_node_id, our_in_l);
-            auto* link_r = m_impl->create_native_link(src_node_id, src_port_r_id != 0 ? src_port_r_id : src_port_l_id,
-                                                      m_impl->our_node_id, our_in_r != 0 ? our_in_r : our_in_l);
+            auto* link_r = m_impl->create_native_link(src_node_id, right_target, m_impl->our_node_id, our_in_r != 0 ? our_in_r : our_in_l);
+
             if (link_l) m_impl->track_links[track_id].push_back(link_l);
             if (link_r) m_impl->track_links[track_id].push_back(link_r);
+            m_impl->active_track_sources[track_id] = stream;
             return true;
         }
     }
 
+    m_impl->active_track_sources[track_id] = stream;
     return true;
 }
 
@@ -692,6 +848,7 @@ bool PipeWireBackend::unlink_source_from_track(const DiscoveredStreamPair& /*str
         if (m_impl->loop) pw_thread_loop_unlock(m_impl->loop);
         m_impl->track_links.erase(it);
     }
+    m_impl->active_track_sources.erase(track_id);
 
     auto* track = m_impl->mixer.get_track(track_id);
     if (track) {
@@ -702,6 +859,35 @@ bool PipeWireBackend::unlink_source_from_track(const DiscoveredStreamPair& /*str
 
 bool PipeWireBackend::unlink_all_for_track(uint32_t track_id) {
     return unlink_source_from_track({}, track_id);
+}
+
+std::optional<DiscoveredStreamPair> PipeWireBackend::get_track_source(uint32_t track_id) const {
+    if (!m_impl) return std::nullopt;
+    auto it = m_impl->active_track_sources.find(track_id);
+    if (it != m_impl->active_track_sources.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+bool PipeWireBackend::is_track_linked(uint32_t track_id) const {
+    return m_impl && m_impl->active_track_sources.find(track_id) != m_impl->active_track_sources.end();
+}
+
+bool PipeWireBackend::connect_master_to_sink(const std::string& sink_node_name) {
+    return m_impl && m_impl->connect_sink_internal(sink_node_name);
+}
+
+bool PipeWireBackend::disconnect_master_output() {
+    return m_impl && m_impl->connect_sink_internal("");
+}
+
+std::string PipeWireBackend::active_master_sink_node_name() const {
+    return m_impl ? m_impl->active_master_sink_node : "";
+}
+
+std::string PipeWireBackend::active_master_sink_display_name() const {
+    return m_impl ? m_impl->active_master_sink_display : "";
 }
 
 void PipeWireBackend::set_aoip_receiver(network::AoipReceiver* receiver) noexcept {

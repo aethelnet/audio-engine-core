@@ -56,7 +56,7 @@ struct Value {
     [[nodiscard]] bool as_bool(bool def = false) const noexcept {
         return is_bool() ? bool_val : def;
     }
-    [[nodiscard]] const std::string& as_string(const std::string& def = "") const noexcept {
+    [[nodiscard]] std::string as_string(const std::string& def = "") const noexcept {
         return is_string() ? str_val : def;
     }
 
@@ -360,6 +360,9 @@ struct TrackPresetData {
     bool solo_safe{false};
     uint32_t dca_mask{0};
     int32_t target_bus{-1};
+    uint8_t input_mode{0};
+    float input_gain{1.0f};
+    bool input_phase_invert{false};
     RackPresetData rack{};
     std::vector<StepTriggerData> sequencer_steps{};
 };
@@ -396,6 +399,9 @@ struct ProjectSessionData {
             ss << "      \"solo_safe\": " << (trk.solo_safe ? "true" : "false") << ",\n";
             ss << "      \"dca_mask\": " << trk.dca_mask << ",\n";
             ss << "      \"target_bus\": " << trk.target_bus << ",\n";
+            ss << "      \"input_mode\": " << static_cast<int>(trk.input_mode) << ",\n";
+            ss << "      \"input_gain\": " << trk.input_gain << ",\n";
+            ss << "      \"input_phase_invert\": " << (trk.input_phase_invert ? "true" : "false") << ",\n";
             ss << "      \"rack\": " << trk.rack.to_json(6) << ",\n";
             ss << "      \"sequencer\": [\n";
             for (size_t s = 0; s < trk.sequencer_steps.size(); ++s) {
@@ -454,6 +460,9 @@ struct ProjectSessionData {
                     if (auto* tsafe = tv.get("solo_safe")) tdata.solo_safe = tsafe->as_bool(false);
                     if (auto* tdca = tv.get("dca_mask")) tdata.dca_mask = tdca->as_uint(0);
                     if (auto* ttgt = tv.get("target_bus")) tdata.target_bus = ttgt->as_int(-1);
+                    if (auto* tim = tv.get("input_mode")) tdata.input_mode = static_cast<uint8_t>(tim->as_uint(0));
+                    if (auto* tig = tv.get("input_gain")) tdata.input_gain = tig->as_float(1.0f);
+                    if (auto* tipi = tv.get("input_phase_invert")) tdata.input_phase_invert = tipi->as_bool(false);
 
                     if (auto* track_rack = tv.get("rack")) {
                         auto r = RackPresetData::from_json_val(*track_rack);
@@ -564,6 +573,9 @@ public:
             tdata.solo_safe = trk->is_solo_safe();
             tdata.dca_mask = trk->dca_mask();
             tdata.target_bus = trk->target_bus();
+            tdata.input_mode = static_cast<uint8_t>(trk->input_mode());
+            tdata.input_gain = trk->input_gain();
+            tdata.input_phase_invert = trk->input_phase_invert();
             tdata.rack = extract_rack_preset(*trk, trk->name() + " Rack");
 
             // Extract sequencer pattern steps
@@ -620,6 +632,9 @@ public:
             trk->set_solo_safe(tdata.solo_safe);
             trk->set_dca_mask(tdata.dca_mask);
             trk->set_target_bus(tdata.target_bus);
+            trk->set_input_mode(static_cast<TrackInputMode>(tdata.input_mode));
+            trk->set_input_gain(tdata.input_gain);
+            trk->set_input_phase_invert(tdata.input_phase_invert);
 
             apply_rack_preset(*trk, tdata.rack, data.sample_rate);
 
