@@ -349,6 +349,24 @@ struct StepTriggerData {
     float send_b{0.0f};
 };
 
+struct AutomationPointData {
+    double t{0.0};
+    float v{1.0f};
+    uint8_t m{0};
+    float tau{0.0f};
+};
+
+struct TrackAutomationData {
+    bool gain_enabled{false};
+    std::vector<AutomationPointData> gain_points{};
+    bool pan_enabled{false};
+    std::vector<AutomationPointData> pan_points{};
+    bool aux1_enabled{false};
+    std::vector<AutomationPointData> aux1_points{};
+    bool aux2_enabled{false};
+    std::vector<AutomationPointData> aux2_points{};
+};
+
 struct TrackPresetData {
     uint32_t id{0};
     std::string name{"Track"};
@@ -364,6 +382,7 @@ struct TrackPresetData {
     float input_gain{1.0f};
     bool input_phase_invert{false};
     RackPresetData rack{};
+    TrackAutomationData automation{};
     std::vector<StepTriggerData> sequencer_steps{};
 };
 
@@ -403,6 +422,40 @@ struct ProjectSessionData {
             ss << "      \"input_gain\": " << trk.input_gain << ",\n";
             ss << "      \"input_phase_invert\": " << (trk.input_phase_invert ? "true" : "false") << ",\n";
             ss << "      \"rack\": " << trk.rack.to_json(6) << ",\n";
+            ss << "      \"automation\": {\n";
+            ss << "        \"gain_enabled\": " << (trk.automation.gain_enabled ? "true" : "false") << ",\n";
+            ss << "        \"gain_points\": [";
+            for (size_t p = 0; p < trk.automation.gain_points.size(); ++p) {
+                const auto& pt = trk.automation.gain_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.automation.gain_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"pan_enabled\": " << (trk.automation.pan_enabled ? "true" : "false") << ",\n";
+            ss << "        \"pan_points\": [";
+            for (size_t p = 0; p < trk.automation.pan_points.size(); ++p) {
+                const auto& pt = trk.automation.pan_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.automation.pan_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"aux1_enabled\": " << (trk.automation.aux1_enabled ? "true" : "false") << ",\n";
+            ss << "        \"aux1_points\": [";
+            for (size_t p = 0; p < trk.automation.aux1_points.size(); ++p) {
+                const auto& pt = trk.automation.aux1_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.automation.aux1_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"aux2_enabled\": " << (trk.automation.aux2_enabled ? "true" : "false") << ",\n";
+            ss << "        \"aux2_points\": [";
+            for (size_t p = 0; p < trk.automation.aux2_points.size(); ++p) {
+                const auto& pt = trk.automation.aux2_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.automation.aux2_points.size() ? "," : "");
+            }
+            ss << "]\n";
+            ss << "      },\n";
             ss << "      \"sequencer\": [\n";
             for (size_t s = 0; s < trk.sequencer_steps.size(); ++s) {
                 const auto& step = trk.sequencer_steps[s];
@@ -467,6 +520,32 @@ struct ProjectSessionData {
                     if (auto* track_rack = tv.get("rack")) {
                         auto r = RackPresetData::from_json_val(*track_rack);
                         if (r) tdata.rack = std::move(*r);
+                    }
+
+                    if (auto* auto_obj = tv.get("automation")) {
+                        if (auto_obj->is_object()) {
+                            auto parse_lane = [](const json::Value* obj, const std::string& en_key, const std::string& pts_key,
+                                                 bool& out_en, std::vector<AutomationPointData>& out_pts) {
+                                if (auto* e = obj->get(en_key)) out_en = e->as_bool(false);
+                                if (auto* pa = obj->get(pts_key)) {
+                                    if (pa->is_array()) {
+                                        for (const auto& pv : pa->arr_val) {
+                                            if (!pv.is_object()) continue;
+                                            AutomationPointData ptd;
+                                            if (auto* t = pv.get("t")) ptd.t = t->as_double(0.0);
+                                            if (auto* v = pv.get("v")) ptd.v = v->as_float(1.0f);
+                                            if (auto* m = pv.get("m")) ptd.m = static_cast<uint8_t>(m->as_uint(0));
+                                            if (auto* tau = pv.get("tau")) ptd.tau = tau->as_float(0.0f);
+                                            out_pts.push_back(ptd);
+                                        }
+                                    }
+                                }
+                            };
+                            parse_lane(auto_obj, "gain_enabled", "gain_points", tdata.automation.gain_enabled, tdata.automation.gain_points);
+                            parse_lane(auto_obj, "pan_enabled", "pan_points", tdata.automation.pan_enabled, tdata.automation.pan_points);
+                            parse_lane(auto_obj, "aux1_enabled", "aux1_points", tdata.automation.aux1_enabled, tdata.automation.aux1_points);
+                            parse_lane(auto_obj, "aux2_enabled", "aux2_points", tdata.automation.aux2_enabled, tdata.automation.aux2_points);
+                        }
                     }
 
                     if (auto* seq_arr = tv.get("sequencer")) {
@@ -578,6 +657,23 @@ public:
             tdata.input_phase_invert = trk->input_phase_invert();
             tdata.rack = extract_rack_preset(*trk, trk->name() + " Rack");
 
+            auto extract_pts = [](const routing::AutomationCurve& curve, std::vector<AutomationPointData>& out) {
+                for (const auto& pt : curve.get_points()) {
+                    out.push_back(AutomationPointData{pt.time_beats, pt.value, static_cast<uint8_t>(pt.node_mode), pt.tension});
+                }
+            };
+            tdata.automation.gain_enabled = trk->is_automation_enabled(routing::AutomationTarget::Gain);
+            extract_pts(trk->automation_curve(routing::AutomationTarget::Gain), tdata.automation.gain_points);
+
+            tdata.automation.pan_enabled = trk->is_automation_enabled(routing::AutomationTarget::Pan);
+            extract_pts(trk->automation_curve(routing::AutomationTarget::Pan), tdata.automation.pan_points);
+
+            tdata.automation.aux1_enabled = trk->is_automation_enabled(routing::AutomationTarget::Aux1);
+            extract_pts(trk->automation_curve(routing::AutomationTarget::Aux1), tdata.automation.aux1_points);
+
+            tdata.automation.aux2_enabled = trk->is_automation_enabled(routing::AutomationTarget::Aux2);
+            extract_pts(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points);
+
             // Extract sequencer pattern steps
             const auto* seq = trk->sequencer();
             if (seq) {
@@ -637,6 +733,32 @@ public:
             trk->set_input_phase_invert(tdata.input_phase_invert);
 
             apply_rack_preset(*trk, tdata.rack, data.sample_rate);
+
+            // Restore multi-parameter automation curves
+            auto restore_lane = [](routing::AutomationCurve& curve, const std::vector<AutomationPointData>& pts, float def_val) {
+                if (pts.empty()) {
+                    curve.clear(def_val);
+                } else {
+                    std::vector<routing::AutomationPoint> r_pts;
+                    r_pts.reserve(pts.size());
+                    for (const auto& p : pts) {
+                        r_pts.push_back(routing::AutomationPoint{p.t, p.v, static_cast<routing::NodeMode>(p.m), p.tau});
+                    }
+                    curve.set_points(std::move(r_pts));
+                }
+            };
+
+            restore_lane(trk->automation_curve(routing::AutomationTarget::Gain), tdata.automation.gain_points, 1.0f);
+            trk->set_automation_enabled(routing::AutomationTarget::Gain, tdata.automation.gain_enabled);
+
+            restore_lane(trk->automation_curve(routing::AutomationTarget::Pan), tdata.automation.pan_points, 0.0f);
+            trk->set_automation_enabled(routing::AutomationTarget::Pan, tdata.automation.pan_enabled);
+
+            restore_lane(trk->automation_curve(routing::AutomationTarget::Aux1), tdata.automation.aux1_points, 0.0f);
+            trk->set_automation_enabled(routing::AutomationTarget::Aux1, tdata.automation.aux1_enabled);
+
+            restore_lane(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points, 0.0f);
+            trk->set_automation_enabled(routing::AutomationTarget::Aux2, tdata.automation.aux2_enabled);
 
             // Restore sequencer pattern
             auto* seq = trk->sequencer();

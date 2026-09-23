@@ -58,6 +58,10 @@ public:
     Track(uint32_t id, std::string name, uint32_t buffer_frames = 1024)
         : m_id(id), m_name(std::move(name)), m_buffer(2, buffer_frames) {
         m_console.set_mode(dsp::ConsoleMode::Channel);
+        m_gain_curve.clear(1.0f);
+        m_pan_curve.clear(0.0f);
+        m_aux1_curve.clear(0.0f);
+        m_aux2_curve.clear(0.0f);
     }
 
     [[nodiscard]] uint32_t id() const noexcept { return m_id; }
@@ -100,12 +104,18 @@ public:
         m_pdc_delay_samples.store(0, std::memory_order_relaxed);
         m_has_previous_gain = false;
         m_gain_automation_enabled.store(false, std::memory_order_relaxed);
+        m_pan_automation_enabled.store(false, std::memory_order_relaxed);
+        m_aux1_automation_enabled.store(false, std::memory_order_relaxed);
+        m_aux2_automation_enabled.store(false, std::memory_order_relaxed);
         m_active.store(true, std::memory_order_release);
     }
 
     void deactivate() noexcept {
         m_active.store(false, std::memory_order_release);
         m_gain_automation_enabled.store(false, std::memory_order_relaxed);
+        m_pan_automation_enabled.store(false, std::memory_order_relaxed);
+        m_aux1_automation_enabled.store(false, std::memory_order_relaxed);
+        m_aux2_automation_enabled.store(false, std::memory_order_relaxed);
         m_azimuth.store(0.0f, std::memory_order_relaxed);
         m_custom_azimuth.store(false, std::memory_order_relaxed);
         m_solo_safe.store(false, std::memory_order_relaxed);
@@ -151,6 +161,100 @@ public:
     }
     [[nodiscard]] bool is_gain_automation_enabled() const noexcept {
         return m_gain_automation_enabled.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] routing::AutomationCurve& pan_curve() noexcept { return m_pan_curve; }
+    [[nodiscard]] const routing::AutomationCurve& pan_curve() const noexcept { return m_pan_curve; }
+
+    void set_pan_automation_enabled(bool enabled) noexcept {
+        m_pan_automation_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_pan_automation_enabled() const noexcept {
+        return m_pan_automation_enabled.load(std::memory_order_relaxed);
+    }
+
+    void ensure_send_active(uint32_t bus_id) noexcept {
+        for (const auto& s : m_sends) {
+            if (s.active && s.bus_id == bus_id) return;
+        }
+        for (auto& s : m_sends) {
+            if (!s.active) {
+                s.bus_id = bus_id;
+                s.amount = 1.0f;
+                s.pre_fader = false;
+                s.active = true;
+                return;
+            }
+        }
+    }
+
+    [[nodiscard]] routing::AutomationCurve& aux1_curve() noexcept { return m_aux1_curve; }
+    [[nodiscard]] const routing::AutomationCurve& aux1_curve() const noexcept { return m_aux1_curve; }
+
+    void set_aux1_automation_enabled(bool enabled) noexcept {
+        m_aux1_automation_enabled.store(enabled, std::memory_order_relaxed);
+        if (enabled) ensure_send_active(1);
+    }
+    [[nodiscard]] bool is_aux1_automation_enabled() const noexcept {
+        return m_aux1_automation_enabled.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] routing::AutomationCurve& aux2_curve() noexcept { return m_aux2_curve; }
+    [[nodiscard]] const routing::AutomationCurve& aux2_curve() const noexcept { return m_aux2_curve; }
+
+    void set_aux2_automation_enabled(bool enabled) noexcept {
+        m_aux2_automation_enabled.store(enabled, std::memory_order_relaxed);
+        if (enabled) ensure_send_active(2);
+    }
+    [[nodiscard]] bool is_aux2_automation_enabled() const noexcept {
+        return m_aux2_automation_enabled.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] routing::AutomationCurve& automation_curve(routing::AutomationTarget target) noexcept {
+        switch (target) {
+            case routing::AutomationTarget::Gain: return m_gain_curve;
+            case routing::AutomationTarget::Pan:  return m_pan_curve;
+            case routing::AutomationTarget::Aux1: return m_aux1_curve;
+            case routing::AutomationTarget::Aux2: return m_aux2_curve;
+        }
+        return m_gain_curve;
+    }
+
+    [[nodiscard]] const routing::AutomationCurve& automation_curve(routing::AutomationTarget target) const noexcept {
+        switch (target) {
+            case routing::AutomationTarget::Gain: return m_gain_curve;
+            case routing::AutomationTarget::Pan:  return m_pan_curve;
+            case routing::AutomationTarget::Aux1: return m_aux1_curve;
+            case routing::AutomationTarget::Aux2: return m_aux2_curve;
+        }
+        return m_gain_curve;
+    }
+
+    void set_automation_enabled(routing::AutomationTarget target, bool enabled) noexcept {
+        switch (target) {
+            case routing::AutomationTarget::Gain: m_gain_automation_enabled.store(enabled, std::memory_order_relaxed); break;
+            case routing::AutomationTarget::Pan:  m_pan_automation_enabled.store(enabled, std::memory_order_relaxed); break;
+            case routing::AutomationTarget::Aux1: {
+                m_aux1_automation_enabled.store(enabled, std::memory_order_relaxed);
+                if (enabled) ensure_send_active(1);
+                break;
+            }
+            case routing::AutomationTarget::Aux2: {
+                m_aux2_automation_enabled.store(enabled, std::memory_order_relaxed);
+                if (enabled) ensure_send_active(2);
+                break;
+            }
+        }
+    }
+
+    [[nodiscard]] bool is_automation_enabled(routing::AutomationTarget target) const noexcept {
+        switch (target) {
+            case routing::AutomationTarget::Gain: return m_gain_automation_enabled.load(std::memory_order_relaxed);
+            case routing::AutomationTarget::Pan:  return m_pan_automation_enabled.load(std::memory_order_relaxed);
+            case routing::AutomationTarget::Aux1: return m_aux1_automation_enabled.load(std::memory_order_relaxed);
+            case routing::AutomationTarget::Aux2: return m_aux2_automation_enabled.load(std::memory_order_relaxed);
+        }
+        return false;
     }
 
     void set_pan(float pan, bool snap = false) noexcept {
@@ -636,6 +740,12 @@ private:
 
     routing::AutomationCurve m_gain_curve;
     std::atomic<bool> m_gain_automation_enabled{false};
+    routing::AutomationCurve m_pan_curve;
+    std::atomic<bool> m_pan_automation_enabled{false};
+    routing::AutomationCurve m_aux1_curve;
+    std::atomic<bool> m_aux1_automation_enabled{false};
+    routing::AutomationCurve m_aux2_curve;
+    std::atomic<bool> m_aux2_automation_enabled{false};
 
     std::atomic<float> m_meter_peak_l{0.0f};
     std::atomic<float> m_meter_peak_r{0.0f};
@@ -1660,12 +1770,32 @@ public:
             const float target_right_gain = target_gain * pan_r;
 
             const bool auto_gain_active = track->is_gain_automation_enabled();
+            const bool auto_pan_active  = track->is_pan_automation_enabled();
+            const bool auto_aux1_active = track->is_aux1_automation_enabled();
+            const bool auto_aux2_active = track->is_aux2_automation_enabled();
+
             alignas(64) float auto_curve[kMaxBlockFrames];
-            if (auto_gain_active) {
+            alignas(64) float auto_pan[kMaxBlockFrames];
+            alignas(64) float auto_aux1[kMaxBlockFrames];
+            alignas(64) float auto_aux2[kMaxBlockFrames];
+
+            if (auto_gain_active || auto_pan_active || auto_aux1_active || auto_aux2_active) {
                 const double spb = std::max(1.0, m_clock.samples_per_beat());
                 const double start_beat = static_cast<double>(m_clock.sample_position()) / spb;
                 const double end_beat   = static_cast<double>(m_clock.sample_position() + frames) / spb;
-                track->gain_curve().evaluate_audio_block(start_beat, end_beat, auto_curve, frames);
+
+                if (auto_gain_active) {
+                    track->gain_curve().evaluate_audio_block(start_beat, end_beat, auto_curve, frames);
+                }
+                if (auto_pan_active) {
+                    track->pan_curve().evaluate_audio_block(start_beat, end_beat, auto_pan, frames);
+                }
+                if (auto_aux1_active) {
+                    track->aux1_curve().evaluate_audio_block(start_beat, end_beat, auto_aux1, frames);
+                }
+                if (auto_aux2_active) {
+                    track->aux2_curve().evaluate_audio_block(start_beat, end_beat, auto_aux2, frames);
+                }
             }
 
             if (!track->m_has_previous_gain) {
@@ -1698,14 +1828,21 @@ public:
                 Sample* dst_l = target_bus->buffer().view().channel(0);
                 Sample* dst_r = target_bus->buffer().view().channel(1);
 
-                if (auto_gain_active) {
+                if (auto_gain_active || auto_pan_active) {
                     #if defined(__GNUC__) || defined(__clang__)
                     #pragma GCC ivdep
                     #endif
                     for (uint32_t i = 0; i < frames; ++i) {
-                        const float cur_mult = auto_curve[i];
-                        dst_l[i] += trk_l[i] * (target_left_gain * cur_mult);
-                        dst_r[i] += trk_r[i] * (target_right_gain * cur_mult);
+                        const float cur_g = auto_gain_active ? (target_gain * auto_curve[i]) : target_gain;
+                        float cur_pan_l = pan_l;
+                        float cur_pan_r = pan_r;
+                        if (auto_pan_active) {
+                            const auto [p_l, p_r] = calculate_pan_gains(auto_pan[i]);
+                            cur_pan_l = p_l;
+                            cur_pan_r = p_r;
+                        }
+                        dst_l[i] += trk_l[i] * (cur_g * cur_pan_l);
+                        dst_r[i] += trk_r[i] * (cur_g * cur_pan_r);
                     }
                 } else if (is_ramping) {
                     const float step_l = (target_left_gain - start_l) / static_cast<float>(frames);
@@ -1735,19 +1872,31 @@ public:
 
             // Auxiliary Sends (e.g. Reverb / Delay Busses)
             for (const auto& send : track->sends()) {
-                if (!send.active || send.amount <= 0.0f) continue;
+                const bool send_auto = (send.bus_id == 1 && auto_aux1_active) || (send.bus_id == 2 && auto_aux2_active);
+                if (!send.active || (!send_auto && send.amount <= 0.0f)) continue;
                 AudioBus* send_bus = get_bus(send.bus_id);
                 if (send_bus) {
                     Sample* s_l = send_bus->buffer().view().channel(0);
                     Sample* s_r = send_bus->buffer().view().channel(1);
-                    float s_gain = send.pre_fader ? send.amount : (target_gain * send.amount);
+                    const float base_send = send.amount;
+                    const float* send_auto_buf = (send.bus_id == 1) ? auto_aux1 : auto_aux2;
+
                     #if defined(__GNUC__) || defined(__clang__)
                     #pragma GCC ivdep
                     #endif
                     for (uint32_t i = 0; i < frames; ++i) {
-                        float eff_s = (auto_gain_active && !send.pre_fader) ? (s_gain * auto_curve[i]) : s_gain;
-                        s_l[i] += trk_l[i] * eff_s * pan_l;
-                        s_r[i] += trk_r[i] * eff_s * pan_r;
+                        const float s_amt = send_auto ? std::clamp(send_auto_buf[i], 0.0f, 1.0f) : base_send;
+                        const float cur_trk_g = auto_gain_active ? (target_gain * auto_curve[i]) : target_gain;
+                        const float eff_s = send.pre_fader ? s_amt : (cur_trk_g * s_amt);
+                        float cur_pan_l = pan_l;
+                        float cur_pan_r = pan_r;
+                        if (auto_pan_active) {
+                            const auto [p_l, p_r] = calculate_pan_gains(auto_pan[i]);
+                            cur_pan_l = p_l;
+                            cur_pan_r = p_r;
+                        }
+                        s_l[i] += trk_l[i] * (eff_s * cur_pan_l);
+                        s_r[i] += trk_r[i] * (eff_s * cur_pan_r);
                     }
                 }
             }

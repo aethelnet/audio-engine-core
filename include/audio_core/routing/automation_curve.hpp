@@ -23,6 +23,14 @@ enum class NodeMode : uint8_t {
     Hold   = 2   // Immediate discrete jump at next node
 };
 
+// Target Parameter Lane in Channel Strip
+enum class AutomationTarget : uint8_t {
+    Gain = 0,  // Track Volume / Gain Multiplier [0.0, 1.25]
+    Pan  = 1,  // Track Stereo Panning [-1.0, +1.0]
+    Aux1 = 2,  // Auxiliary Send 1 (e.g. Reverb) [0.0, 1.0]
+    Aux2 = 3   // Auxiliary Send 2 (e.g. Delay) [0.0, 1.0]
+};
+
 // ============================================================================
 // AutomationPoint: Discrete Breakpoint on the Timeline
 // time_beats: Song timeline coordinate in musical beats (quarter notes)
@@ -191,9 +199,9 @@ private:
             return a.time_beats < b.time_beats;
         });
 
-        // Clamp values and tension
+        // Sanitize values (prevent NaN/Inf) and clamp tension
         for (auto& pt : m_points) {
-            pt.value = std::max(0.0f, pt.value);
+            if (std::isnan(pt.value) || std::isinf(pt.value)) pt.value = 0.0f;
             pt.tension = std::clamp(pt.tension, -1.0f, 1.0f);
         }
     }
@@ -291,7 +299,7 @@ public:
         if (index >= current_pts.size()) return;
 
         current_pts[index].time_beats = std::max(0.0, new_time);
-        current_pts[index].value = std::max(0.0f, new_value);
+        current_pts[index].value = (std::isnan(new_value) || std::isinf(new_value)) ? 0.0f : new_value;
         set_points(std::move(current_pts));
     }
 
@@ -362,6 +370,47 @@ public:
                 pts.push_back(AutomationPoint{t + 0.65, 1.0f, NodeMode::Smooth, 0.0f});
             }
         }
+        set_points(std::move(pts));
+    }
+
+    // Auto-Pan LFO sweep (alternates smoothly between Left and Right)
+    void preset_sine_pan(double total_beats = 16.0, double cycle_beats = 4.0) {
+        std::vector<AutomationPoint> pts;
+        const int num_cycles = static_cast<int>(std::max(1.0, std::round(total_beats / cycle_beats)));
+        for (int c = 0; c < num_cycles; ++c) {
+            double base_t = c * cycle_beats;
+            pts.push_back(AutomationPoint{base_t, 0.0f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{base_t + cycle_beats * 0.25, -0.85f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{base_t + cycle_beats * 0.50, 0.0f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{base_t + cycle_beats * 0.75, 0.85f, NodeMode::Smooth, 0.0f});
+        }
+        pts.push_back(AutomationPoint{total_beats, 0.0f, NodeMode::Smooth, 0.0f});
+        set_points(std::move(pts));
+    }
+
+    // Reverb / FX Send Build-Up Swell before drop
+    void preset_reverb_swell(double start_beat = 12.0, double total_beats = 16.0, float max_send = 0.80f) {
+        std::vector<AutomationPoint> pts = {
+            AutomationPoint{0.0, 0.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{start_beat, 0.0f, NodeMode::Smooth, 0.4f},
+            AutomationPoint{total_beats, max_send, NodeMode::Smooth, 0.0f}
+        };
+        set_points(std::move(pts));
+    }
+
+    // Delay Throw on specific musical bars
+    void preset_delay_throw(uint32_t num_bars = 4, float throw_amount = 0.70f) {
+        std::vector<AutomationPoint> pts;
+        pts.reserve(num_bars * 4 + 2);
+        pts.push_back(AutomationPoint{0.0, 0.0f, NodeMode::Hold, 0.0f});
+        for (uint32_t bar = 0; bar < num_bars; ++bar) {
+            double bar_start = bar * 4.0;
+            if ((bar % 2) == 1) { // Throw on alternating bars
+                pts.push_back(AutomationPoint{bar_start + 3.0, throw_amount, NodeMode::Smooth, 0.0f});
+                pts.push_back(AutomationPoint{bar_start + 3.9, 0.0f, NodeMode::Smooth, 0.0f});
+            }
+        }
+        pts.push_back(AutomationPoint{static_cast<double>(num_bars * 4), 0.0f, NodeMode::Smooth, 0.0f});
         set_points(std::move(pts));
     }
 

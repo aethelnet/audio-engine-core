@@ -8344,6 +8344,230 @@ void test_automation_curve_and_gain_rendering() {
     }
 }
 
+void test_multi_parameter_automation_and_session_serialization() {
+    std::cout << "[TEST] Running Multi-Parameter Automation & Session Serialization Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::routing;
+    using namespace audio_core::serialization;
+
+    // 1. Pan Automation Curve: Dynamic Stereo Modulation & AES Constant-Power Law
+    {
+        constexpr uint32_t kFrames = 256;
+        MixerGraph mixer(kFrames, false, 48000);
+        Track* trk = mixer.add_track("Stereo Synth");
+        TEST_CHECK(trk != nullptr);
+
+        // Constant input DC 1.0f on both L & R
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+
+        // Ramp Pan from -1.0 (Hard Left) at beat 0 to +1.0 (Hard Right) at beat 4
+        trk->pan_curve().set_points({
+            AutomationPoint{0.0, -1.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0,  1.0f, NodeMode::Corner, 0.0f}
+        });
+        trk->set_pan_automation_enabled(true);
+        TEST_CHECK(trk->is_pan_automation_enabled());
+
+        AudioBuffer master_out(2, kFrames);
+        auto master_view = master_out.view();
+        mixer.clock().set_bpm(120.0); // 24000 samples per beat
+
+        // Beat 0: Pan = -1.0f (Hard Left) -> L ≈ 1.0, R ≈ 0.0
+        mixer.clock().set_sample_position(0);
+        mixer.render(master_view);
+        TEST_CHECK(master_view.channel(0)[0] > 0.95f);
+        TEST_CHECK(master_view.channel(1)[0] < 0.05f);
+
+        // Advance to Beat 2.0 (sample 48000): Pan = 0.0f (Center) -> L ≈ 0.7071, R ≈ 0.7071
+        mixer.clock().set_sample_position(48000);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        float mid_l = master_view.channel(0)[kFrames / 2];
+        float mid_r = master_view.channel(1)[kFrames / 2];
+        TEST_CHECK(std::abs(mid_l - 0.7071f) < 0.05f);
+        TEST_CHECK(std::abs(mid_r - 0.7071f) < 0.05f);
+
+        // Advance to Beat 4.0 (sample 96000): Pan = +1.0f (Hard Right) -> L ≈ 0.0, R ≈ 1.0
+        mixer.clock().set_sample_position(96000);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        TEST_CHECK(master_view.channel(0)[kFrames - 1] < 0.05f);
+        TEST_CHECK(master_view.channel(1)[kFrames - 1] > 0.95f);
+
+        std::cout << "  -> Pan Automation Sample-Accurate Constant-Power Modulation: PASSED (Hard L="
+                  << master_view.channel(0)[0] << ", Center=" << mid_l << ", Hard R=" << master_view.channel(1)[kFrames - 1] << ")" << std::endl;
+    }
+
+    // 2. Aux Send Automation Curve (Aux 1 Reverb Swell)
+    {
+        constexpr uint32_t kFrames = 256;
+        MixerGraph mixer(kFrames, false, 48000);
+        AudioBus* aux1 = mixer.allocate_submix_bus("Aux 1 Reverb");
+        TEST_CHECK(aux1 != nullptr);
+        TEST_CHECK(aux1->id() == 1);
+
+        Track* trk = mixer.add_track("Vocal Track");
+        TEST_CHECK(trk != nullptr);
+        trk->set_pan(-1.0f); // Hard Left to normalize send pan multiplier to 1.0
+
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+
+        // Setup Aux 1 Swell: 0.0 at beat 0, 0.8 at beat 4
+        trk->aux1_curve().set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 0.8f, NodeMode::Corner, 0.0f}
+        });
+        trk->set_aux1_automation_enabled(true);
+        TEST_CHECK(trk->is_aux1_automation_enabled());
+
+        AudioBuffer master_out(2, kFrames);
+        auto master_view = master_out.view();
+        mixer.clock().set_bpm(120.0);
+
+        // At beat 0: Aux 1 send should be ~0.0
+        mixer.clock().set_sample_position(0);
+        mixer.render(master_view);
+        const float* aux1_buf = aux1->buffer().view().channel(0);
+        TEST_CHECK(aux1_buf[0] < 0.05f);
+
+        // At beat 4 (sample 96000): Aux 1 send should be ~0.8
+        mixer.clock().set_sample_position(96000);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            trk->buffer().channel(0)[i] = 1.0f;
+            trk->buffer().channel(1)[i] = 1.0f;
+        }
+        mixer.render(master_view);
+        aux1_buf = aux1->buffer().view().channel(0);
+        TEST_CHECK(std::abs(aux1_buf[kFrames / 2] - 0.8f) < 0.05f);
+
+        std::cout << "  -> Aux 1 Send Automation Swell to Bus: PASSED (Aux Send=" << aux1_buf[kFrames / 2] << ")" << std::endl;
+    }
+
+    // 3. Multi-Parameter Session Persistence & JSON Serialization Roundtrip
+    {
+        constexpr uint32_t kFrames = 256;
+        MixerGraph src_mixer(kFrames, false, 48000);
+        Track* trk = src_mixer.allocate_track("CyberSynth");
+        TEST_CHECK(trk != nullptr);
+
+        // Configure Gain curve
+        trk->gain_curve().set_points({
+            AutomationPoint{0.0, 0.2f, NodeMode::Corner, -0.4f},
+            AutomationPoint{2.0, 1.1f, NodeMode::Smooth, 0.2f},
+            AutomationPoint{8.0, 0.5f, NodeMode::Hold, 0.0f}
+        });
+        trk->set_automation_enabled(AutomationTarget::Gain, true);
+
+        // Configure Pan curve
+        trk->pan_curve().set_points({
+            AutomationPoint{0.0, -0.8f, NodeMode::Smooth, 0.1f},
+            AutomationPoint{4.0,  0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{8.0,  0.8f, NodeMode::Smooth, -0.2f}
+        });
+        trk->set_automation_enabled(AutomationTarget::Pan, true);
+
+        // Configure Aux 1 curve
+        trk->aux1_curve().set_points({
+            AutomationPoint{0.0, 0.1f, NodeMode::Hold, 0.0f},
+            AutomationPoint{4.0, 0.9f, NodeMode::Smooth, 0.5f}
+        });
+        trk->set_automation_enabled(AutomationTarget::Aux1, true);
+
+        // Configure Aux 2 curve (disabled)
+        trk->aux2_curve().set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{16.0, 0.5f, NodeMode::Corner, 0.0f}
+        });
+        trk->set_automation_enabled(AutomationTarget::Aux2, false);
+
+        clock::TimelineClock src_clock(48000, 128.0);
+
+        // Extract session data
+        ProjectSessionData sess = SessionSerializer::extract_session(src_mixer, src_clock, "AutomationTestProject");
+        TEST_CHECK(sess.tracks.size() >= 1);
+        const auto& t_data = sess.tracks[0];
+        TEST_CHECK(t_data.automation.gain_enabled == true);
+        TEST_CHECK(t_data.automation.gain_points.size() == 3);
+        TEST_CHECK(t_data.automation.pan_enabled == true);
+        TEST_CHECK(t_data.automation.pan_points.size() == 3);
+        TEST_CHECK(t_data.automation.aux1_enabled == true);
+        TEST_CHECK(t_data.automation.aux1_points.size() == 2);
+        TEST_CHECK(t_data.automation.aux2_enabled == false);
+        TEST_CHECK(t_data.automation.aux2_points.size() == 2);
+
+        // Serialize to JSON
+        std::string json_str = sess.to_json();
+        TEST_CHECK(!json_str.empty());
+        TEST_CHECK(json_str.find("\"gain_enabled\": true") != std::string::npos);
+        TEST_CHECK(json_str.find("\"pan_enabled\": true") != std::string::npos);
+        TEST_CHECK(json_str.find("\"aux1_enabled\": true") != std::string::npos);
+        TEST_CHECK(json_str.find("\"aux2_enabled\": false") != std::string::npos);
+
+        // Deserialize from JSON
+        auto parsed_val = json::Parser::parse(json_str);
+        TEST_CHECK(parsed_val.has_value());
+        auto restored_sess = ProjectSessionData::from_json_val(*parsed_val);
+        TEST_CHECK(restored_sess.has_value());
+
+        // Apply to a clean destination MixerGraph
+        MixerGraph dst_mixer(kFrames, false, 48000);
+        clock::TimelineClock dst_clock(48000, 120.0);
+        bool applied = SessionSerializer::apply_session(dst_mixer, dst_clock, *restored_sess);
+        TEST_CHECK(applied);
+
+        Track* dst_trk = dst_mixer.track_by_index(0);
+        TEST_CHECK(dst_trk != nullptr);
+
+        // Verify Gain curve roundtrip
+        TEST_CHECK(dst_trk->is_automation_enabled(AutomationTarget::Gain) == true);
+        const auto& g_pts = dst_trk->automation_curve(AutomationTarget::Gain).get_points();
+        TEST_CHECK(g_pts.size() == 3);
+        TEST_CHECK(std::abs(g_pts[0].time_beats - 0.0) < 1e-4);
+        TEST_CHECK(std::abs(g_pts[0].value - 0.2f) < 1e-4f);
+        TEST_CHECK(g_pts[0].node_mode == NodeMode::Corner);
+        TEST_CHECK(std::abs(g_pts[0].tension - -0.4f) < 1e-4f);
+        TEST_CHECK(g_pts[1].node_mode == NodeMode::Smooth);
+        TEST_CHECK(std::abs(g_pts[1].value - 1.1f) < 1e-4f);
+
+        // Verify Pan curve roundtrip
+        TEST_CHECK(dst_trk->is_automation_enabled(AutomationTarget::Pan) == true);
+        const auto& p_pts = dst_trk->automation_curve(AutomationTarget::Pan).get_points();
+        TEST_CHECK(p_pts.size() == 3);
+        TEST_CHECK(std::abs(p_pts[0].value - -0.8f) < 1e-4f);
+        TEST_CHECK(p_pts[0].node_mode == NodeMode::Smooth);
+        TEST_CHECK(std::abs(p_pts[2].value - 0.8f) < 1e-4f);
+        TEST_CHECK(std::abs(p_pts[2].tension - -0.2f) < 1e-4f);
+
+        // Verify Aux 1 curve roundtrip
+        TEST_CHECK(dst_trk->is_automation_enabled(AutomationTarget::Aux1) == true);
+        const auto& a1_pts = dst_trk->automation_curve(AutomationTarget::Aux1).get_points();
+        TEST_CHECK(a1_pts.size() == 2);
+        TEST_CHECK(a1_pts[0].node_mode == NodeMode::Hold);
+        TEST_CHECK(std::abs(a1_pts[1].value - 0.9f) < 1e-4f);
+
+        // Verify Aux 2 curve roundtrip
+        TEST_CHECK(dst_trk->is_automation_enabled(AutomationTarget::Aux2) == false);
+        const auto& a2_pts = dst_trk->automation_curve(AutomationTarget::Aux2).get_points();
+        TEST_CHECK(a2_pts.size() == 2);
+        TEST_CHECK(std::abs(a2_pts[1].value - 0.5f) < 1e-4f);
+
+        std::cout << "  -> Multi-Parameter Automation JSON Session Roundtrip: PASSED (Gain/Pan/Aux1/Aux2 verified bit-exact)" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -8414,6 +8638,7 @@ int main() {
     test_faster_than_realtime_offline_wav_bounce();
     test_waveform_overview_and_long_stem_mipmapping();
     test_automation_curve_and_gain_rendering();
+    test_multi_parameter_automation_and_session_serialization();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

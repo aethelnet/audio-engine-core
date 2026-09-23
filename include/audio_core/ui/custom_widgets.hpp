@@ -599,7 +599,8 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
                                       ImVec2 size = ImVec2(0, 160),
                                       double total_beats = 16.0,
                                       double current_playhead_beat = -1.0,
-                                      int* selected_point_out = nullptr) {
+                                      int* selected_point_out = nullptr,
+                                      routing::AutomationTarget target = routing::AutomationTarget::Gain) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
 
@@ -620,7 +621,15 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     const float usable_h = h - pad_top - pad_bot;
     const float bot_y = y + h - pad_bot;
 
-    constexpr float kMaxVal = 1.25f; // Headroom up to +2 dB
+    float min_val = 0.0f;
+    float max_val = 1.25f; // Headroom up to +2 dB for Gain
+    if (target == routing::AutomationTarget::Pan) {
+        min_val = -1.0f;
+        max_val = 1.0f;
+    } else if (target == routing::AutomationTarget::Aux1 || target == routing::AutomationTarget::Aux2) {
+        min_val = 0.0f;
+        max_val = 1.0f;
+    }
 
     auto beat_to_x = [&](double b) -> float {
         return x + static_cast<float>(std::clamp(b / total_beats, 0.0, 1.0)) * w;
@@ -629,12 +638,12 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
         return std::clamp(static_cast<double>((px - x) / w) * total_beats, 0.0, total_beats);
     };
     auto val_to_y = [&](float v) -> float {
-        float norm = std::clamp(v / kMaxVal, 0.0f, 1.0f);
+        float norm = std::clamp((v - min_val) / (max_val - min_val), 0.0f, 1.0f);
         return bot_y - (norm * usable_h);
     };
     auto y_to_val = [&](float py) -> float {
         float norm = std::clamp((bot_y - py) / usable_h, 0.0f, 1.0f);
-        return norm * kMaxVal;
+        return min_val + norm * (max_val - min_val);
     };
 
     static int s_active_pt = -1;
@@ -693,10 +702,27 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
             s_is_dragging_tension = true;
         } else {
             // Click on line/canvas: Insert new breakpoint (Ghost node becomes real)
+            auto snap_val = [&](float v) -> float {
+                if (io.KeyShift) return v;
+                if (target == routing::AutomationTarget::Pan) {
+                    if (std::abs(v) < 0.05f) return 0.0f; // Snap to Center
+                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
+                    if (std::abs(v + 1.0f) < 0.04f) return -1.0f;
+                } else if (target == routing::AutomationTarget::Gain) {
+                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f; // Snap to 0 dB
+                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f; // Snap to -6 dB
+                    if (v < 0.03f) return 0.0f; // Snap to silence
+                } else {
+                    if (v < 0.03f) return 0.0f;
+                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
+                    if (std::abs(v - 1.0f) < 0.03f) return 1.0f;
+                }
+                return v;
+            };
+
             double nb = x_to_beat(mouse.x);
             if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0; // Snap to 1/16th beat
-            float nv = y_to_val(mouse.y);
-            if (std::abs(nv - 1.0f) < 0.04f && !io.KeyShift) nv = 1.0f; // Snap to 0 dB
+            float nv = snap_val(y_to_val(mouse.y));
             size_t new_idx = curve.add_point(nb, nv, routing::NodeMode::Smooth, 0.0f);
             s_active_pt = static_cast<int>(new_idx);
             s_is_dragging_pt = true;
@@ -716,10 +742,27 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     // Dragging
     if (io.MouseDown[0]) {
         if (s_is_dragging_pt && s_active_pt >= 0 && static_cast<size_t>(s_active_pt) < points.size()) {
+            auto snap_val = [&](float v) -> float {
+                if (io.KeyShift) return v;
+                if (target == routing::AutomationTarget::Pan) {
+                    if (std::abs(v) < 0.05f) return 0.0f;
+                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
+                    if (std::abs(v + 1.0f) < 0.04f) return -1.0f;
+                } else if (target == routing::AutomationTarget::Gain) {
+                    if (std::abs(v - 1.0f) < 0.04f) return 1.0f;
+                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
+                    if (v < 0.03f) return 0.0f;
+                } else {
+                    if (v < 0.03f) return 0.0f;
+                    if (std::abs(v - 0.5f) < 0.03f) return 0.5f;
+                    if (std::abs(v - 1.0f) < 0.03f) return 1.0f;
+                }
+                return v;
+            };
+
             double nb = x_to_beat(mouse.x);
             if (!io.KeyShift) nb = std::round(nb * 4.0) / 4.0;
-            float nv = y_to_val(mouse.y);
-            if (std::abs(nv - 1.0f) < 0.04f && !io.KeyShift) nv = 1.0f;
+            float nv = snap_val(y_to_val(mouse.y));
             curve.update_point(static_cast<size_t>(s_active_pt), nb, nv);
             modified = true;
         } else if (s_is_dragging_tension && s_active_tension >= 0 && static_cast<size_t>(s_active_tension) < points.size()) {
@@ -745,19 +788,46 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
     draw_list->AddRectFilled(pos, ImVec2(x + w, y + h), ImColor(255, 255, 255, 255), 2.0f);
     draw_list->AddRect(pos, ImVec2(x + w, y + h), ImColor(190, 196, 206, 255), 2.0f);
 
-    // 0 dB guideline (solid graphite)
-    float y_0db = val_to_y(1.0f);
-    draw_list->AddLine(ImVec2(x, y_0db), ImVec2(x + w, y_0db), ImColor(140, 150, 168, 255), 1.5f);
-    draw_list->AddText(ImVec2(x + 6.0f, y_0db - 13.0f), ImColor(120, 130, 145, 220), "0 dB [Unity]");
+    if (target == routing::AutomationTarget::Pan) {
+        // Center line [C]
+        float y_c = val_to_y(0.0f);
+        draw_list->AddLine(ImVec2(x, y_c), ImVec2(x + w, y_c), ImColor(140, 150, 168, 255), 1.5f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_c - 13.0f), ImColor(120, 130, 145, 220), "Center [C]");
 
-    // -6 dB guideline (dashed)
-    float y_6db = val_to_y(0.5f);
-    draw_list->AddLine(ImVec2(x, y_6db), ImVec2(x + w, y_6db), ImColor(225, 230, 238, 255), 1.0f);
-    draw_list->AddText(ImVec2(x + 6.0f, y_6db - 13.0f), ImColor(160, 170, 185, 200), "-6 dB [0.5]");
+        // Right line [+1.0]
+        float y_r = val_to_y(1.0f);
+        draw_list->AddLine(ImVec2(x, y_r), ImVec2(x + w, y_r), ImColor(225, 230, 238, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_r + 2.0f), ImColor(160, 170, 185, 200), "Right [+1.0]");
 
-    // Baseline (-inf)
-    draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
-    draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "-inf [Silence]");
+        // Left line [-1.0]
+        draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "Left [-1.0]");
+    } else if (target == routing::AutomationTarget::Aux1 || target == routing::AutomationTarget::Aux2) {
+        float y_100 = val_to_y(1.0f);
+        draw_list->AddLine(ImVec2(x, y_100), ImVec2(x + w, y_100), ImColor(140, 150, 168, 255), 1.5f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_100 + 2.0f), ImColor(120, 130, 145, 220), "100% [Full Send]");
+
+        float y_50 = val_to_y(0.5f);
+        draw_list->AddLine(ImVec2(x, y_50), ImVec2(x + w, y_50), ImColor(225, 230, 238, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_50 - 13.0f), ImColor(160, 170, 185, 200), "50% [-6 dB]");
+
+        draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "0% [Off]");
+    } else {
+        // Gain: 0 dB guideline (solid graphite)
+        float y_0db = val_to_y(1.0f);
+        draw_list->AddLine(ImVec2(x, y_0db), ImVec2(x + w, y_0db), ImColor(140, 150, 168, 255), 1.5f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_0db - 13.0f), ImColor(120, 130, 145, 220), "0 dB [Unity]");
+
+        // -6 dB guideline (dashed)
+        float y_6db = val_to_y(0.5f);
+        draw_list->AddLine(ImVec2(x, y_6db), ImVec2(x + w, y_6db), ImColor(225, 230, 238, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, y_6db - 13.0f), ImColor(160, 170, 185, 200), "-6 dB [0.5]");
+
+        // Baseline (-inf)
+        draw_list->AddLine(ImVec2(x, bot_y), ImVec2(x + w, bot_y), ImColor(200, 208, 220, 255), 1.0f);
+        draw_list->AddText(ImVec2(x + 6.0f, bot_y - 13.0f), ImColor(160, 170, 185, 200), "-inf [Silence]");
+    }
 
     // Vertical Bars & Beats
     for (double b = 0.0; b <= total_beats; b += 1.0) {
@@ -842,8 +912,20 @@ inline bool DrawAutomationCurveEditor(const char* str_id,
 
         draw_list->AddCircle(ImVec2(gx, gy), 6.0f, ImColor(31, 97, 217, 140), 0, 1.5f);
         char tip[64];
-        float db = linear_to_db(hv);
-        std::snprintf(tip, sizeof(tip), "Bar %.2f | %.1f dB", (hb / 4.0) + 1.0, db);
+        if (target == routing::AutomationTarget::Pan) {
+            if (std::abs(hv) < 0.01f) {
+                std::snprintf(tip, sizeof(tip), "Bar %.2f | Center", (hb / 4.0) + 1.0);
+            } else if (hv < 0.0f) {
+                std::snprintf(tip, sizeof(tip), "Bar %.2f | L %.0f%%", (hb / 4.0) + 1.0, -hv * 100.0f);
+            } else {
+                std::snprintf(tip, sizeof(tip), "Bar %.2f | R %.0f%%", (hb / 4.0) + 1.0, hv * 100.0f);
+            }
+        } else if (target == routing::AutomationTarget::Aux1 || target == routing::AutomationTarget::Aux2) {
+            std::snprintf(tip, sizeof(tip), "Bar %.2f | %.0f%% Send", (hb / 4.0) + 1.0, hv * 100.0f);
+        } else {
+            float db = linear_to_db(hv);
+            std::snprintf(tip, sizeof(tip), "Bar %.2f | %.1f dB", (hb / 4.0) + 1.0, db);
+        }
         draw_list->AddText(ImVec2(gx + 10.0f, gy - 16.0f), ImColor(31, 97, 217, 220), tip);
     }
 

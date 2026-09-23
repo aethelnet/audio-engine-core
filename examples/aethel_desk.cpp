@@ -504,6 +504,7 @@ int main(int argc, char** argv) {
     mixer.connect_sidechain(trk0->id(), trk1->id(), 0, 120.0f, routing::TapPoint::Input);
     uint32_t selected_patch_id = 1;
     int selected_curve_point = -1;
+    int selected_auto_lane = 0; // 0=Gain, 1=Pan, 2=Aux1, 3=Aux2
 
     protocol::MixerTelemetryFrame telemetry{};
     auto last_time = std::chrono::steady_clock::now();
@@ -3472,19 +3473,44 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    ImGui::Spacing();
+
+                    // Lane Selector Buttons (Gain, Pan, Aux 1 Reverb, Aux 2 Delay)
+                    routing::AutomationTarget current_target = static_cast<routing::AutomationTarget>(selected_auto_lane);
+                    routing::AutomationCurve& active_curve = auto_trk->automation_curve(current_target);
+
+                    ImGui::Text("Parameter Lane:");
+                    ImGui::SameLine();
+                    const char* lane_names[4] = { "GAIN", "PAN", "AUX 1 (REVERB)", "AUX 2 (DELAY)" };
+                    for (int l = 0; l < 4; ++l) {
+                        if (l > 0) ImGui::SameLine();
+                        bool is_sel = (selected_auto_lane == l);
+                        if (is_sel) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 0.9f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        }
+                        if (ImGui::Button(lane_names[l], ImVec2(130, 24))) {
+                            selected_auto_lane = l;
+                            selected_curve_point = -1;
+                        }
+                        if (is_sel) {
+                            ImGui::PopStyleColor(2);
+                        }
+                    }
+
                     ImGui::SameLine(0, 16);
-                    bool is_auto_on = auto_trk->is_gain_automation_enabled();
+                    bool is_auto_on = auto_trk->is_automation_enabled(current_target);
                     if (is_auto_on) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.62f, 0.30f, 1.0f));
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.72f, 0.35f, 1.0f));
                         if (ImGui::Button("[ AUTOMATION ENGAGED ]", ImVec2(180, 24))) {
-                            auto_trk->set_gain_automation_enabled(false);
+                            auto_trk->set_automation_enabled(current_target, false);
                         }
                         ImGui::PopStyleColor(2);
                     } else {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.32f, 0.35f, 0.40f, 0.8f));
                         if (ImGui::Button("[ AUTOMATION BYPASSED ]", ImVec2(180, 24))) {
-                            auto_trk->set_gain_automation_enabled(true);
+                            auto_trk->set_automation_enabled(current_target, true);
                         }
                         ImGui::PopStyleColor(1);
                     }
@@ -3492,67 +3518,116 @@ int main(int argc, char** argv) {
                     ImGui::SameLine(0, 16);
                     ImGui::TextDisabled("Presets:");
                     ImGui::SameLine();
-                    if (ImGui::Button("Fade In")) {
-                        auto_trk->gain_curve().preset_fade_in(0.0, 16.0);
-                        auto_trk->set_gain_automation_enabled(true);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Fade Out")) {
-                        auto_trk->gain_curve().preset_fade_out(0.0, 16.0);
-                        auto_trk->set_gain_automation_enabled(true);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("4-Beat Pump")) {
-                        auto_trk->gain_curve().preset_sidechain_pump(16.0);
-                        auto_trk->set_gain_automation_enabled(true);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Reset 0 dB")) {
-                        auto_trk->gain_curve().preset_reset_unity(16.0);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear")) {
-                        auto_trk->gain_curve().clear();
+                    if (current_target == routing::AutomationTarget::Gain) {
+                        if (ImGui::Button("Fade In")) {
+                            active_curve.preset_fade_in(0.0, 16.0);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Fade Out")) {
+                            active_curve.preset_fade_out(0.0, 16.0);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("4-Beat Pump")) {
+                            active_curve.preset_sidechain_pump(16.0);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset 0 dB")) {
+                            active_curve.preset_reset_unity(16.0);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear")) {
+                            active_curve.clear(1.0f);
+                        }
+                    } else if (current_target == routing::AutomationTarget::Pan) {
+                        if (ImGui::Button("Auto-Pan Sine")) {
+                            active_curve.preset_sine_pan(16.0, 4.0);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset Center")) {
+                            active_curve.clear(0.0f);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear")) {
+                            active_curve.clear(0.0f);
+                        }
+                    } else {
+                        // Aux 1 or Aux 2
+                        if (ImGui::Button("Reverb/FX Swell")) {
+                            active_curve.preset_reverb_swell(12.0, 16.0, 0.80f);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Delay Throw")) {
+                            active_curve.preset_delay_throw(4, 0.75f);
+                            auto_trk->set_automation_enabled(current_target, true);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset Off")) {
+                            active_curve.clear(0.0f);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear")) {
+                            active_curve.clear(0.0f);
+                        }
                     }
 
                     ImGui::Spacing();
 
                     // Canvas
-                    ui::DrawAutomationCurveEditor("TrackGainAutomationEditor",
-                                                  auto_trk->gain_curve(),
+                    ui::DrawAutomationCurveEditor("TrackAutomationEditor",
+                                                  active_curve,
                                                   ImVec2(0, 200),
                                                   16.0,
                                                   cur_play_beat,
-                                                  &selected_curve_point);
+                                                  &selected_curve_point,
+                                                  current_target);
 
                     // Curve Inspector & Ergonomics Legend
-                    auto pts = auto_trk->gain_curve().get_points();
+                    auto pts = active_curve.get_points();
                     ImGui::Spacing();
                     ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
                         "Ergonomics: Click curve = Split & Add Node | Drag Node = Move (Snap 1/16th beat; hold Shift for free movement)");
                     ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f),
-                        "            Drag Tension Dot = Adjust Curvature tau in [-1, 1] | Double-Click Node = Toggle Smooth / Corner | Right-Click = Delete Node");
+                        "            Drag Tension Dot = Adjust Curvature tau in [-1, 1] | Double-Click Node = Toggle Smooth / Corner / Hold | Right-Click = Delete Node");
 
                     if (selected_curve_point >= 0 && selected_curve_point < static_cast<int>(pts.size())) {
                         auto pt = pts[selected_curve_point];
                         ImGui::Spacing();
                         ImGui::Text("Node #%d Selected:", selected_curve_point + 1);
                         ImGui::SameLine();
-                        float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
-                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Linear: %.3f (%+.1f dB)",
-                                           pt.time_beats, pt.value, db_val);
+                        if (current_target == routing::AutomationTarget::Pan) {
+                            if (std::abs(pt.value) < 0.01f) {
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Center [0.00]", pt.time_beats);
+                            } else if (pt.value < 0.0f) {
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Left %.0f%% (%.2f)", pt.time_beats, -pt.value * 100.0f, pt.value);
+                            } else {
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Right %.0f%% (+%.2f)", pt.time_beats, pt.value * 100.0f, pt.value);
+                            }
+                        } else if (current_target == routing::AutomationTarget::Aux1 || current_target == routing::AutomationTarget::Aux2) {
+                            float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
+                            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Send: %.0f%% (%.1f dB)",
+                                               pt.time_beats, pt.value * 100.0f, db_val);
+                        } else {
+                            float db_val = (pt.value > 1e-4f) ? 20.0f * std::log10(pt.value) : -96.0f;
+                            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "Beat: %.2f | Linear: %.3f (%+.1f dB)",
+                                               pt.time_beats, pt.value, db_val);
+                        }
                         ImGui::SameLine(0, 16);
                         const char* m_str = (pt.node_mode == routing::NodeMode::Smooth) ? "Mode: Smooth (Circle)" :
                                             (pt.node_mode == routing::NodeMode::Corner) ? "Mode: Corner (Diamond)" : "Mode: Hold (Box)";
                         if (ImGui::Button(m_str)) {
-                            auto_trk->gain_curve().toggle_node_mode(selected_curve_point);
+                            active_curve.toggle_node_mode(selected_curve_point);
                         }
                         if (selected_curve_point < static_cast<int>(pts.size()) - 1) {
                             ImGui::SameLine(0, 16);
                             ImGui::SetNextItemWidth(140);
                             float cur_t = pt.tension;
                             if (ImGui::SliderFloat("Tension", &cur_t, -1.0f, 1.0f, "%.2f")) {
-                                auto_trk->gain_curve().set_segment_tension(selected_curve_point, cur_t);
+                                active_curve.set_segment_tension(selected_curve_point, cur_t);
                             }
                         }
                     }
