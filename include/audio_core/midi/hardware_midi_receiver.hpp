@@ -22,8 +22,20 @@
 #include <fstream>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 
 namespace audio_core::midi {
+
+// ============================================================================
+// AlsaSeqSubscription: Information about an active ALSA Sequencer subscription
+// ============================================================================
+struct AlsaSeqSubscription {
+    int client_id{-1};
+    int port_id{-1};
+    std::string client_name;
+    std::string port_name;
+    bool is_system_announce{false};
+};
 
 // ============================================================================
 // MidiDeviceInfo: Information about an available hardware/virtual MIDI port
@@ -183,6 +195,9 @@ public:
         m_is_mock = false;
         ensure_listener_thread_running();
         update_device_path_string();
+
+        // Auto-discover and subscribe to available MIDI outputs and system announce
+        auto_subscribe_all(true);
         return true;
     }
 
@@ -231,6 +246,8 @@ public:
             }
         }
 
+        unsubscribe_all();
+
         if (m_stop_pipe[0] >= 0) { ::close(m_stop_pipe[0]); m_stop_pipe[0] = -1; }
         if (m_stop_pipe[1] >= 0) { ::close(m_stop_pipe[1]); m_stop_pipe[1] = -1; }
         if (m_fd >= 0) { ::close(m_fd); m_fd = -1; }
@@ -263,6 +280,202 @@ public:
         if (m_seq_fd < 0) return false;
         ssize_t w = ::write(m_seq_fd, &ev, sizeof(ev));
         return (w == static_cast<ssize_t>(sizeof(ev)));
+    }
+
+    // ========================================================================
+    // ALSA Sequencer Dynamic Port Subscriptions & Hotplug
+    // ========================================================================
+    bool subscribe_to(int client_id, int port_id) {
+        if (m_is_mock) {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            for (const auto& s : m_subscriptions) {
+                if (s.client_id == client_id && s.port_id == port_id) return true;
+            }
+            AlsaSeqSubscription sub;
+            sub.client_id = client_id;
+            sub.port_id = port_id;
+            sub.client_name = "Mock Client " + std::to_string(client_id);
+            sub.port_name = "Mock Port " + std::to_string(port_id);
+            sub.is_system_announce = (client_id == 0 && port_id == 1);
+            m_subscriptions.push_back(std::move(sub));
+            update_device_path_string();
+            return true;
+        }
+
+        if (m_seq_fd < 0 || client_id == m_seq_client_id) return false;
+
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            for (const auto& s : m_subscriptions) {
+                if (s.client_id == client_id && s.port_id == port_id) return true;
+            }
+        }
+
+        std::string client_name = "Client " + std::to_string(client_id);
+        std::string port_name = "Port " + std::to_string(port_id);
+        bool is_announce = (client_id == 0 && port_id == 1);
+
+        struct snd_seq_client_info cinfo{};
+        cinfo.client = client_id;
+        if (ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_GET_CLIENT_INFO, &cinfo) >= 0) {
+            if (cinfo.name[0] != '\0') client_name = cinfo.name;
+        }
+
+        struct snd_seq_port_info pinfo{};
+        pinfo.addr.client = static_cast<unsigned char>(client_id);
+        pinfo.addr.port = static_cast<unsigned char>(port_id);
+        if (ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_GET_PORT_INFO, &pinfo) >= 0) {
+            if (pinfo.name[0] != '\0') port_name = pinfo.name;
+            if (!is_announce && !(pinfo.capability & SNDRV_SEQ_PORT_CAP_SUBS_READ)) {
+                return false;
+            }
+        }
+
+        struct snd_seq_port_subscribe subs{};
+        subs.sender.client = static_cast<unsigned char>(client_id);
+        subs.sender.port = static_cast<unsigned char>(port_id);
+        subs.dest.client = static_cast<unsigned char>(m_seq_client_id);
+        subs.dest.port = static_cast<unsigned char>(m_seq_port_id);
+
+        int res = ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT, &subs);
+        if (res < 0 && errno != EEXIST && errno != EBUSY) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            bool exists = false;
+            for (const auto& s : m_subscriptions) {
+                if (s.client_id == client_id && s.port_id == port_id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                AlsaSeqSubscription sub;
+                sub.client_id = client_id;
+                sub.port_id = port_id;
+                sub.client_name = client_name;
+                sub.port_name = port_name;
+                sub.is_system_announce = is_announce;
+                m_subscriptions.push_back(std::move(sub));
+            }
+        }
+        update_device_path_string();
+        return true;
+    }
+
+    bool unsubscribe_from(int client_id, int port_id) {
+        if (m_is_mock) {
+            remove_subscription_record(client_id, port_id);
+            return true;
+        }
+        if (m_seq_fd < 0) return false;
+
+        struct snd_seq_port_subscribe subs{};
+        subs.sender.client = static_cast<unsigned char>(client_id);
+        subs.sender.port = static_cast<unsigned char>(port_id);
+        subs.dest.client = static_cast<unsigned char>(m_seq_client_id);
+        subs.dest.port = static_cast<unsigned char>(m_seq_port_id);
+
+        (void)ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT, &subs);
+        remove_subscription_record(client_id, port_id);
+        return true;
+    }
+
+    size_t auto_subscribe_all(bool subscribe_system_announce = true) {
+        if (m_is_mock) {
+            if (m_subscriptions.empty()) {
+                if (subscribe_system_announce) subscribe_to(0, 1);
+                subscribe_to(14, 0);
+            }
+            return m_subscriptions.size();
+        }
+
+        if (m_seq_fd < 0) return 0;
+        size_t count = 0;
+
+        if (subscribe_system_announce) {
+            if (subscribe_to(0, 1)) {
+                ++count;
+            }
+        }
+
+        struct snd_seq_client_info cinfo{};
+        cinfo.client = -1;
+        while (ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_QUERY_NEXT_CLIENT, &cinfo) >= 0) {
+            if (cinfo.client == m_seq_client_id || cinfo.client == 0) continue;
+
+            struct snd_seq_port_info pinfo{};
+            pinfo.addr.client = static_cast<unsigned char>(cinfo.client);
+            pinfo.addr.port = static_cast<unsigned char>(-1);
+            while (ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_QUERY_NEXT_PORT, &pinfo) >= 0) {
+                if (pinfo.capability & SNDRV_SEQ_PORT_CAP_SUBS_READ) {
+                    if (subscribe_to(cinfo.client, pinfo.addr.port)) {
+                        ++count;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    void unsubscribe_all() noexcept {
+        if (m_is_mock) {
+            try {
+                std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+                m_subscriptions.clear();
+                update_device_path_string();
+            } catch (...) {}
+            return;
+        }
+
+        if (m_seq_fd < 0) return;
+        std::vector<AlsaSeqSubscription> subs_copy;
+        try {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            subs_copy = std::move(m_subscriptions);
+            m_subscriptions.clear();
+        } catch (...) {}
+
+        for (const auto& s : subs_copy) {
+            struct snd_seq_port_subscribe subs{};
+            subs.sender.client = static_cast<unsigned char>(s.client_id);
+            subs.sender.port = static_cast<unsigned char>(s.port_id);
+            subs.dest.client = static_cast<unsigned char>(m_seq_client_id);
+            subs.dest.port = static_cast<unsigned char>(m_seq_port_id);
+            (void)ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT, &subs);
+        }
+        update_device_path_string();
+    }
+
+    [[nodiscard]] std::vector<AlsaSeqSubscription> active_subscriptions() const {
+        std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+        return m_subscriptions;
+    }
+
+    [[nodiscard]] size_t subscription_count(bool include_system_announce = false) const noexcept {
+        try {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            if (include_system_announce) return m_subscriptions.size();
+            size_t cnt = 0;
+            for (const auto& s : m_subscriptions) {
+                if (!s.is_system_announce) ++cnt;
+            }
+            return cnt;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    [[nodiscard]] bool is_subscribed(int client_id, int port_id) const noexcept {
+        try {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            for (const auto& s : m_subscriptions) {
+                if (s.client_id == client_id && s.port_id == port_id) return true;
+            }
+        } catch (...) {}
+        return false;
     }
 
     // ========================================================================
@@ -372,14 +585,40 @@ private:
     }
 
     void update_device_path_string() {
-        if (!m_rawmidi_device_path.empty() && m_seq_fd >= 0) {
-            m_current_device_path = m_rawmidi_device_path + " + ALSA Seq [" + m_seq_port_name + "]";
+        std::string seq_desc;
+        if (m_seq_fd >= 0) {
+            seq_desc = "ALSA Seq [" + m_seq_port_name + "]";
+            size_t sub_count = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+                for (const auto& s : m_subscriptions) {
+                    if (!s.is_system_announce) ++sub_count;
+                }
+            }
+            if (sub_count > 0) {
+                seq_desc += " (" + std::to_string(sub_count) + " subs)";
+            }
+        }
+
+        if (!m_rawmidi_device_path.empty() && !seq_desc.empty()) {
+            m_current_device_path = m_rawmidi_device_path + " + " + seq_desc;
         } else if (!m_rawmidi_device_path.empty()) {
             m_current_device_path = m_rawmidi_device_path;
-        } else if (m_seq_fd >= 0) {
-            m_current_device_path = "ALSA Seq [" + m_seq_port_name + "]";
+        } else if (!seq_desc.empty()) {
+            m_current_device_path = seq_desc;
         } else if (m_is_mock) {
-            m_current_device_path = "Virtual / Mock MIDI Receiver";
+            size_t sub_count = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+                for (const auto& s : m_subscriptions) {
+                    if (!s.is_system_announce) ++sub_count;
+                }
+            }
+            if (sub_count > 0) {
+                m_current_device_path = "Virtual / Mock MIDI Receiver (" + std::to_string(sub_count) + " subs)";
+            } else {
+                m_current_device_path = "Virtual / Mock MIDI Receiver";
+            }
         } else {
             m_current_device_path.clear();
         }
@@ -471,70 +710,144 @@ private:
         }
     }
 
+    void remove_subscription_record(int client, int port) noexcept {
+        try {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            auto it = std::remove_if(m_subscriptions.begin(), m_subscriptions.end(),
+                [client, port](const AlsaSeqSubscription& s) {
+                    return s.client_id == client && s.port_id == port;
+                });
+            if (it != m_subscriptions.end()) {
+                m_subscriptions.erase(it, m_subscriptions.end());
+                update_device_path_string();
+            }
+        } catch (...) {}
+    }
+
+    void remove_client_subscriptions(int client) noexcept {
+        try {
+            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+            auto it = std::remove_if(m_subscriptions.begin(), m_subscriptions.end(),
+                [client](const AlsaSeqSubscription& s) {
+                    return s.client_id == client;
+                });
+            if (it != m_subscriptions.end()) {
+                m_subscriptions.erase(it, m_subscriptions.end());
+                update_device_path_string();
+            }
+        } catch (...) {}
+    }
+
     void parse_seq_event(const struct snd_seq_event& ev) noexcept {
-        switch (ev.type) {
-            case SNDRV_SEQ_EVENT_NOTEON: {
-                uint8_t ch = ev.data.note.channel & 0x0F;
-                uint8_t note = ev.data.note.note & 0x7F;
-                uint8_t vel = ev.data.note.velocity & 0x7F;
-                dispatch_parsed_message(0x90 | ch, note, vel);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_NOTEOFF: {
-                uint8_t ch = ev.data.note.channel & 0x0F;
-                uint8_t note = ev.data.note.note & 0x7F;
-                uint8_t vel = ev.data.note.velocity & 0x7F;
-                dispatch_parsed_message(0x80 | ch, note, vel);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_NOTE: {
-                uint8_t ch = ev.data.note.channel & 0x0F;
-                uint8_t note = ev.data.note.note & 0x7F;
-                uint8_t vel = ev.data.note.velocity & 0x7F;
-                if (vel > 0) {
+        try {
+            switch (ev.type) {
+                case SNDRV_SEQ_EVENT_NOTEON: {
+                    uint8_t ch = ev.data.note.channel & 0x0F;
+                    uint8_t note = ev.data.note.note & 0x7F;
+                    uint8_t vel = ev.data.note.velocity & 0x7F;
                     dispatch_parsed_message(0x90 | ch, note, vel);
-                } else {
-                    dispatch_parsed_message(0x80 | ch, note, 0);
+                    break;
                 }
-                break;
+                case SNDRV_SEQ_EVENT_NOTEOFF: {
+                    uint8_t ch = ev.data.note.channel & 0x0F;
+                    uint8_t note = ev.data.note.note & 0x7F;
+                    uint8_t vel = ev.data.note.velocity & 0x7F;
+                    dispatch_parsed_message(0x80 | ch, note, vel);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_NOTE: {
+                    uint8_t ch = ev.data.note.channel & 0x0F;
+                    uint8_t note = ev.data.note.note & 0x7F;
+                    uint8_t vel = ev.data.note.velocity & 0x7F;
+                    if (vel > 0) {
+                        dispatch_parsed_message(0x90 | ch, note, vel);
+                    } else {
+                        dispatch_parsed_message(0x80 | ch, note, 0);
+                    }
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_KEYPRESS: {
+                    uint8_t ch = ev.data.note.channel & 0x0F;
+                    uint8_t note = ev.data.note.note & 0x7F;
+                    uint8_t vel = ev.data.note.velocity & 0x7F;
+                    dispatch_parsed_message(0xA0 | ch, note, vel);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_CONTROLLER: {
+                    uint8_t ch = ev.data.control.channel & 0x0F;
+                    uint8_t param = ev.data.control.param & 0x7F;
+                    uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
+                    dispatch_parsed_message(0xB0 | ch, param, val);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_PGMCHANGE: {
+                    uint8_t ch = ev.data.control.channel & 0x0F;
+                    uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
+                    dispatch_parsed_message(0xC0 | ch, val, 0);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_CHANPRESS: {
+                    uint8_t ch = ev.data.control.channel & 0x0F;
+                    uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
+                    dispatch_parsed_message(0xD0 | ch, val, 0);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_PITCHBEND: {
+                    uint8_t ch = ev.data.control.channel & 0x0F;
+                    int raw_val = std::clamp(static_cast<int>(ev.data.control.value) + 8192, 0, 16383);
+                    uint8_t d1 = static_cast<uint8_t>(raw_val & 0x7F);
+                    uint8_t d2 = static_cast<uint8_t>((raw_val >> 7) & 0x7F);
+                    dispatch_parsed_message(0xE0 | ch, d1, d2);
+                    break;
+                }
+                // Dynamic hotplug & kernel announce events
+                case SNDRV_SEQ_EVENT_PORT_START:
+                case SNDRV_SEQ_EVENT_PORT_CHANGE: {
+                    int client = static_cast<int>(ev.data.addr.client);
+                    int port = static_cast<int>(ev.data.addr.port);
+                    if (client != m_seq_client_id && client != 0) {
+                        struct snd_seq_port_info pinfo{};
+                        pinfo.addr.client = static_cast<unsigned char>(client);
+                        pinfo.addr.port = static_cast<unsigned char>(port);
+                        if (ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_GET_PORT_INFO, &pinfo) >= 0) {
+                            if (pinfo.capability & SNDRV_SEQ_PORT_CAP_SUBS_READ) {
+                                subscribe_to(client, port);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_PORT_EXIT: {
+                    int client = static_cast<int>(ev.data.addr.client);
+                    int port = static_cast<int>(ev.data.addr.port);
+                    remove_subscription_record(client, port);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_CLIENT_EXIT: {
+                    int client = static_cast<int>(ev.data.addr.client);
+                    remove_client_subscriptions(client);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_PORT_SUBSCRIBED: {
+                    if (static_cast<int>(ev.data.connect.dest.client) == m_seq_client_id &&
+                        static_cast<int>(ev.data.connect.dest.port) == m_seq_port_id) {
+                        subscribe_to(static_cast<int>(ev.data.connect.sender.client),
+                                     static_cast<int>(ev.data.connect.sender.port));
+                    }
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_PORT_UNSUBSCRIBED: {
+                    if (static_cast<int>(ev.data.connect.dest.client) == m_seq_client_id &&
+                        static_cast<int>(ev.data.connect.dest.port) == m_seq_port_id) {
+                        remove_subscription_record(static_cast<int>(ev.data.connect.sender.client),
+                                                   static_cast<int>(ev.data.connect.sender.port));
+                    }
+                    break;
+                }
+                default:
+                    break;
             }
-            case SNDRV_SEQ_EVENT_KEYPRESS: {
-                uint8_t ch = ev.data.note.channel & 0x0F;
-                uint8_t note = ev.data.note.note & 0x7F;
-                uint8_t vel = ev.data.note.velocity & 0x7F;
-                dispatch_parsed_message(0xA0 | ch, note, vel);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_CONTROLLER: {
-                uint8_t ch = ev.data.control.channel & 0x0F;
-                uint8_t param = ev.data.control.param & 0x7F;
-                uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
-                dispatch_parsed_message(0xB0 | ch, param, val);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_PGMCHANGE: {
-                uint8_t ch = ev.data.control.channel & 0x0F;
-                uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
-                dispatch_parsed_message(0xC0 | ch, val, 0);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_CHANPRESS: {
-                uint8_t ch = ev.data.control.channel & 0x0F;
-                uint8_t val = static_cast<uint8_t>(std::clamp(ev.data.control.value, 0, 127));
-                dispatch_parsed_message(0xD0 | ch, val, 0);
-                break;
-            }
-            case SNDRV_SEQ_EVENT_PITCHBEND: {
-                uint8_t ch = ev.data.control.channel & 0x0F;
-                int raw_val = std::clamp(static_cast<int>(ev.data.control.value) + 8192, 0, 16383);
-                uint8_t d1 = static_cast<uint8_t>(raw_val & 0x7F);
-                uint8_t d2 = static_cast<uint8_t>((raw_val >> 7) & 0x7F);
-                dispatch_parsed_message(0xE0 | ch, d1, d2);
-                break;
-            }
-            default:
-                break;
-        }
+        } catch (...) {}
     }
 
     void parse_byte(uint8_t byte) noexcept {
@@ -632,6 +945,10 @@ private:
     std::atomic<uint8_t> m_last_note{0};
     std::atomic<uint8_t> m_last_velocity{0};
     std::atomic<bool> m_activity_flag{false};
+
+    // ALSA Sequencer Subscriptions
+    mutable std::recursive_mutex m_subs_mutex;
+    std::vector<AlsaSeqSubscription> m_subscriptions;
 };
 
 } // namespace audio_core::midi

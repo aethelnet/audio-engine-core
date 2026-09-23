@@ -10073,6 +10073,193 @@ void test_alsa_sequencer_and_modulation_session_serialization() {
     }
 }
 
+void test_alsa_sequencer_subscriptions_and_hotplug() {
+    std::cout << "[TEST 74] Running ALSA Sequencer Subscriptions & Dynamic Hotplug Daemon..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::midi;
+
+    // ------------------------------------------------------------------------
+    // Part A: Kernel ALSA Sequencer Subscriptions & Dynamic Hotplug
+    // ------------------------------------------------------------------------
+    {
+        HardwareMidiReceiver rx;
+        bool seq_opened = rx.open_alsa_sequencer("Aethel Sub Test", "Sub Test In");
+
+        if (seq_opened && rx.has_alsa_seq()) {
+            std::cout << "  -> Opened ALSA Sequencer client " << rx.seq_client_id()
+                      << ", port " << rx.seq_port_id() << std::endl;
+
+            // 1. Verify Kernel System Announce is auto-subscribed
+            TEST_CHECK(rx.is_subscribed(0, 1));
+            TEST_CHECK(rx.subscription_count(true) >= 1);
+
+            // 2. If Midi Through exists on this machine, verify it was discovered and subscribed
+            if (rx.is_subscribed(14, 0)) {
+                std::cout << "  -> Auto-discovered and subscribed Midi Through [14:0]" << std::endl;
+            }
+
+            // 3. Simulate dynamic device hotplug via second ALSA client
+            std::cout << "  -> Simulating dynamic hardware MIDI keyboard hotplug..." << std::endl;
+            int hotplug_fd = ::open("/dev/snd/seq", O_RDWR | O_CLOEXEC);
+            TEST_CHECK(hotplug_fd >= 0);
+
+            int hotplug_client = -1;
+            TEST_CHECK(ioctl(hotplug_fd, SNDRV_SEQ_IOCTL_CLIENT_ID, &hotplug_client) >= 0);
+
+            struct snd_seq_client_info c_hotplug{};
+            c_hotplug.client = hotplug_client;
+            if (ioctl(hotplug_fd, SNDRV_SEQ_IOCTL_GET_CLIENT_INFO, &c_hotplug) >= 0) {
+                std::strncpy(c_hotplug.name, "Hotplugged KeyLab 88", sizeof(c_hotplug.name) - 1);
+                (void)ioctl(hotplug_fd, SNDRV_SEQ_IOCTL_SET_CLIENT_INFO, &c_hotplug);
+            }
+
+            struct snd_seq_port_info p_hotplug{};
+            p_hotplug.addr.client = static_cast<unsigned char>(hotplug_client);
+            p_hotplug.capability = SNDRV_SEQ_PORT_CAP_READ | SNDRV_SEQ_PORT_CAP_SUBS_READ;
+            p_hotplug.type = SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC | SNDRV_SEQ_PORT_TYPE_APPLICATION;
+            std::strncpy(p_hotplug.name, "KeyLab 88 DAW Out", sizeof(p_hotplug.name) - 1);
+            TEST_CHECK(ioctl(hotplug_fd, SNDRV_SEQ_IOCTL_CREATE_PORT, &p_hotplug) >= 0);
+            int hotplug_port = p_hotplug.addr.port;
+
+            // Wait up to 500ms for rx listener thread to receive SNDRV_SEQ_EVENT_PORT_START
+            // and automatically subscribe the hotplugged port
+            bool auto_sub_ok = false;
+            for (int i = 0; i < 50; ++i) {
+                if (rx.is_subscribed(hotplug_client, hotplug_port)) {
+                    auto_sub_ok = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            TEST_CHECK(auto_sub_ok);
+            std::cout << "  -> Hotplugged client [" << hotplug_client << ":" << hotplug_port
+                      << "] automatically discovered & subscribed in real-time!" << std::endl;
+
+            // Verify active_subscriptions returns hotplug info
+            auto subs = rx.active_subscriptions();
+            bool found_hotplug = false;
+            for (const auto& s : subs) {
+                if (s.client_id == hotplug_client && s.port_id == hotplug_port) {
+                    found_hotplug = true;
+                    TEST_CHECK(s.client_name == "Hotplugged KeyLab 88");
+                    TEST_CHECK(s.port_name == "KeyLab 88 DAW Out");
+                    TEST_CHECK(!s.is_system_announce);
+                    break;
+                }
+            }
+            TEST_CHECK(found_hotplug);
+
+            // 4. Forward MIDI Note Event from hotplugged device through kernel subscription
+            uint64_t count_before = rx.event_count();
+            struct snd_seq_event note_ev{};
+            note_ev.type = SNDRV_SEQ_EVENT_NOTEON;
+            note_ev.source.client = static_cast<unsigned char>(hotplug_client);
+            note_ev.source.port = static_cast<unsigned char>(hotplug_port);
+            note_ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+            note_ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+            note_ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+            note_ev.data.note.channel = 0;
+            note_ev.data.note.note = 67; // G4
+            note_ev.data.note.velocity = 112;
+
+            ssize_t w = ::write(hotplug_fd, &note_ev, sizeof(note_ev));
+            TEST_CHECK(w == static_cast<ssize_t>(sizeof(note_ev)));
+
+            // Wait up to 200ms for event to arrive
+            bool note_received = false;
+            for (int i = 0; i < 20; ++i) {
+                if (rx.event_count() > count_before) {
+                    note_received = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            TEST_CHECK(note_received);
+            TEST_CHECK(rx.last_note() == 67);
+            TEST_CHECK(rx.last_velocity() == 112);
+
+            // Drain to synth & verify voice allocation
+            modulation::ModulationMatrix matrix;
+            matrix.init(48000);
+            size_t drained = rx.drain_to(matrix);
+            TEST_CHECK(drained >= 1);
+            TEST_CHECK(matrix.poly_synth().active_voice_count() == 1);
+
+            // 5. Explicit Unsubscribe & Resubscribe
+            TEST_CHECK(rx.unsubscribe_from(hotplug_client, hotplug_port));
+            TEST_CHECK(!rx.is_subscribed(hotplug_client, hotplug_port));
+
+            // Note sent now should NOT be received
+            uint64_t count_after_unsub = rx.event_count();
+            note_ev.data.note.note = 71; // B4
+            (void)::write(hotplug_fd, &note_ev, sizeof(note_ev));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            TEST_CHECK(rx.event_count() == count_after_unsub);
+
+            // Resubscribe manually
+            TEST_CHECK(rx.subscribe_to(hotplug_client, hotplug_port));
+            TEST_CHECK(rx.is_subscribed(hotplug_client, hotplug_port));
+
+            // Note sent now SHOULD be received
+            (void)::write(hotplug_fd, &note_ev, sizeof(note_ev));
+            for (int i = 0; i < 20; ++i) {
+                if (rx.event_count() > count_after_unsub) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            TEST_CHECK(rx.event_count() > count_after_unsub);
+            TEST_CHECK(rx.last_note() == 71);
+
+            // 6. Simulate device unplug / disconnect
+            ::close(hotplug_fd);
+            // Wait up to 500ms for SNDRV_SEQ_EVENT_CLIENT_EXIT / PORT_EXIT
+            bool removed_ok = false;
+            for (int i = 0; i < 50; ++i) {
+                if (!rx.is_subscribed(hotplug_client, hotplug_port)) {
+                    removed_ok = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            TEST_CHECK(removed_ok);
+            std::cout << "  -> Hotplug disconnect cleanly pruned subscription!" << std::endl;
+
+            rx.close_device();
+            TEST_CHECK(!rx.is_connected());
+            TEST_CHECK(rx.subscription_count(true) == 0);
+        } else {
+            std::cout << "  [ALSA Sequencer hardware node not available - skipping kernel-level step]" << std::endl;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Part B: Mock Mode Subscriptions & API Coverage
+    // ------------------------------------------------------------------------
+    {
+        HardwareMidiReceiver mock_rx;
+        TEST_CHECK(mock_rx.auto_connect(false));
+        TEST_CHECK(mock_rx.is_mock());
+        TEST_CHECK(mock_rx.is_connected());
+
+        size_t n = mock_rx.auto_subscribe_all(true);
+        TEST_CHECK(n >= 1);
+        TEST_CHECK(mock_rx.is_subscribed(0, 1));
+        TEST_CHECK(mock_rx.is_subscribed(14, 0));
+        TEST_CHECK(mock_rx.subscription_count(true) >= 2);
+        TEST_CHECK(mock_rx.subscription_count(false) >= 1);
+
+        TEST_CHECK(mock_rx.unsubscribe_from(14, 0));
+        TEST_CHECK(!mock_rx.is_subscribed(14, 0));
+        TEST_CHECK(mock_rx.subscribe_to(14, 0));
+        TEST_CHECK(mock_rx.is_subscribed(14, 0));
+
+        mock_rx.unsubscribe_all();
+        TEST_CHECK(mock_rx.subscription_count(true) == 0);
+        mock_rx.close_device();
+    }
+
+    std::cout << "  -> ALSA Sequencer Subscriptions & Dynamic Hotplug Daemon: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -10151,6 +10338,7 @@ int main() {
     test_polyphonic_mseg_synth_and_voice_allocator();
     test_hardware_midi_and_automatic_track_routing();
     test_alsa_sequencer_and_modulation_session_serialization();
+    test_alsa_sequencer_subscriptions_and_hotplug();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

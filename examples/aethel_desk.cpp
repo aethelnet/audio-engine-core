@@ -4323,6 +4323,32 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(ImVec4(0.25f, 0.70f, 1.0f, 1.0f), "➔ Auto-Routed: Track 2 (\"Poly Synth / Lead\") -> Bus B (Music)");
 
                         ImGui::SameLine();
+                        size_t n_subs = midi_rx.subscription_count(false);
+                        ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "[Subs: %zu]", n_subs);
+                        if (ImGui::IsItemHovered()) {
+                            auto subs = midi_rx.active_subscriptions();
+                            ImGui::BeginTooltip();
+                            ImGui::TextUnformatted("Active ALSA Sequencer Subscriptions:");
+                            if (subs.empty()) {
+                                ImGui::TextDisabled("No active subscriptions");
+                            } else {
+                                for (const auto& s : subs) {
+                                    if (s.is_system_announce) {
+                                        ImGui::TextDisabled("• [%d:%d] Kernel Hotplug Announce", s.client_id, s.port_id);
+                                    } else {
+                                        ImGui::Text("• [%d:%d] %s - %s", s.client_id, s.port_id, s.client_name.c_str(), s.port_name.c_str());
+                                    }
+                                }
+                            }
+                            ImGui::EndTooltip();
+                        }
+
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" ⟳ Auto-Subscribe ")) {
+                            midi_rx.auto_subscribe_all(true);
+                        }
+
+                        ImGui::SameLine();
                         if (ImGui::SmallButton(" ⟳ Re-probe MIDI ")) {
                             midi_rx.auto_connect();
                         }
