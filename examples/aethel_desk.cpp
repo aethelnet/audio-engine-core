@@ -18,6 +18,7 @@
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/engine.hpp"
 #include "audio_core/midi/hardware_midi_receiver.hpp"
+#include "audio_core/midi/midi_sync.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -661,6 +662,13 @@ int main(int argc, char** argv) {
 
         // Drain incoming Hardware MIDI events into ModulationMatrix & PolyphonicSynth
         midi_rx.drain_to(mod_matrix);
+        midi_rx.sync_to_clock(mixer.clock());
+        if (mixer.clock().authority() == clock::ClockAuthority::MidiClockSlave ||
+            mixer.clock().authority() == clock::ClockAuthority::MtcSlave) {
+            bpm = static_cast<float>(mixer.clock().bpm());
+            is_playing = mixer.clock().is_playing();
+            playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / 48000.0f;
+        }
 
         // Advance Modulator Matrix & Polyphonic Voice Pool at audio clock rate for real-time visual feedback
         uint32_t mod_sim_frames = std::clamp(static_cast<uint32_t>(dt * 48000.0f), 1u, 1024u);
@@ -770,7 +778,11 @@ int main(int argc, char** argv) {
 
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100);
-            if (ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f")) {
+            if (mixer.clock().authority() == clock::ClockAuthority::MidiClockSlave) {
+                ImGui::BeginDisabled();
+                ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f (MIDI)");
+                ImGui::EndDisabled();
+            } else if (ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f")) {
                 mixer.clock().set_bpm(bpm);
             }
 
@@ -4351,6 +4363,44 @@ int main(int argc, char** argv) {
                         ImGui::SameLine();
                         if (ImGui::SmallButton(" ⟳ Re-probe MIDI ")) {
                             midi_rx.auto_connect();
+                        }
+
+                        // MIDI Sync Telemetry & Clock Authority Banner
+                        const auto& tracker = midi_rx.sync_tracker();
+                        auto sync_tel = tracker.telemetry(4);
+                        auto mtc_tc = tracker.mtc_timecode();
+                        auto auth = mixer.clock().authority();
+
+                        ImGui::Spacing();
+                        ImGui::Text("Sync Authority:");
+                        ImGui::SameLine();
+                        const char* auth_names[] = { "Master (Internal)", "Ableton Link Follower", "Isolated", "MIDI Clock Slave (24 PPQN)", "MTC Slave (SMPTE Timecode)" };
+                        int current_auth_idx = static_cast<int>(auth);
+                        ImGui::SetNextItemWidth(210);
+                        if (ImGui::Combo("##SyncAuthCombo", &current_auth_idx, auth_names, IM_ARRAYSIZE(auth_names))) {
+                            mixer.clock().set_authority(static_cast<clock::ClockAuthority>(current_auth_idx));
+                        }
+
+                        ImGui::SameLine();
+                        if (sync_tel.is_locked) {
+                            ImGui::TextColored(ImVec4(0.20f, 1.0f, 0.40f, 1.0f), "[ ● MIDI CLOCK LOCKED: %.1f BPM ]", sync_tel.estimated_bpm);
+                        } else {
+                            ImGui::TextColored(ImVec4(0.50f, 0.50f, 0.50f, 1.0f), "[ ○ MIDI CLOCK: NO LOCK ]");
+                        }
+
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("| Ticks: %llu | SPP: %u (Bar %u.%u) | Jitter: %.2f ms",
+                            static_cast<unsigned long long>(sync_tel.tick_count),
+                            sync_tel.song_position_spp,
+                            sync_tel.bar_index + 1,
+                            sync_tel.beat_within_bar + 1,
+                            sync_tel.jitter_ms);
+
+                        ImGui::SameLine();
+                        if (mtc_tc.is_valid) {
+                            ImGui::TextColored(ImVec4(0.20f, 0.90f, 1.0f, 1.0f), "| [ MTC: %s ]", mtc_tc.to_string().c_str());
+                        } else {
+                            ImGui::TextDisabled("| [ MTC: Offline ]");
                         }
                     }
                     ImGui::Separator();

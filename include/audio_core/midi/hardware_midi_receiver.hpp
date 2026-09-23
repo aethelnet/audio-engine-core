@@ -4,6 +4,7 @@
 #include "audio_core/ring_buffer.hpp"
 #include "audio_core/modulation/polyphonic_synth.hpp"
 #include "audio_core/modulation/modulation_matrix.hpp"
+#include "audio_core/midi/midi_sync.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -277,9 +278,17 @@ public:
     [[nodiscard]] const std::string& current_device_path() const noexcept { return m_current_device_path; }
 
     bool send_seq_event(const struct snd_seq_event& ev) noexcept {
+        if (m_is_mock) {
+            parse_seq_event(ev);
+            return true;
+        }
         if (m_seq_fd < 0) return false;
         ssize_t w = ::write(m_seq_fd, &ev, sizeof(ev));
         return (w == static_cast<ssize_t>(sizeof(ev)));
+    }
+
+    void inject_seq_event(const struct snd_seq_event& ev) noexcept {
+        parse_seq_event(ev);
     }
 
     // ========================================================================
@@ -476,6 +485,90 @@ public:
             }
         } catch (...) {}
         return false;
+    }
+
+    // ========================================================================
+    // MIDI Synchronization (Beat Clock 24 PPQN & MTC SMPTE Time Code)
+    // ========================================================================
+    [[nodiscard]] MidiSyncTracker& sync_tracker() noexcept { return m_sync_tracker; }
+    [[nodiscard]] const MidiSyncTracker& sync_tracker() const noexcept { return m_sync_tracker; }
+
+    void sync_to_clock(clock::TimelineClock& clock) noexcept {
+        m_sync_tracker.apply_to_timeline_clock(clock);
+    }
+
+    bool send_midi_clock_tick() noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_CLOCK;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        return send_seq_event(ev);
+    }
+
+    bool send_midi_start() noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_START;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        return send_seq_event(ev);
+    }
+
+    bool send_midi_continue() noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_CONTINUE;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        return send_seq_event(ev);
+    }
+
+    bool send_midi_stop() noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_STOP;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        return send_seq_event(ev);
+    }
+
+    bool send_midi_spp(uint16_t spp_sixteenths) noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_SONGPOS;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        ev.data.control.value = spp_sixteenths;
+        return send_seq_event(ev);
+    }
+
+    bool send_mtc_qframe(uint8_t qframe_byte) noexcept {
+        if (m_seq_fd < 0 && !m_is_mock) return false;
+        struct snd_seq_event ev{};
+        ev.type = SNDRV_SEQ_EVENT_QFRAME;
+        ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+        ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+        ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+        ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        ev.data.control.value = qframe_byte;
+        return send_seq_event(ev);
     }
 
     // ========================================================================
@@ -800,6 +893,33 @@ private:
                     dispatch_parsed_message(0xE0 | ch, d1, d2);
                     break;
                 }
+                // Realtime Sync Events (Beat Clock & MTC)
+                case SNDRV_SEQ_EVENT_CLOCK: { // 36
+                    m_sync_tracker.on_clock_tick();
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_START: { // 30
+                    m_sync_tracker.on_start();
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_CONTINUE: { // 31
+                    m_sync_tracker.on_continue();
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_STOP: { // 32
+                    m_sync_tracker.on_stop();
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_SONGPOS: { // 20
+                    uint16_t spp = static_cast<uint16_t>(std::clamp(ev.data.control.value, 0, 16383));
+                    m_sync_tracker.on_song_position_pointer(spp);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_QFRAME: { // 22
+                    uint8_t qf = static_cast<uint8_t>(ev.data.control.value & 0xFF);
+                    m_sync_tracker.on_mtc_quarter_frame(qf);
+                    break;
+                }
                 // Dynamic hotplug & kernel announce events
                 case SNDRV_SEQ_EVENT_PORT_START:
                 case SNDRV_SEQ_EVENT_PORT_CHANGE: {
@@ -851,8 +971,25 @@ private:
     }
 
     void parse_byte(uint8_t byte) noexcept {
-        // 1. Realtime messages (0xF8..0xFF) can appear anywhere without interrupting running status
+        // 1. System Realtime messages (0xF8..0xFF) can appear ANYWHERE in the byte stream
+        // without interrupting or corrupting running status for channel messages!
         if (byte >= 0xF8) {
+            switch (byte) {
+                case 0xF8: // Timing Clock (24 PPQN)
+                    m_sync_tracker.on_clock_tick();
+                    break;
+                case 0xFA: // Start
+                    m_sync_tracker.on_start();
+                    break;
+                case 0xFB: // Continue
+                    m_sync_tracker.on_continue();
+                    break;
+                case 0xFC: // Stop
+                    m_sync_tracker.on_stop();
+                    break;
+                default:
+                    break;
+            }
             return;
         }
 
@@ -863,10 +1000,22 @@ private:
                 m_running_status = 0;
                 m_expected_bytes = 0;
                 m_received_bytes = 0;
+
+                if (byte == 0xF1) { // MTC Quarter Frame
+                    m_syscommon_status = 0xF1;
+                    m_expected_bytes = 1;
+                } else if (byte == 0xF2) { // Song Position Pointer (SPP)
+                    m_syscommon_status = 0xF2;
+                    m_expected_bytes = 2;
+                } else {
+                    m_syscommon_status = byte;
+                    m_expected_bytes = (byte == 0xF3) ? 1 : 0;
+                }
                 return;
             }
 
             // Channel Voice Message (0x80..0xEF)
+            m_syscommon_status = 0;
             m_running_status = byte;
             m_received_bytes = 0;
             uint8_t type = byte & 0xF0;
@@ -879,6 +1028,27 @@ private:
         }
 
         // 3. Data Byte (MSB == 0)
+        if (m_syscommon_status == 0xF1) {
+            m_sync_tracker.on_mtc_quarter_frame(byte);
+            m_syscommon_status = 0;
+            m_expected_bytes = 0;
+            m_received_bytes = 0;
+            return;
+        } else if (m_syscommon_status == 0xF2) {
+            if (m_received_bytes == 0) {
+                m_data1 = byte; // SPP LSB
+                m_received_bytes = 1;
+            } else {
+                uint8_t spp_msb = byte;
+                uint16_t spp = static_cast<uint16_t>(m_data1) | (static_cast<uint16_t>(spp_msb) << 7);
+                m_sync_tracker.on_song_position_pointer(spp);
+                m_syscommon_status = 0;
+                m_expected_bytes = 0;
+                m_received_bytes = 0;
+            }
+            return;
+        }
+
         if (m_running_status == 0) return; // Stray data byte without active status
 
         if (m_received_bytes == 0) {
@@ -934,6 +1104,7 @@ private:
 
     // Running-status parser state
     uint8_t m_running_status{0};
+    uint8_t m_syscommon_status{0};
     uint8_t m_data1{0};
     uint8_t m_data2{0};
     uint8_t m_expected_bytes{0};
@@ -949,6 +1120,9 @@ private:
     // ALSA Sequencer Subscriptions
     mutable std::recursive_mutex m_subs_mutex;
     std::vector<AlsaSeqSubscription> m_subscriptions;
+
+    // MIDI Clock & MTC Synchronization Tracker
+    MidiSyncTracker m_sync_tracker;
 };
 
 } // namespace audio_core::midi

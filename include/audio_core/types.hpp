@@ -110,7 +110,23 @@ enum class MidiStatus : uint8_t {
     ControlChange = 0xB0,
     ProgramChange = 0xC0,
     ChannelAftertouch = 0xD0,
-    PitchBend = 0xE0
+    PitchBend = 0xE0,
+
+    // System Common (0xF0..0xF7)
+    SysEx = 0xF0,
+    TimeCodeQuarterFrame = 0xF1,
+    SongPositionPointer = 0xF2,
+    SongSelect = 0xF3,
+    TuneRequest = 0xF6,
+    EndOfExclusive = 0xF7,
+
+    // System Realtime (0xF8..0xFF)
+    TimingClock = 0xF8,
+    Start = 0xFA,
+    Continue = 0xFB,
+    Stop = 0xFC,
+    ActiveSensing = 0xFE,
+    SystemReset = 0xFF
 };
 
 struct MidiEvent {
@@ -120,16 +136,28 @@ struct MidiEvent {
     uint8_t data2{0};
 
     [[nodiscard]] constexpr MidiStatus type() const noexcept {
+        if (status >= 0xF0) {
+            return static_cast<MidiStatus>(status);
+        }
         return static_cast<MidiStatus>(status & 0xF0);
     }
     [[nodiscard]] constexpr uint8_t channel() const noexcept {
-        return status & 0x0F;
+        return (status < 0xF0) ? (status & 0x0F) : 0;
     }
     [[nodiscard]] constexpr uint8_t note() const noexcept {
         return data1;
     }
     [[nodiscard]] constexpr uint8_t velocity() const noexcept {
         return data2;
+    }
+    [[nodiscard]] constexpr bool is_realtime() const noexcept {
+        return status >= 0xF8;
+    }
+    [[nodiscard]] constexpr bool is_system_common() const noexcept {
+        return status >= 0xF0 && status < 0xF8;
+    }
+    [[nodiscard]] constexpr bool is_channel_voice() const noexcept {
+        return status >= 0x80 && status < 0xF0;
     }
 };
 

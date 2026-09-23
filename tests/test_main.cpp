@@ -55,6 +55,7 @@
 #include "audio_core/modulation/modulation_lfo.hpp"
 #include "audio_core/modulation/modulation_matrix.hpp"
 #include "audio_core/midi/hardware_midi_receiver.hpp"
+#include "audio_core/midi/midi_sync.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -10260,6 +10261,384 @@ void test_alsa_sequencer_subscriptions_and_hotplug() {
     std::cout << "  -> ALSA Sequencer Subscriptions & Dynamic Hotplug Daemon: PASSED" << std::endl;
 }
 
+void test_midi_sync_beat_clock_spp_and_mtc_timecode() {
+    std::cout << "[TEST 75] Running MIDI Sync: Beat Clock (24 PPQN), SPP & MTC Timecode..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::midi;
+    using namespace audio_core::clock;
+
+    // ------------------------------------------------------------------------
+    // Part A: Beat Clock (24 PPQN) Ingestion & PLL Smoothed Tempo Estimation
+    // ------------------------------------------------------------------------
+    {
+        MidiSyncTracker tracker;
+        TEST_CHECK(!tracker.is_locked());
+        TEST_CHECK(!tracker.is_playing());
+        TEST_CHECK(tracker.tick_count() == 0);
+
+        // 120.0 BPM: 24 ticks per beat = 2.5e9 / 120.0 = 20,833,333.33 ns per tick
+        constexpr int64_t tick_interval_120 = 20833333; // ~20.833 ms
+        uint64_t t_ns = 1'000'000'000ULL; // 1 second epoch start
+
+        // Feed 48 ticks (2 beats = 1/2 bar of 4/4)
+        for (int i = 0; i < 48; ++i) {
+            tracker.on_clock_tick(t_ns);
+            t_ns += tick_interval_120;
+        }
+
+        TEST_CHECK(tracker.is_locked());
+        TEST_CHECK(std::abs(tracker.estimated_bpm() - 120.0) < 0.1);
+        TEST_CHECK(tracker.tick_count() == 48);
+        TEST_CHECK(std::abs(tracker.total_beats() - 2.0) < 0.001);
+        TEST_CHECK(tracker.jitter_ms() < 0.05);
+
+        // Tempo Agility: Shift to 140.0 BPM (2.5e9 / 140 = 17,857,143 ns per tick)
+        constexpr int64_t tick_interval_140 = 17857143;
+        for (int i = 0; i < 48; ++i) {
+            tracker.on_clock_tick(t_ns);
+            t_ns += tick_interval_140;
+        }
+        TEST_CHECK(std::abs(tracker.estimated_bpm() - 140.0) < 0.5);
+
+        // Outlier Rejection: Inject spurious jitter spikes
+        // Delta 2ms from last tick (3000 BPM / contact bounce) -> Rejected
+        uint64_t last_t = t_ns - tick_interval_140;
+        tracker.on_clock_tick(last_t + 2'000'000);
+        TEST_CHECK(std::abs(tracker.estimated_bpm() - 140.0) < 0.5);
+
+        // Delta 200ms from last tick (12.5 BPM / pause gap) -> Rejected
+        tracker.on_clock_tick(last_t + 200'000'000);
+        TEST_CHECK(std::abs(tracker.estimated_bpm() - 140.0) < 0.5);
+
+        std::cout << "  -> Beat Clock (24 PPQN) PLL lock, tempo agility & outlier rejection: PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part B: Realtime Transport Transitions
+    // ------------------------------------------------------------------------
+    {
+        MidiSyncTracker tracker;
+        TEST_CHECK(!tracker.is_playing());
+
+        tracker.on_start();
+        TEST_CHECK(tracker.is_playing());
+        TEST_CHECK(tracker.tick_count() == 0);
+        TEST_CHECK(tracker.total_beats() == 0.0);
+
+        // Advance 96 ticks (1 bar of 4/4)
+        uint64_t t = 100'000'000;
+        for (int i = 0; i < 96; ++i) {
+            tracker.on_clock_tick(t);
+            t += 20833333;
+        }
+        TEST_CHECK(tracker.tick_count() == 96);
+        TEST_CHECK(std::abs(tracker.total_beats() - 4.0) < 0.001);
+
+        tracker.on_stop();
+        TEST_CHECK(!tracker.is_playing());
+        TEST_CHECK(tracker.tick_count() == 96);
+        TEST_CHECK(std::abs(tracker.total_beats() - 4.0) < 0.001);
+
+        // Continue resumes without resetting playhead
+        tracker.on_continue();
+        TEST_CHECK(tracker.is_playing());
+        TEST_CHECK(tracker.tick_count() == 96);
+
+        std::cout << "  -> Realtime Transport Transitions (Start, Stop, Continue): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part C: Song Position Pointer (SPP) 16th-Note Invariant
+    // ------------------------------------------------------------------------
+    {
+        MidiSyncTracker tracker;
+        // Invariant: 1 SPP unit = 6 MIDI clocks = 1/16th note.
+        // 4 units = 1 beat (24 clocks); 16 units = 1 bar (96 clocks).
+        tracker.on_song_position_pointer(64); // 64 sixteenths = 16 beats = 4 bars
+        TEST_CHECK(tracker.song_position_spp() == 64);
+        TEST_CHECK(tracker.tick_count() == 384);
+        TEST_CHECK(std::abs(tracker.total_beats() - 16.0) < 0.001);
+
+        auto tel = tracker.telemetry(4);
+        TEST_CHECK(tel.bar_index == 4);
+        TEST_CHECK(tel.beat_within_bar == 0);
+        TEST_CHECK(tel.song_position_spp == 64);
+
+        // Position with partial beat: SPP 18 = 18 sixteenths = 4.5 beats = 1 bar, 0.5 beats
+        tracker.on_song_position_pointer(18);
+        TEST_CHECK(tracker.song_position_spp() == 18);
+        TEST_CHECK(tracker.tick_count() == 108); // 18 * 6
+        TEST_CHECK(std::abs(tracker.total_beats() - 4.5) < 0.001);
+
+        auto tel2 = tracker.telemetry(4);
+        TEST_CHECK(tel2.bar_index == 1);
+        TEST_CHECK(tel2.beat_within_bar == 0);
+
+        std::cout << "  -> Song Position Pointer (1 unit = 6 clocks = 1/16th note): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part D: MIDI Time Code (MTC) 8-Piece Quarter-Frame Assembly & Full Frame
+    // ------------------------------------------------------------------------
+    {
+        MidiSyncTracker tracker;
+        TEST_CHECK(!tracker.mtc_timecode().is_valid);
+        TEST_CHECK(!tracker.is_mtc_playing());
+
+        // Target SMPTE: 02:15:30:18 at 25 fps PAL (rate code 1)
+        // Piece 0: Frame LSB -> 18 & 0x0F = 2 -> (0 << 4) | 0x02 = 0x02
+        // Piece 1: Frame MSB -> (18 >> 4) & 1 = 1 -> (1 << 4) | 0x01 = 0x11
+        // Piece 2: Sec LSB   -> 30 & 0x0F = 14 = 0x0E -> (2 << 4) | 0x0E = 0x2E
+        // Piece 3: Sec MSB   -> (30 >> 4) & 3 = 1 -> (3 << 4) | 0x01 = 0x31
+        // Piece 4: Min LSB   -> 15 & 0x0F = 15 = 0x0F -> (4 << 4) | 0x0F = 0x4F
+        // Piece 5: Min MSB   -> (15 >> 4) & 3 = 0 -> (5 << 4) | 0x00 = 0x50
+        // Piece 6: Hour LSB  -> 2 & 0x0F = 2 -> (6 << 4) | 0x02 = 0x62
+        // Piece 7: Hour MSB & Rate -> Rate=1 (25fps), Hr MSB=0 -> (7 << 4) | (1 << 1) = 0x72
+        const std::array<uint8_t, 8> pieces = { 0x02, 0x11, 0x2E, 0x31, 0x4F, 0x50, 0x62, 0x72 };
+
+        // Feed first 7 pieces (0..6) - MUST NOT be valid yet
+        for (size_t i = 0; i < 7; ++i) {
+            tracker.on_mtc_quarter_frame(pieces[i]);
+            TEST_CHECK(!tracker.mtc_timecode().is_valid);
+        }
+
+        // Feed 8th piece (7) - Timecode unlocks!
+        tracker.on_mtc_quarter_frame(pieces[7]);
+        auto tc = tracker.mtc_timecode();
+        TEST_CHECK(tc.is_valid);
+        TEST_CHECK(tc.hours == 2);
+        TEST_CHECK(tc.minutes == 15);
+        TEST_CHECK(tc.seconds == 30);
+        TEST_CHECK(tc.frames == 18);
+        TEST_CHECK(tc.rate == MtcFrameRate::Fps25);
+        TEST_CHECK(tracker.is_mtc_playing());
+
+        const double expected_sec = 2.0 * 3600.0 + 15.0 * 60.0 + 30.0 + 18.0 / 25.0;
+        TEST_CHECK(std::abs(tc.total_seconds() - expected_sec) < 1e-6);
+        TEST_CHECK(tc.to_string().find("02:15:30:18 (25 fps)") != std::string::npos);
+
+        // Test Full Frame
+        tracker.on_mtc_full_frame(1, 0, 0, 0, MtcFrameRate::Fps30);
+        auto tc_ff = tracker.mtc_timecode();
+        TEST_CHECK(tc_ff.hours == 1 && tc_ff.minutes == 0 && tc_ff.seconds == 0 && tc_ff.frames == 0);
+        TEST_CHECK(tc_ff.rate == MtcFrameRate::Fps30);
+        TEST_CHECK(std::abs(tc_ff.total_seconds() - 3600.0) < 1e-6);
+
+        std::cout << "  -> MIDI Time Code (MTC) 8-piece quarter-frame & full frame: PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part E: Strict Format Isolation Invariant
+    // ------------------------------------------------------------------------
+    {
+        MidiSyncTracker tracker;
+        // Ingest Beat Clock ticks
+        uint64_t t = 1000;
+        for (int i = 0; i < 24; ++i) {
+            tracker.on_clock_tick(t);
+            t += 20833333;
+        }
+        tracker.on_song_position_pointer(32);
+        uint64_t ticks_before = tracker.tick_count();
+        double beats_before = tracker.total_beats();
+        uint16_t spp_before = tracker.song_position_spp();
+        double bpm_before = tracker.estimated_bpm();
+
+        // Ingest MTC Full Frame
+        tracker.on_mtc_full_frame(5, 10, 15, 20, MtcFrameRate::Fps24);
+
+        // Beat Clock state MUST be completely untouched!
+        TEST_CHECK(tracker.tick_count() == ticks_before);
+        TEST_CHECK(tracker.total_beats() == beats_before);
+        TEST_CHECK(tracker.song_position_spp() == spp_before);
+        TEST_CHECK(tracker.estimated_bpm() == bpm_before);
+
+        // Ingest more Beat Clock ticks: MTC timecode MUST be completely untouched!
+        tracker.on_clock_tick(t + 20833333);
+        auto tc = tracker.mtc_timecode();
+        TEST_CHECK(tc.hours == 5 && tc.minutes == 10 && tc.seconds == 15 && tc.frames == 20);
+
+        std::cout << "  -> Strict Format Isolation (Beat Clock vs MTC): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part F: RawMIDI Byte Parser with Interleaved Realtime Clocks & Running Status
+    // ------------------------------------------------------------------------
+    {
+        HardwareMidiReceiver rx;
+        TEST_CHECK(rx.auto_connect(false)); // Mock mode
+        TEST_CHECK(rx.is_mock());
+
+        // Simulated Byte Stream:
+        // Status 0x90 (Note On ch 0), note 60, vel 100
+        // Then running status: note 64, INTERLEAVED 0xF8 (Timing Clock), vel 110
+        // Then running status: note 67, vel 120
+        const std::array<uint8_t, 8> raw_stream = {
+            0x90, 60, 100,
+            64, 0xF8, 110,
+            67, 120
+        };
+
+        rx.inject_raw_bytes(raw_stream.data(), raw_stream.size());
+
+        // 0xF8 must be routed to sync tracker
+        TEST_CHECK(rx.sync_tracker().tick_count() >= 1);
+
+        // Drain parsed channel voice events
+        std::vector<MidiEvent> events;
+        size_t drained = rx.drain_to(events);
+        TEST_CHECK(drained == 3);
+        TEST_CHECK(events[0].note() == 60 && events[0].velocity() == 100);
+        TEST_CHECK(events[1].note() == 64 && events[1].velocity() == 110);
+        TEST_CHECK(events[2].note() == 67 && events[2].velocity() == 120);
+
+        // System Common SPP cancels running status
+        const std::array<uint8_t, 4> spp_stream = {
+            0xF2, 0x10, 0x00, // SPP = 16 sixteenths
+            55                // Stray data byte without active running status
+        };
+        rx.inject_raw_bytes(spp_stream.data(), spp_stream.size());
+        TEST_CHECK(rx.sync_tracker().song_position_spp() == 16);
+
+        events.clear();
+        drained = rx.drain_to(events);
+        TEST_CHECK(drained == 0); // Stray byte 55 dropped safely
+
+        rx.close_device();
+        std::cout << "  -> RawMIDI Byte Parser (Interleaved Realtime Clocks & Running Status): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part G: ALSA Sequencer Event Loopback for Sync Events
+    // ------------------------------------------------------------------------
+    {
+        HardwareMidiReceiver rx;
+        TEST_CHECK(rx.auto_connect(false));
+
+        TEST_CHECK(rx.send_midi_start());
+        TEST_CHECK(rx.sync_tracker().is_playing());
+
+        TEST_CHECK(rx.send_midi_clock_tick());
+        TEST_CHECK(rx.sync_tracker().tick_count() >= 1);
+
+        TEST_CHECK(rx.send_midi_spp(64));
+        TEST_CHECK(rx.sync_tracker().song_position_spp() == 64);
+
+        TEST_CHECK(rx.send_mtc_qframe(0x72));
+
+        TEST_CHECK(rx.send_midi_stop());
+        TEST_CHECK(!rx.sync_tracker().is_playing());
+
+        rx.close_device();
+        std::cout << "  -> ALSA Sequencer Event Loopback (Clock, Start, Stop, SPP, QFrame): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part H: TimelineClock Integration & Authority Enforcement
+    // ------------------------------------------------------------------------
+    {
+        TimelineClock clock(48000);
+
+        MidiSyncTracker tracker;
+        uint64_t t = 1000;
+        for (int i = 0; i < 48; ++i) {
+            tracker.on_clock_tick(t);
+            t += 20833333; // 120 BPM
+        }
+        tracker.on_song_position_pointer(16); // 16 sixteenths = 4 beats = 1 bar
+
+        // 1. ClockAuthority::Master -> REJECTS external synchronization!
+        clock.set_authority(ClockAuthority::Master);
+        clock.set_bpm(135.0);
+        clock.set_sample_position(0);
+        clock.set_playing(false);
+
+        tracker.apply_to_timeline_clock(clock);
+        TEST_CHECK(clock.bpm() == 135.0); // BPM preserved
+        TEST_CHECK(clock.sample_position() == 0);
+        TEST_CHECK(!clock.is_playing());
+
+        // 2. ClockAuthority::MidiClockSlave -> Follows Beat Clock & SPP
+        clock.set_authority(ClockAuthority::MidiClockSlave);
+        tracker.on_start();
+        tracker.on_song_position_pointer(16); // 4 beats
+        tracker.apply_to_timeline_clock(clock);
+
+        TEST_CHECK(std::abs(clock.bpm() - tracker.estimated_bpm()) < 0.1);
+        TEST_CHECK(clock.is_playing());
+        const double expected_sample_pos = 4.0 * clock.samples_per_beat();
+        TEST_CHECK(std::abs(static_cast<double>(clock.sample_position()) - expected_sample_pos) < 2.0);
+
+        // 3. ClockAuthority::MtcSlave -> Follows SMPTE Linear Time
+        clock.set_authority(ClockAuthority::MtcSlave);
+        tracker.on_mtc_full_frame(0, 1, 0, 0, MtcFrameRate::Fps25); // Exactly 60 seconds
+        tracker.apply_to_timeline_clock(clock);
+
+        TEST_CHECK(clock.is_playing());
+        // 60 seconds * 48000 samples/sec = 2,880,000 samples
+        TEST_CHECK(clock.sample_position() == 2'880'000ULL);
+
+        std::cout << "  -> TimelineClock External Authority Enforcement (Master vs MidiSlave vs MtcSlave): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part I: MidiClockGenerator (Master Output Generation)
+    // ------------------------------------------------------------------------
+    {
+        MidiClockGenerator gen;
+        gen.reset();
+
+        TimelineClock master_clock(48000);
+        master_clock.set_bpm(120.0);
+        master_clock.set_sample_position(0);
+        master_clock.set_playing(false);
+
+        std::vector<uint8_t> emitted_bytes;
+        auto byte_consumer = [&](uint8_t b) { emitted_bytes.push_back(b); };
+
+        // Process block while stopped -> 0 bytes
+        gen.process_block(512, master_clock, byte_consumer);
+        TEST_CHECK(emitted_bytes.empty());
+
+        // Start playback at sample 0
+        master_clock.set_playing(true);
+        // Process 48000 frames (1 second = 2 beats at 120 BPM = 48 clocks)
+        gen.process_block(48000, master_clock, byte_consumer);
+
+        TEST_CHECK(!emitted_bytes.empty());
+        TEST_CHECK(emitted_bytes.front() == 0xFA); // Start
+
+        size_t clock_ticks = std::count(emitted_bytes.begin(), emitted_bytes.end(), 0xF8);
+        TEST_CHECK(clock_ticks == 48); // Exactly 2 beats * 24 clocks/beat = 48 clocks!
+
+        // Stop playback
+        master_clock.set_playing(false);
+        emitted_bytes.clear();
+        gen.process_block(128, master_clock, byte_consumer);
+        TEST_CHECK(emitted_bytes.size() == 1);
+        TEST_CHECK(emitted_bytes[0] == 0xFC); // Stop
+
+        // Resume playback at sample > 0 -> Emits 0xFB (Continue)
+        master_clock.set_sample_position(24000);
+        master_clock.set_playing(true);
+        emitted_bytes.clear();
+        gen.process_block(128, master_clock, byte_consumer);
+        TEST_CHECK(!emitted_bytes.empty());
+        TEST_CHECK(emitted_bytes.front() == 0xFB); // Continue
+
+        // Song Position Pointer factory helper
+        auto spp_msg = MidiClockGenerator::make_spp(64);
+        TEST_CHECK(spp_msg[0] == 0xF2);
+        TEST_CHECK(spp_msg[1] == 0x40); // 64 & 0x7F
+        TEST_CHECK(spp_msg[2] == 0x00); // (64 >> 7) & 0x7F
+
+        std::cout << "  -> MidiClockGenerator Master Clock Output (24 PPQN, Start, Continue, Stop, SPP): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> MIDI Synchronization (Beat Clock, SPP & MTC Timecode): ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -10339,6 +10718,7 @@ int main() {
     test_hardware_midi_and_automatic_track_routing();
     test_alsa_sequencer_and_modulation_session_serialization();
     test_alsa_sequencer_subscriptions_and_hotplug();
+    test_midi_sync_beat_clock_spp_and_mtc_timecode();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -8,9 +8,11 @@
 namespace audio_core::clock {
 
 enum class ClockAuthority : uint8_t {
-    Master = 0,   // Sovereign internal clock. Dictates BPM and beat phase to Link. Rejects external overrides.
-    Follower,     // Follows external Link clock (via smooth PLL / adaptive adjustment).
-    Isolated      // Internal clock only, Ableton Link completely detached.
+    Master = 0,     // Sovereign internal clock. Dictates BPM and beat phase to Link. Rejects external overrides.
+    Follower,       // Follows external Link clock (via smooth PLL / adaptive adjustment).
+    Isolated,       // Internal clock only, Ableton Link completely detached.
+    MidiClockSlave, // Slaved to incoming MIDI 24 PPQN Beat Clock + SPP
+    MtcSlave        // Slaved to incoming MIDI Time Code (SMPTE linear frames)
 };
 
 struct TimeSignature {
@@ -95,6 +97,28 @@ public:
     }
     void set_sample_position(uint64_t pos) noexcept {
         m_sample_position.store(pos, std::memory_order_relaxed);
+    }
+
+    // External Sync Ingestion Hooks
+    void sync_from_midi_clock(double external_bpm, uint64_t sample_pos, bool is_playing) noexcept {
+        if (m_authority.load(std::memory_order_relaxed) != ClockAuthority::MidiClockSlave) {
+            return;
+        }
+        if (external_bpm >= 20.0 && external_bpm <= 400.0) {
+            m_bpm.store(external_bpm, std::memory_order_relaxed);
+        }
+        m_sample_position.store(sample_pos, std::memory_order_relaxed);
+        m_is_playing.store(is_playing, std::memory_order_relaxed);
+    }
+
+    void sync_from_mtc(double total_seconds, bool is_playing) noexcept {
+        if (m_authority.load(std::memory_order_relaxed) != ClockAuthority::MtcSlave) {
+            return;
+        }
+        const double sr = static_cast<double>(m_sample_rate.load(std::memory_order_relaxed));
+        const uint64_t pos = static_cast<uint64_t>(std::max(0.0, std::round(total_seconds * sr)));
+        m_sample_position.store(pos, std::memory_order_relaxed);
+        m_is_playing.store(is_playing, std::memory_order_relaxed);
     }
 
     // Mathematical Grid Calculations
