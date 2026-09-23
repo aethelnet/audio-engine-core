@@ -4,9 +4,10 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 56/56 Passed](https://img.shields.io/badge/CTest-56%2F56%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 59/59 Passed](https://img.shields.io/badge/CTest-59%2F59%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-orange.svg)](LICENSE)
 
 ---
 
@@ -14,7 +15,7 @@
 
 `AudioEngineCore` is an industrial-grade C++20 real-time audio processing engine built specifically to guarantee **zero priority inversions, zero memory allocations, and zero unbounded locks** inside any active audio callback. 
 
-Designed for high-density digital audio workstations (DAWs), embedded installations, and low-latency audio servers, it bridges classical DSP (Cytomic state-variable filters, optical vactrol levelers, Buchla 292 low-pass gates) with modern dynamical systems (continuous Liquid Neural ODE compression) and deterministic network synchronization (IEEE 1588-2008 PTPv2 / AES67).
+Designed for high-density digital audio workstations (DAWs), embedded installations, and low-latency audio servers, it bridges classical DSP (Cytomic state-variable filters, optical vactrol levelers, Buchla 292 low-pass gates, and Airwindows modeled processors) with modern dynamical systems (continuous Liquid Neural ODE compression) and deterministic network synchronization (IEEE 1588-2008 PTPv2 / AES67).
 
 ```
                                  [AUDIO THREAD / REAL-TIME DOMAIN]
@@ -33,7 +34,7 @@ Designed for high-density digital audio workstations (DAWs), embedded installati
     │   Track 2: Synth / Sampler (WSOLA Resample) ──────────┤                               │
     │                                                       ▼                               │
     │                                           [InsertSlot Chain]                          │
-    │                                           - Airwindows DeRez2                         │
+    │                                           - Airwindows DeRez2 / ClipOnly2             │
     │                                           - Liquid ODE Multiband Vactrol              │
     │                                           - Cytomic State-Variable Filter             │
     │                                                       │                               │
@@ -83,7 +84,7 @@ Bit-exact mathematical integrity is verified via `GoldenMasterTool`:
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **56 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **59 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -100,8 +101,11 @@ $ ./build/audio_tests
 [TEST 54]     Plugin Delay Compensation (PDC Phase Alignment):    PASSED
 [TEST 55]     Sample-Accurate Parameter Ramping (Anti-Zipper):    PASSED
 [TEST 56]     Disk-Streaming & Lock-Free Voice Prefetching:       PASSED
+[TEST 57]     Airwindows DeRez2 Bit & Sample-Rate Reduction:      PASSED
+[TEST 58]     Airwindows ClipOnly2 Ultrasonic Wavefolding:        PASSED
+[TEST 59]     Interstage Transformer Saturation & Resonance:      PASSED
 ===============================================================================
-   56 / 56 UNIT TESTS PASSED (100.0% SUCCESS IN 1.41s)
+   59 / 59 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 
@@ -117,7 +121,7 @@ $ ./build/audio_tests
 ### Building & Running Tests
 ```bash
 # Clone the repository
-git clone https://github.com/ProphitEngine/audio-engine-core.git
+git clone https://github.com/aethelnet/audio-engine-core.git
 cd audio-engine-core
 
 # Configure with CMake (Release mode recommended for SIMD vectorization)
@@ -146,6 +150,7 @@ audio-engine-core/
 │   ├── analysis/             # FFT, Spectrum, Golden Master Checksums
 │   ├── dynamics/             # Liquid ODE Compressor, Vactrol Opto-Leveler
 │   ├── filters/              # Cytomic SVF, Buchla 292 LPG, LR4 Crossovers
+│   ├── modeled/              # Airwindows DSP: DeRez2, ClipOnly2, Interstage, Baxandall
 │   ├── network/              # IEEE 1588 PTPv2, AES67 RTP L24 Framing
 │   ├── routing/              # Universal Routing Matrix, PDC Delay Lines
 │   ├── sampling/             # DiskStreamer, WSOLA Stretcher, Hermite Resampler
@@ -154,14 +159,31 @@ audio-engine-core/
 │   ├── mixer_graph.hpp       # Lock-Free Multi-Track Mixer Graph
 │   └── ring_buffer.hpp       # Lock-Free SPSC Wait-Free Ring Buffer
 ├── src/                      # Implementation sources
-├── tests/                    # 56 Automated Unit Test Suites
+├── tests/                    # 59 Automated Unit Test Suites
 ├── examples/
 │   ├── aethel_desk.cpp       # ImGui Audio Workstation GUI
 │   └── golden_master_tool.cpp# Bit-Exact Checksum Verification CLI
+├── LICENSE                   # GNU AGPL-3.0
 └── CMakeLists.txt
 ```
 
 ---
 
-## 6. License
-Dual-licensed under the **MIT License** and **AGPL-3.0**. Commercial licensing is available upon request.
+## 6. Attribution & Acknowledgements
+
+This project incorporates and adapts select analog-modeled DSP algorithms created by **Chris Johnson ([Airwindows](https://www.airwindows.com / https://github.com/airwindows/airwindows))**, originally released under the MIT License:
+- **Baxandall**: Precision high/low shelving filter curves with minimal phase distortion.
+- **ButterComp2**: Dual-stage cascaded Butterworth gain-reduction dynamics.
+- **PurestDrive**: Pure sine/hyperbolic tangent harmonic saturation.
+- **DeRez2**: Continuous variable wordlength quantization and sample-rate reduction.
+- **ClipOnly2**: Specialized anti-harshness peak limiter and ultrasonic wavefolder.
+- **Interstage**: Analog transformer core saturation and interstage capacitive LF resonance.
+
+We express our gratitude to Chris Johnson for his monumental contribution to open-source digital signal processing.
+
+---
+
+## 7. License
+
+Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.  
+See [`LICENSE`](LICENSE) for the full license text.
