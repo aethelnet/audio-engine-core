@@ -113,6 +113,31 @@ struct Pattern {
         }
     }
 
+    // Automatically fill steps chromatically with 12-TET pitch ratio
+    void fill_chromatic_slices(uint32_t num_slices, uint8_t root_note = 60, float velocity = 1.0f) noexcept {
+        clear();
+        uint32_t count = std::min<uint32_t>(num_slices, num_steps);
+        for (uint32_t i = 0; i < count; ++i) {
+            float semitones = static_cast<float>(i);
+            float pitch = std::pow(2.0f, semitones / 12.0f);
+            set_step(i, 0, velocity, pitch);
+        }
+    }
+
+    // Remap slice IDs across all steps when slices are inserted/deleted
+    void remap_slice_ids(const std::vector<int32_t>& old_to_new_map) noexcept {
+        for (auto& s : steps) {
+            if (s.active && s.slice_id < old_to_new_map.size()) {
+                int32_t new_id = old_to_new_map[s.slice_id];
+                if (new_id >= 0) {
+                    s.slice_id = static_cast<uint32_t>(new_id);
+                } else {
+                    s.active = false; // Slice was deleted
+                }
+            }
+        }
+    }
+
     void quantize_all(float target_pct = 1.0f) noexcept {
         float q = std::clamp(target_pct, 0.0f, 1.0f);
         for (uint32_t i = 0; i < num_steps; ++i) {
@@ -367,6 +392,47 @@ public:
         }
 
         return true;
+    }
+
+    // 1-Click Linear mapping: maps slices 0..N-1 directly to steps 0..N-1
+    bool map_slices_linear(size_t target_pattern = 0, float velocity = 0.9f) noexcept {
+        if (!m_clip || m_clip->slices().empty()) return false;
+        m_patterns[target_pattern % kMaxPatterns].fill_linear_slices(
+            static_cast<uint32_t>(m_clip->slices().size()), velocity);
+        return true;
+    }
+
+    // 1-Click Chromatic mapping: maps root slice across chromatic semitones
+    bool map_slices_chromatic(size_t target_pattern = 0, uint8_t root_note = 60, float velocity = 0.9f) noexcept {
+        if (!m_clip || m_clip->slices().empty()) return false;
+        m_patterns[target_pattern % kMaxPatterns].fill_chromatic_slices(
+            std::min<uint32_t>(16, static_cast<uint32_t>(m_clip->slices().size())), root_note, velocity);
+        return true;
+    }
+
+    // Bidirectional query: find which step triggers a given slice_id in a pattern
+    [[nodiscard]] int32_t get_step_for_slice(uint32_t slice_id, size_t pattern_idx = 0) const noexcept {
+        const auto& pat = m_patterns[pattern_idx % kMaxPatterns];
+        for (uint32_t i = 0; i < pat.num_steps; ++i) {
+            if (pat.steps[i].active && pat.steps[i].slice_id == slice_id) {
+                return static_cast<int32_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    // Direct slice assignment to a specific step
+    bool assign_slice_to_step(size_t step_idx, uint32_t slice_id, size_t pattern_idx = 0, float velocity = 0.9f) noexcept {
+        if (step_idx >= Pattern::kMaxSteps) return false;
+        m_patterns[pattern_idx % kMaxPatterns].set_step(step_idx, slice_id, velocity);
+        return true;
+    }
+
+    // Remap slice indices across all patterns when slices are added/removed in the editor
+    void remap_slice_indices(const std::vector<int32_t>& old_to_new_map) noexcept {
+        for (auto& pat : m_patterns) {
+            pat.remap_slice_ids(old_to_new_map);
+        }
     }
 
     void stop() noexcept {

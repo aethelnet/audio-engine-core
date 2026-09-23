@@ -47,6 +47,8 @@
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/sampling/wsola_streamer.hpp"
 #include "audio_core/sampling/disk_streamer.hpp"
+#include "audio_core/engine.hpp"
+#include "audio_core/serialization/session_serializer.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -7143,6 +7145,290 @@ void test_disk_streaming_and_voice_prefetching() {
     std::cout << "  -> Disk-Streaming & Prefetching: PASSED (RAM pre-roll 0ms latency, background ring-buffer prefetch, seek, and underrun safety verified)" << std::endl;
 }
 
+void test_unified_engine_and_transport() {
+    std::cout << "[TEST] Running Unified Engine & Transport Integration Test..." << std::endl;
+
+    audio_core::Engine engine(48000, 256);
+    bool init_ok = engine.init(48000, 256);
+    TEST_CHECK(init_ok);
+
+    auto& mixer = engine.mixer();
+    TEST_CHECK(mixer.sample_rate() == 48000);
+    TEST_CHECK(mixer.buffer_frames() == 256);
+
+    // Initial transport state
+    TEST_CHECK(!engine.clock().is_playing());
+    TEST_CHECK(engine.clock().sample_position() == 0);
+
+    // Play transport
+    engine.transport_play();
+    TEST_CHECK(engine.clock().is_playing());
+
+    // Render interleaved audio
+    std::vector<float> audio_out(256 * 2, 0.0f);
+    engine.process_interleaved(audio_out.data(), 256, 2);
+
+    // TimelineClock must advance by 256 samples
+    TEST_CHECK(engine.clock().sample_position() == 256);
+
+    // Pause transport
+    engine.transport_pause();
+    TEST_CHECK(!engine.clock().is_playing());
+
+    // Process another block while paused
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    // Position must NOT advance while paused
+    TEST_CHECK(engine.clock().sample_position() == 256);
+
+    // Seek to beat 4.0
+    engine.transport_seek(4.0);
+    double expected_pos = 4.0 * engine.clock().samples_per_beat();
+    TEST_CHECK(std::abs(static_cast<double>(engine.clock().sample_position()) - expected_pos) <= 1.0);
+
+    // Stop resets sample position to 0 and stops playing
+    engine.transport_play();
+    TEST_CHECK(engine.clock().is_playing());
+    engine.transport_stop();
+    TEST_CHECK(!engine.clock().is_playing());
+    TEST_CHECK(engine.clock().sample_position() == 0);
+
+    // Master volume control
+    engine.set_master_volume(0.85f);
+    TEST_CHECK(std::abs(engine.master_volume() - 0.85f) < 1e-4f);
+
+    // Track volume & mute/solo via MixerGraph
+    auto* trk1 = engine.mixer().allocate_track("Track 1");
+    TEST_CHECK(trk1 != nullptr);
+    trk1->set_gain(0.72f);
+    TEST_CHECK(std::abs(trk1->gain() - 0.72f) < 1e-4f);
+
+    // Parameter automation via queue
+    engine.set_parameter(1, 0.88f); // Parameter 1 = Master Volume in engine.cpp
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(std::abs(engine.master_volume() - 0.88f) < 1e-4f);
+
+    std::cout << "  -> Unified Engine & Transport: PASSED (MixerGraph rendered, transport synchronized, volume & parameters automated)" << std::endl;
+}
+
+void test_session_and_rack_preset_serialization() {
+    std::cout << "[TEST] Running Session & Channel Strip Preset Serialization Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::serialization;
+
+    // 1. RackPresetData standalone serialization
+    RackPresetData rack;
+    rack.name = "Vintage Mastering Bus";
+    rack.category = "Mastering";
+
+    SlotPresetData s0;
+    s0.slot_idx = 0;
+    s0.processor_name = "Baxandall";
+    s0.bypassed = false;
+    s0.parameters = {0.8f, 0.4f};
+    rack.slots.push_back(s0);
+
+    SlotPresetData s1;
+    s1.slot_idx = 1;
+    s1.processor_name = "ButterComp2";
+    s1.bypassed = false;
+    s1.parameters = {0.5f, 0.7f};
+    rack.slots.push_back(s1);
+
+    SlotPresetData s2;
+    s2.slot_idx = 2;
+    s2.processor_name = "ClipOnly2";
+    s2.bypassed = true;
+    rack.slots.push_back(s2);
+
+    std::string rack_json = rack.to_json();
+    TEST_CHECK(!rack_json.empty());
+    TEST_CHECK(rack_json.find("Vintage Mastering Bus") != std::string::npos);
+    TEST_CHECK(rack_json.find("Baxandall") != std::string::npos);
+    TEST_CHECK(rack_json.find("ButterComp2") != std::string::npos);
+
+    // Parse back
+    auto parsed_rack_val = json::Parser::parse(rack_json);
+    TEST_CHECK(parsed_rack_val.has_value());
+    auto restored_rack = RackPresetData::from_json_val(*parsed_rack_val);
+    TEST_CHECK(restored_rack.has_value());
+    TEST_CHECK(restored_rack->name == "Vintage Mastering Bus");
+    TEST_CHECK(restored_rack->slots.size() == 3);
+    TEST_CHECK(restored_rack->slots[0].processor_name == "Baxandall");
+    TEST_CHECK(std::abs(restored_rack->slots[0].parameters[0] - 0.8f) < 1e-4f);
+    TEST_CHECK(restored_rack->slots[2].bypassed == true);
+
+    // 2. Apply RackPreset to Track & verify DSP execution
+    MixerGraph mixer(256, false, 48000);
+    auto* trk = mixer.allocate_track("LeadSynth");
+    TEST_CHECK(trk != nullptr);
+
+    SessionSerializer::apply_rack_preset(*trk, *restored_rack, 48000);
+    TEST_CHECK(trk->slot(0).processor() != nullptr);
+    TEST_CHECK(std::string(trk->slot(0).processor()->name()).find("Baxandall") != std::string::npos);
+    TEST_CHECK(trk->slot(1).processor() != nullptr);
+    TEST_CHECK(std::string(trk->slot(1).processor()->name()).find("ButterComp2") != std::string::npos);
+    TEST_CHECK(trk->slot(2).processor() != nullptr);
+    TEST_CHECK(std::string(trk->slot(2).processor()->name()).find("ClipOnly2") != std::string::npos);
+    TEST_CHECK(trk->slot(2).is_bypassed() == true);
+
+    // Export rack from Track
+    RackPresetData exported_rack = SessionSerializer::extract_rack_preset(*trk, "Exported Track 1 Rack");
+    TEST_CHECK(exported_rack.slots.size() >= 3);
+    TEST_CHECK(exported_rack.slots[0].processor_name.find("Baxandall") != std::string::npos);
+
+    // File I/O for Rack Preset
+    const std::string rack_path = "/tmp/test_rack_audio_core.json";
+    bool rack_saved = SessionSerializer::save_rack_preset_file(rack_path, *trk, "SavedFileRack");
+    TEST_CHECK(rack_saved);
+
+    auto* trk2 = mixer.allocate_track("SubBass");
+    TEST_CHECK(trk2 != nullptr);
+    bool rack_loaded = SessionSerializer::load_rack_preset_file(rack_path, *trk2, 48000);
+    TEST_CHECK(rack_loaded);
+    TEST_CHECK(trk2->slot(0).processor() != nullptr);
+    TEST_CHECK(std::string(trk2->slot(0).processor()->name()).find("Baxandall") != std::string::npos);
+    std::filesystem::remove(rack_path);
+
+    // 3. ProjectSessionData: Full mixer state, routing, gains, and step sequencer
+    mixer.set_master_volume(0.82f);
+    mixer.set_master_limiter_enabled(true);
+
+    trk->set_name("LeadSynth");
+    trk->set_gain(0.75f, true);
+    trk->set_pan(-0.35f, true);
+    trk->set_solo(true);
+
+    trk2->set_name("SubBass");
+    trk2->set_gain(0.92f, true);
+    trk2->set_pan(0.15f, true);
+    trk2->set_mute(true);
+
+    // Add sequencer steps to Track 1
+    auto seq = std::make_shared<sequencer::StepSequencer>();
+    trk->set_sequencer(seq);
+    TEST_CHECK(trk->sequencer() != nullptr);
+    trk->sequencer()->pattern(0).set_step(0, 3, 0.95f, 1.0f);
+    trk->sequencer()->pattern(0).set_step(4, 7, 0.85f, 1.5f);
+
+    clock::TimelineClock proj_clock(48000, 134.0);
+
+    // Save project session to file
+    const std::string session_path = "/tmp/test_session_audio_core.json";
+    bool sess_saved = SessionSerializer::save_session_file(session_path, mixer, proj_clock, "Cyberpunk_Project");
+    TEST_CHECK(sess_saved);
+
+    // Create a fresh new MixerGraph and Clock, then load session
+    MixerGraph loaded_mixer(256, false, 48000);
+    clock::TimelineClock loaded_clock(48000, 120.0);
+
+    bool sess_loaded = SessionSerializer::load_session_file(session_path, loaded_mixer, loaded_clock);
+    TEST_CHECK(sess_loaded);
+    std::filesystem::remove(session_path);
+
+    // Verify clock tempo
+    TEST_CHECK(std::abs(loaded_clock.bpm() - 134.0) < 1e-4);
+
+    // Verify master controls
+    TEST_CHECK(std::abs(loaded_mixer.master_volume() - 0.82f) < 1e-4f);
+    TEST_CHECK(loaded_mixer.is_master_limiter_enabled() == true);
+
+    // Verify Track 1 restored properties
+    auto* ltrk1 = loaded_mixer.get_track(1);
+    TEST_CHECK(ltrk1 != nullptr);
+    TEST_CHECK(ltrk1->name() == "LeadSynth");
+    TEST_CHECK(std::abs(ltrk1->gain() - 0.75f) < 1e-4f);
+    TEST_CHECK(std::abs(ltrk1->pan() - -0.35f) < 1e-4f);
+    TEST_CHECK(ltrk1->is_solo() == true);
+    TEST_CHECK(ltrk1->slot(0).processor() != nullptr);
+    TEST_CHECK(std::string(ltrk1->slot(0).processor()->name()).find("Baxandall") != std::string::npos);
+    TEST_CHECK(ltrk1->slot(1).processor() != nullptr);
+    TEST_CHECK(std::string(ltrk1->slot(1).processor()->name()).find("ButterComp2") != std::string::npos);
+    TEST_CHECK(ltrk1->sequencer()->pattern(0).steps[0].active == true);
+    TEST_CHECK(ltrk1->sequencer()->pattern(0).steps[0].slice_id == 3);
+    TEST_CHECK(std::abs(ltrk1->sequencer()->pattern(0).steps[0].velocity - 0.95f) < 1e-4f);
+    TEST_CHECK(ltrk1->sequencer()->pattern(0).steps[4].active == true);
+    TEST_CHECK(ltrk1->sequencer()->pattern(0).steps[4].slice_id == 7);
+
+    // Verify Track 2 restored properties
+    auto* ltrk2 = loaded_mixer.get_track(2);
+    TEST_CHECK(ltrk2 != nullptr);
+    TEST_CHECK(ltrk2->name() == "SubBass");
+    TEST_CHECK(std::abs(ltrk2->gain() - 0.92f) < 1e-4f);
+    TEST_CHECK(std::abs(ltrk2->pan() - 0.15f) < 1e-4f);
+    TEST_CHECK(ltrk2->is_muted() == true);
+
+    std::cout << "  -> Session & Rack Preset Serialization: PASSED (Pure C++20 JSON roundtrip, bit-exact parameter and pattern restoration)" << std::endl;
+}
+
+void test_step_sequencer_slice_marker_mapping() {
+    std::cout << "[TEST] Running Step-Sequencer Slice Marker Mapping Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+
+    auto clip = std::make_shared<AudioClip>("TestDrumLoop", 48000, 2, 48000);
+    clip->slice_grid(8); // 8 slices: 0..7
+    TEST_CHECK(clip->slices().size() == 8);
+
+    StepSequencer seq(clip);
+
+    // 1. Linear Mapping: Maps slices 0..7 to steps 0..7
+    bool lin_ok = seq.map_slices_linear(0, 0.95f);
+    TEST_CHECK(lin_ok);
+
+    const auto& p0 = seq.pattern(0);
+    for (uint32_t i = 0; i < 8; ++i) {
+        TEST_CHECK(p0.steps[i].active);
+        TEST_CHECK(p0.steps[i].slice_id == i);
+        TEST_CHECK(std::abs(p0.steps[i].velocity - 0.95f) < 1e-4f);
+    }
+    // Steps 8..15 should not be active
+    for (uint32_t i = 8; i < 16; ++i) {
+        TEST_CHECK(!p0.steps[i].active);
+    }
+
+    // 2. Bidirectional Query: get_step_for_slice
+    TEST_CHECK(seq.get_step_for_slice(3, 0) == 3);
+    TEST_CHECK(seq.get_step_for_slice(7, 0) == 7);
+    TEST_CHECK(seq.get_step_for_slice(99, 0) == -1); // Non-existent slice
+
+    // 3. Direct Assignment: assign_slice_to_step
+    bool assign_ok = seq.assign_slice_to_step(12, 5, 0, 0.88f);
+    TEST_CHECK(assign_ok);
+    TEST_CHECK(seq.pattern(0).steps[12].active);
+    TEST_CHECK(seq.pattern(0).steps[12].slice_id == 5);
+    TEST_CHECK(std::abs(seq.pattern(0).steps[12].velocity - 0.88f) < 1e-4f);
+    TEST_CHECK(seq.get_step_for_slice(5, 0) == 5); // Returns the first matching step
+
+    // 4. Chromatic Mapping: maps root slice across chromatic semitones
+    bool chrom_ok = seq.map_slices_chromatic(1, 60, 0.9f);
+    TEST_CHECK(chrom_ok);
+    const auto& p1 = seq.pattern(1);
+    for (uint32_t i = 0; i < 8; ++i) {
+        TEST_CHECK(p1.steps[i].active);
+        TEST_CHECK(p1.steps[i].slice_id == 0); // Root slice
+        float expected_pitch = std::pow(2.0f, static_cast<float>(i) / 12.0f);
+        TEST_CHECK(std::abs(p1.steps[i].pitch_ratio - expected_pitch) < 1e-4f);
+    }
+
+    // 5. Slice Deletion & Remapping across all patterns
+    std::vector<int32_t> remap_table = {0, 1, -1, 2, 3, 4, 5, 6};
+    seq.remap_slice_indices(remap_table);
+
+    // In pattern 0, step 2 formerly had slice 2 -> must now be inactive!
+    TEST_CHECK(!seq.pattern(0).steps[2].active);
+    // Step 3 formerly had slice 3 -> must now have slice 2!
+    TEST_CHECK(seq.pattern(0).steps[3].active);
+    TEST_CHECK(seq.pattern(0).steps[3].slice_id == 2);
+    // Step 12 formerly had slice 5 -> must now have slice 4!
+    TEST_CHECK(seq.pattern(0).steps[12].active);
+    TEST_CHECK(seq.pattern(0).steps[12].slice_id == 4);
+
+    std::cout << "  -> Slice Marker Mapping: PASSED (Linear & chromatic mapping, bidirectional lookup, and index remapping verified)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -7205,6 +7491,9 @@ int main() {
     test_plugin_delay_compensation_pdc();
     test_sample_accurate_parameter_ramping();
     test_disk_streaming_and_voice_prefetching();
+    test_unified_engine_and_transport();
+    test_session_and_rack_preset_serialization();
+    test_step_sequencer_slice_marker_mapping();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

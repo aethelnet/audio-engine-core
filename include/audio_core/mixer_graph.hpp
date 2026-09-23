@@ -1112,6 +1112,25 @@ public:
         return nullptr;
     }
 
+    [[nodiscard]] const Track* get_track(uint32_t id) const noexcept {
+        if (id >= 1 && id <= kMaxTracks) {
+            auto* t = m_tracks[id - 1].get();
+            return t->is_active() ? t : nullptr;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] Track* track_by_index(size_t idx) noexcept {
+        return (idx < kMaxTracks) ? m_tracks[idx].get() : nullptr;
+    }
+
+    [[nodiscard]] const Track* track_by_index(size_t idx) const noexcept {
+        return (idx < kMaxTracks) ? m_tracks[idx].get() : nullptr;
+    }
+
+    [[nodiscard]] float master_volume() const noexcept { return m_master_bus.gain(); }
+    void set_master_volume(float vol) noexcept { m_master_bus.set_gain(vol); }
+
     [[nodiscard]] AudioBus* get_bus(uint32_t id) noexcept {
         if (id >= 1 && id <= kMaxBuses) {
             auto* b = m_buses[id - 1].get();
