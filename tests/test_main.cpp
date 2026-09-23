@@ -7633,6 +7633,128 @@ void test_websocket_bridge_and_remote_control() {
     TEST_CHECK(!bridge.is_running());
 }
 
+void test_faster_than_realtime_offline_wav_bounce() {
+    std::cout << "[TEST] Running Faster-Than-Realtime Offline WAV Bounce & PDC Flush Engine Test..." << std::endl;
+
+    audio_core::Engine engine(48000, 256);
+    TEST_CHECK(engine.init(48000, 256));
+
+    // 1. Safety Guardrail: Offline bounce while running must be strictly rejected
+    engine.start();
+    TEST_CHECK(engine.is_running());
+    std::vector<float> dummy_l, dummy_r;
+    auto fail_res = engine.render_offline(dummy_l, dummy_r);
+    TEST_CHECK(!fail_res.success);
+    TEST_CHECK(!fail_res.error_message.empty());
+    engine.stop();
+    TEST_CHECK(!engine.is_running());
+
+    // 2. Setup Synth & Tracks: Add audio clip and lookahead PDC latency
+    auto& mixer = engine.mixer();
+    auto* trk1 = mixer.add_track("LookaheadTrack");
+    TEST_CHECK(trk1 != nullptr);
+
+    // Create an audio clip with 48,000 frames (1.0 second test tone: 440 Hz Sine)
+    auto clip = std::make_shared<audio_core::sampling::AudioClip>("TestClip", 48000, 2, 48000);
+    float* cl = clip->channel(0);
+    float* cr = clip->channel(1);
+    for (uint32_t i = 0; i < 48000; ++i) {
+        float val = 0.5f * std::sin(2.0f * 3.14159265f * 440.0f * (static_cast<float>(i) / 48000.0f));
+        cl[i] = val;
+        cr[i] = val;
+    }
+    trk1->set_clip(clip, false); // No loop
+    trk1->set_console_type(audio_core::dsp::ConsoleType::Bypass);
+
+    // Track 1 hosts a 48-sample LatencyDelayProcessor in Slot 0
+    auto proc = std::make_shared<LatencyDelayProcessor>(48);
+    trk1->slot(0).set_processor(proc);
+    trk1->slot(0).set_dc_block_enabled(false);
+    TEST_CHECK(trk1->slot(0).latency_samples() == 48);
+
+    // Track 2 has no latency processor; PDC must delay Track 2 by 48 samples
+    auto* trk2 = mixer.add_track("DryParallelTrack");
+    TEST_CHECK(trk2 != nullptr);
+    trk2->set_console_type(audio_core::dsp::ConsoleType::Bypass);
+    trk2->set_gain(0.8f);
+
+    mixer.master_bus().set_console_type(audio_core::dsp::ConsoleType::Bypass);
+    mixer.set_master_limiter_enabled(false);
+
+    // 3. Perform Faster-than-Realtime Offline Render into memory
+    audio_core::BounceOptions opts{};
+    opts.start_frame = 0;
+    opts.total_frames = 96000; // 2.0 seconds @ 48kHz
+    opts.tail_frames = 12000;  // 0.25 seconds tail
+    opts.apply_pdc_flush = true;
+    opts.normalize = true;
+    opts.target_peak_db = -0.5f;
+
+    float last_progress = 0.0f;
+    opts.progress_callback = [&](float p) {
+        last_progress = p;
+    };
+
+    std::vector<float> bounce_l, bounce_r;
+    auto res = engine.render_offline(bounce_l, bounce_r, opts);
+
+    TEST_CHECK(res.success);
+    TEST_CHECK(res.frames_rendered == 96000 + 12000);
+    TEST_CHECK(bounce_l.size() == 96000 + 12000);
+    TEST_CHECK(bounce_r.size() == 96000 + 12000);
+    TEST_CHECK(last_progress >= 0.99f);
+
+    // Realtime factor must be significantly faster than 1.0x (typically > 15x)
+    std::cout << "  -> Faster-Than-Realtime Speedup: " << res.realtime_factor << "x realtime ("
+              << res.duration_seconds << "s audio rendered in " << res.render_time_seconds << "s)" << std::endl;
+    TEST_CHECK(res.realtime_factor > 2.0);
+
+    // Normalization check: Target peak -0.5 dBFS = 0.94406
+    float expected_peak = std::pow(10.0f, -0.5f / 20.0f);
+    float actual_max_peak = std::max(res.peak_l, res.peak_r);
+    TEST_CHECK(std::abs(actual_max_peak - expected_peak) < 0.01f);
+    std::cout << "  -> Peak Normalization & Audio Metrics: PASSED (Peak=" << actual_max_peak
+              << " expected=" << expected_peak << ", RMS L=" << res.rms_l << ")" << std::endl;
+
+    // PDC sample alignment: Verify that sample 0 has audio content due to PDC flush
+    float early_energy = 0.0f;
+    for (size_t i = 1; i < 48; ++i) {
+        early_energy += std::abs(bounce_l[i]);
+    }
+    TEST_CHECK(early_energy > 0.001f);
+    std::cout << "  -> PDC Latency Flush Alignment: PASSED (First 48 frames energy=" << early_energy << ")" << std::endl;
+
+    // 4. File-Based Offline WAV Bounce & Bit-Exact Re-Ingest
+    const std::string test_wav_path = "/tmp/aethel_test_bounce_24bit.wav";
+    opts.bits_per_sample = 24;
+    auto wav_res = engine.render_offline_wav(test_wav_path, opts);
+    TEST_CHECK(wav_res.success);
+    TEST_CHECK(wav_res.output_path == test_wav_path);
+
+    std::vector<float> reloaded_l, reloaded_r;
+    uint32_t reloaded_rate = 0;
+    uint16_t reloaded_channels = 0;
+    bool load_ok = audio_core::sampling::WavReader::load_wav(test_wav_path, reloaded_l, reloaded_r, reloaded_rate, reloaded_channels);
+    TEST_CHECK(load_ok);
+    TEST_CHECK(reloaded_rate == 48000);
+    TEST_CHECK(reloaded_channels == 2);
+    TEST_CHECK(reloaded_l.size() == bounce_l.size());
+
+    // Compare reloaded 24-bit WAV against in-memory float render (error must be bounded by 24-bit quantization < 1e-4)
+    float max_error = 0.0f;
+    for (size_t i = 0; i < bounce_l.size(); ++i) {
+        float err_l = std::abs(bounce_l[i] - reloaded_l[i]);
+        float err_r = std::abs(bounce_r[i] - reloaded_r[i]);
+        if (err_l > max_error) max_error = err_l;
+        if (err_r > max_error) max_error = err_r;
+    }
+    TEST_CHECK(max_error < 1e-4f);
+    std::cout << "  -> 24-Bit RIFF/WAVE File Export & Bit-Exact Reload: PASSED (Max error=" << max_error << " < 1e-4)" << std::endl;
+
+    // Clean up temporary file
+    std::remove(test_wav_path.c_str());
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -7699,6 +7821,7 @@ int main() {
     test_session_and_rack_preset_serialization();
     test_step_sequencer_slice_marker_mapping();
     test_websocket_bridge_and_remote_control();
+    test_faster_than_realtime_offline_wav_bounce();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

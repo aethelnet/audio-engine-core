@@ -13,8 +13,36 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
+#include <functional>
 
 namespace audio_core {
+
+struct BounceOptions {
+    uint64_t start_frame{0};              // Timeline start position in frames
+    uint64_t total_frames{0};             // Render length in frames (if 0, auto-detects from active tracks/timeline)
+    uint32_t tail_frames{0};              // Decay tail frames after total_frames (reverbs, delays, release envelopes)
+    uint16_t bits_per_sample{24};         // 16, 24 (PCM), or 32 (Float)
+    bool apply_pdc_flush{true};           // Pre-roll & flush PDC latency so audio starts sample-aligned with timeline
+    bool normalize{false};                // Peak normalize output
+    float target_peak_db{-0.1f};          // Target peak dB if normalized (-0.1 dBFS by default)
+    std::function<void(float progress)> progress_callback{nullptr}; // Progress callback 0.0f -> 1.0f
+};
+
+struct BounceResult {
+    bool success{false};
+    uint64_t frames_rendered{0};
+    uint32_t sample_rate{0};
+    float peak_l{0.0f};
+    float peak_r{0.0f};
+    float rms_l{0.0f};
+    float rms_r{0.0f};
+    double duration_seconds{0.0};
+    double render_time_seconds{0.0};
+    double realtime_factor{0.0};          // Speedup factor vs realtime (e.g. 45.2x)
+    std::string output_path;
+    std::string error_message;
+};
 
 class Engine {
 public:
@@ -69,6 +97,14 @@ public:
 
     // Called strictly from the Real-Time Audio Callback Thread
     void process_interleaved(Sample* output, uint32_t num_frames, uint32_t channels) noexcept;
+
+    // Faster-Than-Realtime Offline Bounce Engine (Zero hardware dependency)
+    BounceResult render_offline(std::vector<float>& out_left,
+                               std::vector<float>& out_right,
+                               const BounceOptions& options = {});
+
+    BounceResult render_offline_wav(const std::string& filepath,
+                                   const BounceOptions& options = {});
 
     // Real-Time Stats (thread-safe reads)
     [[nodiscard]] float cpu_load_percent() const noexcept {

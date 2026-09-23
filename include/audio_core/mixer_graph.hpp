@@ -250,6 +250,10 @@ public:
         return m_clip != nullptr;
     }
 
+    [[nodiscard]] std::shared_ptr<sampling::AudioClip> clip() const noexcept {
+        return m_clip;
+    }
+
     [[nodiscard]] uint64_t clip_playhead() const noexcept {
         return static_cast<uint64_t>(std::round(m_streamer.playhead()));
     }
@@ -261,6 +265,21 @@ public:
     void set_clip_playhead(double playhead) noexcept {
         m_clip_playhead.store(playhead, std::memory_order_relaxed);
         m_streamer.set_playhead(playhead);
+    }
+
+    void reset_playback_state(double playhead = 0.0) noexcept {
+        m_clip_playhead.store(playhead, std::memory_order_relaxed);
+        m_streamer.set_playhead(playhead);
+        m_buffer.clear();
+        reset_meters();
+        m_pdc_buffer.clear();
+        m_pdc_write_pos = 0;
+        for (auto& s : m_slots) {
+            s.reset();
+        }
+        if (m_sequencer) {
+            m_sequencer->stop();
+        }
     }
 
     void set_sync_to_transport(bool sync) noexcept {
@@ -632,6 +651,14 @@ public:
     [[nodiscard]] InsertSlot& slot(size_t index) noexcept { return m_slots[index]; }
     [[nodiscard]] const InsertSlot& slot(size_t index) const noexcept { return m_slots[index]; }
 
+    [[nodiscard]] uint32_t latency_samples() const noexcept {
+        uint32_t lat = 0;
+        for (const auto& slot : m_slots) {
+            lat += slot.latency_samples();
+        }
+        return lat;
+    }
+
     [[nodiscard]] AudioBuffer& buffer() noexcept { return m_buffer; }
     [[nodiscard]] const AudioBuffer& buffer() const noexcept { return m_buffer; }
 
@@ -653,6 +680,14 @@ public:
 
     void clear() noexcept {
         m_buffer.clear();
+    }
+
+    void reset_playback_state() noexcept {
+        clear();
+        reset_meters();
+        for (auto& s : m_slots) {
+            s.reset();
+        }
     }
 
     void process_buss_strip(uint32_t frames, const routing::UniversalRoutingMatrix* matrix = nullptr) noexcept {
@@ -1024,6 +1059,46 @@ public:
                 (static_cast<size_t>(tgt) < max_bus_lat.size() ? max_bus_lat[tgt] : 0);
             track->set_pdc_delay_samples(target_max >= lat ? (target_max - lat) : 0);
         }
+    }
+
+    [[nodiscard]] uint32_t total_latency_samples() noexcept {
+        update_pdc_delay_compensation();
+        uint32_t max_track_lat = 0;
+        for (const auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            uint32_t t_lat = track->latency_samples() + track->pdc_delay_samples();
+            if (t_lat > max_track_lat) max_track_lat = t_lat;
+        }
+        return max_track_lat + m_master_bus.latency_samples();
+    }
+
+    [[nodiscard]] uint64_t auto_detect_project_frames() const noexcept {
+        uint64_t max_frames = 0;
+        for (const auto& track : m_tracks) {
+            if (!track->is_active()) continue;
+            if (track->has_clip() && track->clip()) {
+                max_frames = std::max(max_frames, static_cast<uint64_t>(track->clip()->num_frames()));
+            }
+            if (track->is_sequencer_enabled() && track->sequencer()) {
+                uint64_t pat_frames = static_cast<uint64_t>(m_clock.samples_per_bar() * 1);
+                max_frames = std::max(max_frames, pat_frames);
+            }
+        }
+        return max_frames;
+    }
+
+    void reset_playback_state(double playhead = 0.0) noexcept {
+        for (auto& track : m_tracks) {
+            if (track) {
+                track->reset_playback_state(playhead);
+            }
+        }
+        for (auto& bus : m_buses) {
+            if (bus) {
+                bus->reset_playback_state();
+            }
+        }
+        m_master_bus.reset_playback_state();
     }
 
     bool set_bus_target_bus(uint32_t bus_id, int32_t target_bus_id) noexcept {
