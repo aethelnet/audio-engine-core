@@ -216,6 +216,7 @@ public:
             case routing::AutomationTarget::Pan:  return m_pan_curve;
             case routing::AutomationTarget::Aux1: return m_aux1_curve;
             case routing::AutomationTarget::Aux2: return m_aux2_curve;
+            case routing::AutomationTarget::Pitch: break;
         }
         return m_gain_curve;
     }
@@ -226,6 +227,7 @@ public:
             case routing::AutomationTarget::Pan:  return m_pan_curve;
             case routing::AutomationTarget::Aux1: return m_aux1_curve;
             case routing::AutomationTarget::Aux2: return m_aux2_curve;
+            case routing::AutomationTarget::Pitch: break;
         }
         return m_gain_curve;
     }
@@ -244,6 +246,7 @@ public:
                 if (enabled) ensure_send_active(2);
                 break;
             }
+            case routing::AutomationTarget::Pitch: break;
         }
     }
 
@@ -253,6 +256,7 @@ public:
             case routing::AutomationTarget::Pan:  return m_pan_automation_enabled.load(std::memory_order_relaxed);
             case routing::AutomationTarget::Aux1: return m_aux1_automation_enabled.load(std::memory_order_relaxed);
             case routing::AutomationTarget::Aux2: return m_aux2_automation_enabled.load(std::memory_order_relaxed);
+            case routing::AutomationTarget::Pitch: return false;
         }
         return false;
     }

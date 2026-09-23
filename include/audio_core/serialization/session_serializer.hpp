@@ -367,6 +367,16 @@ struct TrackAutomationData {
     std::vector<AutomationPointData> aux2_points{};
 };
 
+struct ClipEnvelopeData {
+    bool gain_enabled{false};
+    std::vector<AutomationPointData> gain_points{};
+    bool pan_enabled{false};
+    std::vector<AutomationPointData> pan_points{};
+    bool pitch_enabled{false};
+    std::vector<AutomationPointData> pitch_points{};
+    double length_beats{0.0};
+};
+
 struct TrackPresetData {
     uint32_t id{0};
     std::string name{"Track"};
@@ -383,6 +393,7 @@ struct TrackPresetData {
     bool input_phase_invert{false};
     RackPresetData rack{};
     TrackAutomationData automation{};
+    ClipEnvelopeData clip_envelopes{};
     std::vector<StepTriggerData> sequencer_steps{};
 };
 
@@ -455,6 +466,33 @@ struct ProjectSessionData {
                    << (p + 1 < trk.automation.aux2_points.size() ? "," : "");
             }
             ss << "]\n";
+            ss << "      },\n";
+            ss << "      \"clip_envelopes\": {\n";
+            ss << "        \"gain_enabled\": " << (trk.clip_envelopes.gain_enabled ? "true" : "false") << ",\n";
+            ss << "        \"gain_points\": [";
+            for (size_t p = 0; p < trk.clip_envelopes.gain_points.size(); ++p) {
+                const auto& pt = trk.clip_envelopes.gain_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.clip_envelopes.gain_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"pan_enabled\": " << (trk.clip_envelopes.pan_enabled ? "true" : "false") << ",\n";
+            ss << "        \"pan_points\": [";
+            for (size_t p = 0; p < trk.clip_envelopes.pan_points.size(); ++p) {
+                const auto& pt = trk.clip_envelopes.pan_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.clip_envelopes.pan_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"pitch_enabled\": " << (trk.clip_envelopes.pitch_enabled ? "true" : "false") << ",\n";
+            ss << "        \"pitch_points\": [";
+            for (size_t p = 0; p < trk.clip_envelopes.pitch_points.size(); ++p) {
+                const auto& pt = trk.clip_envelopes.pitch_points[p];
+                ss << "{\"t\":" << pt.t << ",\"v\":" << pt.v << ",\"m\":" << static_cast<int>(pt.m) << ",\"tau\":" << pt.tau << "}"
+                   << (p + 1 < trk.clip_envelopes.pitch_points.size() ? "," : "");
+            }
+            ss << "],\n";
+            ss << "        \"length_beats\": " << trk.clip_envelopes.length_beats << "\n";
             ss << "      },\n";
             ss << "      \"sequencer\": [\n";
             for (size_t s = 0; s < trk.sequencer_steps.size(); ++s) {
@@ -545,6 +583,32 @@ struct ProjectSessionData {
                             parse_lane(auto_obj, "pan_enabled", "pan_points", tdata.automation.pan_enabled, tdata.automation.pan_points);
                             parse_lane(auto_obj, "aux1_enabled", "aux1_points", tdata.automation.aux1_enabled, tdata.automation.aux1_points);
                             parse_lane(auto_obj, "aux2_enabled", "aux2_points", tdata.automation.aux2_enabled, tdata.automation.aux2_points);
+                        }
+                    }
+
+                    if (auto* cenv_obj = tv.get("clip_envelopes")) {
+                        if (cenv_obj->is_object()) {
+                            auto parse_lane = [](const json::Value* parent, const char* en_key, const char* pts_key,
+                                                 bool& out_en, std::vector<AutomationPointData>& out_pts) {
+                                if (auto* e = parent->get(en_key)) out_en = e->as_bool(false);
+                                if (auto* pa = parent->get(pts_key)) {
+                                    if (pa->is_array()) {
+                                        for (const auto& pv : pa->arr_val) {
+                                            if (!pv.is_object()) continue;
+                                            AutomationPointData ptd;
+                                            if (auto* t = pv.get("t")) ptd.t = t->as_double(0.0);
+                                            if (auto* v = pv.get("v")) ptd.v = v->as_float(1.0f);
+                                            if (auto* m = pv.get("m")) ptd.m = static_cast<uint8_t>(m->as_uint(0));
+                                            if (auto* tau = pv.get("tau")) ptd.tau = tau->as_float(0.0f);
+                                            out_pts.push_back(ptd);
+                                        }
+                                    }
+                                }
+                            };
+                            parse_lane(cenv_obj, "gain_enabled", "gain_points", tdata.clip_envelopes.gain_enabled, tdata.clip_envelopes.gain_points);
+                            parse_lane(cenv_obj, "pan_enabled", "pan_points", tdata.clip_envelopes.pan_enabled, tdata.clip_envelopes.pan_points);
+                            parse_lane(cenv_obj, "pitch_enabled", "pitch_points", tdata.clip_envelopes.pitch_enabled, tdata.clip_envelopes.pitch_points);
+                            if (auto* lb = cenv_obj->get("length_beats")) tdata.clip_envelopes.length_beats = lb->as_double(4.0);
                         }
                     }
 
@@ -674,6 +738,21 @@ public:
             tdata.automation.aux2_enabled = trk->is_automation_enabled(routing::AutomationTarget::Aux2);
             extract_pts(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points);
 
+            // Extract clip envelopes if track has an audio clip
+            if (trk->clip()) {
+                const auto& clp = trk->clip();
+                tdata.clip_envelopes.gain_enabled = clp->is_envelope_enabled(sampling::ClipEnvelopeTarget::Gain);
+                extract_pts(clp->envelope(sampling::ClipEnvelopeTarget::Gain), tdata.clip_envelopes.gain_points);
+
+                tdata.clip_envelopes.pan_enabled = clp->is_envelope_enabled(sampling::ClipEnvelopeTarget::Pan);
+                extract_pts(clp->envelope(sampling::ClipEnvelopeTarget::Pan), tdata.clip_envelopes.pan_points);
+
+                tdata.clip_envelopes.pitch_enabled = clp->is_envelope_enabled(sampling::ClipEnvelopeTarget::Pitch);
+                extract_pts(clp->envelope(sampling::ClipEnvelopeTarget::Pitch), tdata.clip_envelopes.pitch_points);
+
+                tdata.clip_envelopes.length_beats = clp->envelope_length_beats();
+            }
+
             // Extract sequencer pattern steps
             const auto* seq = trk->sequencer();
             if (seq) {
@@ -759,6 +838,34 @@ public:
 
             restore_lane(trk->automation_curve(routing::AutomationTarget::Aux2), tdata.automation.aux2_points, 0.0f);
             trk->set_automation_enabled(routing::AutomationTarget::Aux2, tdata.automation.aux2_enabled);
+
+            // Restore clip envelopes if track has an audio clip (or instantiate clip if envelope data exists)
+            if (!trk->clip() && (tdata.clip_envelopes.gain_enabled ||
+                                 tdata.clip_envelopes.pan_enabled ||
+                                 tdata.clip_envelopes.pitch_enabled ||
+                                 !tdata.clip_envelopes.gain_points.empty() ||
+                                 !tdata.clip_envelopes.pan_points.empty() ||
+                                 !tdata.clip_envelopes.pitch_points.empty())) {
+                const uint32_t def_frames = mixer.sample_rate() * 2;
+                auto new_clp = std::make_shared<sampling::AudioClip>("RestoredClip", mixer.sample_rate(), 2, def_frames);
+                trk->set_clip(new_clp, true);
+            }
+
+            if (trk->clip()) {
+                auto clp = trk->clip();
+                restore_lane(clp->envelope(sampling::ClipEnvelopeTarget::Gain), tdata.clip_envelopes.gain_points, 1.0f);
+                clp->set_envelope_enabled(sampling::ClipEnvelopeTarget::Gain, tdata.clip_envelopes.gain_enabled);
+
+                restore_lane(clp->envelope(sampling::ClipEnvelopeTarget::Pan), tdata.clip_envelopes.pan_points, 0.0f);
+                clp->set_envelope_enabled(sampling::ClipEnvelopeTarget::Pan, tdata.clip_envelopes.pan_enabled);
+
+                restore_lane(clp->envelope(sampling::ClipEnvelopeTarget::Pitch), tdata.clip_envelopes.pitch_points, 0.0f);
+                clp->set_envelope_enabled(sampling::ClipEnvelopeTarget::Pitch, tdata.clip_envelopes.pitch_enabled);
+
+                if (tdata.clip_envelopes.length_beats > 0.0) {
+                    clp->set_envelope_length_beats(tdata.clip_envelopes.length_beats);
+                }
+            }
 
             // Restore sequencer pattern
             auto* seq = trk->sequencer();

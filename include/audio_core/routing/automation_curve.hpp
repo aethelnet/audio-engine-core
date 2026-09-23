@@ -23,12 +23,13 @@ enum class NodeMode : uint8_t {
     Hold   = 2   // Immediate discrete jump at next node
 };
 
-// Target Parameter Lane in Channel Strip
+// Target Parameter Lane in Channel Strip or Clip Envelope
 enum class AutomationTarget : uint8_t {
-    Gain = 0,  // Track Volume / Gain Multiplier [0.0, 1.25]
-    Pan  = 1,  // Track Stereo Panning [-1.0, +1.0]
-    Aux1 = 2,  // Auxiliary Send 1 (e.g. Reverb) [0.0, 1.0]
-    Aux2 = 3   // Auxiliary Send 2 (e.g. Delay) [0.0, 1.0]
+    Gain  = 0,  // Track Volume / Gain Multiplier [0.0, 1.25]
+    Pan   = 1,  // Track Stereo Panning [-1.0, +1.0]
+    Aux1  = 2,  // Auxiliary Send 1 (e.g. Reverb) [0.0, 1.0]
+    Aux2  = 3,  // Auxiliary Send 2 (e.g. Delay) [0.0, 1.0]
+    Pitch = 4   // Pitch Transposition in semitones [-24.0, +24.0]
 };
 
 // ============================================================================
@@ -223,6 +224,40 @@ public:
             AutomationPoint{16.0, 1.0f, NodeMode::Smooth, 0.0f}
         };
         m_snapshot.store(std::make_shared<AutomationSnapshot>(std::move(initial_pts)), std::memory_order_release);
+    }
+
+    AutomationCurve(const AutomationCurve& other) {
+        auto snap = other.snapshot();
+        m_snapshot.store(snap ? std::make_shared<AutomationSnapshot>(snap->points())
+                              : std::make_shared<AutomationSnapshot>(),
+                         std::memory_order_release);
+    }
+
+    AutomationCurve& operator=(const AutomationCurve& other) {
+        if (this != &other) {
+            auto snap = other.snapshot();
+            m_snapshot.store(snap ? std::make_shared<AutomationSnapshot>(snap->points())
+                                  : std::make_shared<AutomationSnapshot>(),
+                             std::memory_order_release);
+        }
+        return *this;
+    }
+
+    AutomationCurve(AutomationCurve&& other) noexcept {
+        auto snap = other.snapshot();
+        m_snapshot.store(snap ? std::make_shared<AutomationSnapshot>(snap->points())
+                              : std::make_shared<AutomationSnapshot>(),
+                         std::memory_order_release);
+    }
+
+    AutomationCurve& operator=(AutomationCurve&& other) noexcept {
+        if (this != &other) {
+            auto snap = other.snapshot();
+            m_snapshot.store(snap ? std::make_shared<AutomationSnapshot>(snap->points())
+                                  : std::make_shared<AutomationSnapshot>(),
+                             std::memory_order_release);
+        }
+        return *this;
     }
 
     // Audio-Thread API: Lock-Free, Zero Allocations, Zero Mutex
@@ -528,6 +563,65 @@ public:
             }
         }
         pts.push_back(AutomationPoint{static_cast<double>(num_bars * 4), 0.0f, NodeMode::Smooth, 0.0f});
+        set_points(std::move(pts));
+    }
+
+    // Clip-Relative Loop Presets
+    void preset_clip_sidechain_pump(double total_beats = 4.0, double cycle_beats = 1.0, float depth = 0.0f) {
+        std::vector<AutomationPoint> pts;
+        int num_cycles = static_cast<int>(std::max(1.0, std::round(total_beats / cycle_beats)));
+        for (int c = 0; c < num_cycles; ++c) {
+            double t = c * cycle_beats;
+            pts.push_back(AutomationPoint{t, depth, NodeMode::Smooth, -0.6f});
+            pts.push_back(AutomationPoint{t + cycle_beats * 0.65, 1.0f, NodeMode::Smooth, 0.0f});
+        }
+        pts.push_back(AutomationPoint{total_beats, depth, NodeMode::Smooth, 0.0f});
+        set_points(std::move(pts));
+    }
+
+    void preset_clip_gate_trance(double total_beats = 4.0, uint32_t divisions_per_beat = 4) {
+        std::vector<AutomationPoint> pts;
+        double step_size = 1.0 / static_cast<double>(divisions_per_beat);
+        int total_steps = static_cast<int>(total_beats * divisions_per_beat);
+        for (int s = 0; s < total_steps; ++s) {
+            double t = s * step_size;
+            float val = ((s % 2) == 0) ? 1.0f : 0.0f;
+            pts.push_back(AutomationPoint{t, val, NodeMode::Hold, 0.0f});
+        }
+        pts.push_back(AutomationPoint{total_beats, 0.0f, NodeMode::Hold, 0.0f});
+        set_points(std::move(pts));
+    }
+
+    void preset_clip_fade_in_out(double total_beats, double fade_in_beats = 0.5, double fade_out_beats = 0.5) {
+        std::vector<AutomationPoint> pts = {
+            AutomationPoint{0.0, 0.0f, NodeMode::Smooth, -0.3f},
+            AutomationPoint{std::min(total_beats * 0.5, fade_in_beats), 1.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{std::max(fade_in_beats, total_beats - fade_out_beats), 1.0f, NodeMode::Smooth, 0.3f},
+            AutomationPoint{total_beats, 0.0f, NodeMode::Smooth, 0.0f}
+        };
+        set_points(std::move(pts));
+    }
+
+    void preset_clip_ping_pong_pan(double total_beats = 4.0, double cycle_beats = 1.0) {
+        std::vector<AutomationPoint> pts;
+        int num_cycles = static_cast<int>(std::max(1.0, std::round(total_beats / cycle_beats)));
+        for (int c = 0; c < num_cycles; ++c) {
+            double t = c * cycle_beats;
+            pts.push_back(AutomationPoint{t, 0.0f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{t + cycle_beats * 0.25, -0.80f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{t + cycle_beats * 0.50,  0.0f, NodeMode::Smooth, 0.0f});
+            pts.push_back(AutomationPoint{t + cycle_beats * 0.75,  0.80f, NodeMode::Smooth, 0.0f});
+        }
+        pts.push_back(AutomationPoint{total_beats, 0.0f, NodeMode::Smooth, 0.0f});
+        set_points(std::move(pts));
+    }
+
+    void preset_clip_pitch_drop(double total_beats = 4.0, double drop_start_beat = 3.0, float drop_semitones = -12.0f) {
+        std::vector<AutomationPoint> pts = {
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{std::min(total_beats - 0.1, drop_start_beat), 0.0f, NodeMode::Smooth, 0.3f},
+            AutomationPoint{total_beats, drop_semitones, NodeMode::Smooth, 0.0f}
+        };
         set_points(std::move(pts));
     }
 

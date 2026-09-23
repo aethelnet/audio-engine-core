@@ -252,11 +252,18 @@ public:
 
         // 1b. Real-Time WSOLA Time-Stretch & Decoupled Pitch Branch
         if (mode == PlaybackMode::BeatSyncTimeStretch || mode == PlaybackMode::PitchShiftWsola) {
+            double start_ph = m_wsola.playhead();
+            float base_pitch = m_pitch_semitones.load(std::memory_order_relaxed);
+            if (m_clip && m_clip->is_envelope_enabled(ClipEnvelopeTarget::Pitch)) {
+                double b = m_clip->frame_to_envelope_beat(start_ph, l_start, l_end, user_bars);
+                float env_st = m_clip->envelope(ClipEnvelopeTarget::Pitch).evaluate_audio_sample(b);
+                base_pitch += env_st;
+            }
             m_wsola.set_clip(m_clip);
             m_wsola.set_loop(loop);
             m_wsola.set_loop_range(l_start, l_end);
             m_wsola.set_bar_length(user_bars);
-            m_wsola.set_pitch_semitones(m_pitch_semitones.load(std::memory_order_relaxed));
+            m_wsola.set_pitch_semitones(base_pitch);
             if (mode == PlaybackMode::BeatSyncTimeStretch) {
                 m_wsola.set_beat_sync(true);
                 m_wsola.set_stretch_factor(m_speed_ratio.load(std::memory_order_relaxed));
@@ -265,8 +272,14 @@ public:
                 m_wsola.set_stretch_factor(m_speed_ratio.load(std::memory_order_relaxed));
             }
             m_wsola.render(dst_l, dst_r, frames, session_sr, session_bpm, is_playing);
-            m_playhead.store(m_wsola.playhead(), std::memory_order_relaxed);
+            double end_ph = m_wsola.playhead();
+            m_playhead.store(end_ph, std::memory_order_relaxed);
             m_effective_ratio = m_wsola.effective_stretch_ratio();
+
+            // Apply active Clip-Relative Gain & Pan Envelopes
+            if (m_clip && m_clip->has_active_envelopes()) {
+                m_clip->apply_envelopes(dst_l, dst_r, frames, start_ph, end_ph, l_start, l_end, user_bars);
+            }
             return;
         }
 
@@ -325,6 +338,7 @@ public:
         }
 
         double ph = m_playhead.load(std::memory_order_relaxed);
+        double start_ph = ph;
         const double d_start = static_cast<double>(l_start);
         const double d_end = static_cast<double>(l_end);
         const double d_len = static_cast<double>(loop_len);
@@ -359,7 +373,16 @@ public:
                 motor_factor = 0.0f;
             }
 
-            const float sample_target_step = static_cast<float>(nominal_step * motor_factor);
+            float pitch_env_mult = 1.0f;
+            if (m_clip && m_clip->is_envelope_enabled(ClipEnvelopeTarget::Pitch)) {
+                double b = m_clip->frame_to_envelope_beat(ph, l_start, l_end, user_bars);
+                float env_st = m_clip->envelope(ClipEnvelopeTarget::Pitch).evaluate_audio_sample(b);
+                if (std::abs(env_st) > 1e-4f) {
+                    pitch_env_mult = std::pow(2.0f, env_st / 12.0f);
+                }
+            }
+
+            const float sample_target_step = static_cast<float>(nominal_step * motor_factor * pitch_env_mult);
             float active_step = sample_target_step;
             if (inertia_ms > 0.001f) {
                 m_smoother.set_target(sample_target_step);
@@ -397,6 +420,11 @@ public:
 
         m_playhead.store(ph, std::memory_order_relaxed);
         m_effective_ratio = last_active_step;
+
+        // Apply active Clip-Relative Gain & Pan Envelopes
+        if (m_clip && m_clip->has_active_envelopes()) {
+            m_clip->apply_envelopes(dst_l, dst_r, frames, start_ph, ph, l_start, l_end, user_bars);
+        }
     }
 
 private:

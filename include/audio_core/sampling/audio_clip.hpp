@@ -3,6 +3,7 @@
 #include "audio_core/dsp/resampler.hpp"
 #include "audio_core/sampling/wav_reader.hpp"
 #include "audio_core/sampling/waveform_overview.hpp"
+#include "audio_core/routing/automation_curve.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -12,6 +13,12 @@
 #include <span>
 
 namespace audio_core::sampling {
+
+enum class ClipEnvelopeTarget : uint8_t {
+    Gain  = 0,  // Clip Volume Multiplier [0.0, 2.0] (1.0 = Unity / 0 dB)
+    Pan   = 1,  // Clip Stereo Panning [-1.0, +1.0] (0.0 = Center)
+    Pitch = 2   // Clip Pitch Transposition in semitones [-24.0, +24.0] (0.0 = Natural)
+};
 
 struct AudioSlice {
     uint32_t slice_id{0};
@@ -27,7 +34,9 @@ struct AudioSlice {
 // ============================================================================
 class AudioClip {
 public:
-    AudioClip() = default;
+    AudioClip() {
+        init_envelopes(4.0);
+    }
 
     AudioClip(std::string name, uint32_t sample_rate, uint32_t channels, uint32_t frames)
         : m_name(std::move(name)),
@@ -35,9 +44,48 @@ public:
           m_channels(channels),
           m_frames(frames),
           m_data(channels, std::vector<float>(frames, 0.0f)) {
+        init_envelopes(4.0);
         if (m_frames > 0 && m_channels > 0) {
             build_overview(false);
         }
+    }
+
+    AudioClip(const AudioClip& other)
+        : m_name(other.m_name),
+          m_sample_rate(other.m_sample_rate),
+          m_channels(other.m_channels),
+          m_frames(other.m_frames),
+          m_bpm(other.m_bpm),
+          m_data(other.m_data),
+          m_slices(other.m_slices),
+          m_overview(other.m_overview),
+          m_gain_envelope(other.m_gain_envelope),
+          m_pan_envelope(other.m_pan_envelope),
+          m_pitch_envelope(other.m_pitch_envelope),
+          m_gain_envelope_enabled(other.m_gain_envelope_enabled.load(std::memory_order_relaxed)),
+          m_pan_envelope_enabled(other.m_pan_envelope_enabled.load(std::memory_order_relaxed)),
+          m_pitch_envelope_enabled(other.m_pitch_envelope_enabled.load(std::memory_order_relaxed)),
+          m_envelope_length_beats(other.m_envelope_length_beats.load(std::memory_order_relaxed)) {}
+
+    AudioClip& operator=(const AudioClip& other) {
+        if (this != &other) {
+            m_name = other.m_name;
+            m_sample_rate = other.m_sample_rate;
+            m_channels = other.m_channels;
+            m_frames = other.m_frames;
+            m_bpm = other.m_bpm;
+            m_data = other.m_data;
+            m_slices = other.m_slices;
+            m_overview = other.m_overview;
+            m_gain_envelope = other.m_gain_envelope;
+            m_pan_envelope = other.m_pan_envelope;
+            m_pitch_envelope = other.m_pitch_envelope;
+            m_gain_envelope_enabled.store(other.m_gain_envelope_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_pan_envelope_enabled.store(other.m_pan_envelope_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_pitch_envelope_enabled.store(other.m_pitch_envelope_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_envelope_length_beats.store(other.m_envelope_length_beats.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
     }
 
     [[nodiscard]] const std::string& name() const noexcept { return m_name; }
@@ -460,6 +508,170 @@ public:
         rebuild_overview();
     }
 
+    // ========================================================================
+    // Clip-Relative Envelopes (Gain, Pan, Pitch)
+    // ========================================================================
+    void init_envelopes(double beats = 4.0) {
+        m_gain_envelope.set_points({
+            routing::AutomationPoint{0.0, 1.0f, routing::NodeMode::Smooth, 0.0f},
+            routing::AutomationPoint{beats, 1.0f, routing::NodeMode::Smooth, 0.0f}
+        });
+        m_pan_envelope.set_points({
+            routing::AutomationPoint{0.0, 0.0f, routing::NodeMode::Smooth, 0.0f},
+            routing::AutomationPoint{beats, 0.0f, routing::NodeMode::Smooth, 0.0f}
+        });
+        m_pitch_envelope.set_points({
+            routing::AutomationPoint{0.0, 0.0f, routing::NodeMode::Smooth, 0.0f},
+            routing::AutomationPoint{beats, 0.0f, routing::NodeMode::Smooth, 0.0f}
+        });
+    }
+
+    [[nodiscard]] routing::AutomationCurve& envelope(ClipEnvelopeTarget target) noexcept {
+        switch (target) {
+            case ClipEnvelopeTarget::Gain:  return m_gain_envelope;
+            case ClipEnvelopeTarget::Pan:   return m_pan_envelope;
+            case ClipEnvelopeTarget::Pitch: return m_pitch_envelope;
+        }
+        return m_gain_envelope;
+    }
+
+    [[nodiscard]] const routing::AutomationCurve& envelope(ClipEnvelopeTarget target) const noexcept {
+        switch (target) {
+            case ClipEnvelopeTarget::Gain:  return m_gain_envelope;
+            case ClipEnvelopeTarget::Pan:   return m_pan_envelope;
+            case ClipEnvelopeTarget::Pitch: return m_pitch_envelope;
+        }
+        return m_gain_envelope;
+    }
+
+    [[nodiscard]] bool is_envelope_enabled(ClipEnvelopeTarget target) const noexcept {
+        switch (target) {
+            case ClipEnvelopeTarget::Gain:  return m_gain_envelope_enabled.load(std::memory_order_relaxed);
+            case ClipEnvelopeTarget::Pan:   return m_pan_envelope_enabled.load(std::memory_order_relaxed);
+            case ClipEnvelopeTarget::Pitch: return m_pitch_envelope_enabled.load(std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    void set_envelope_enabled(ClipEnvelopeTarget target, bool enabled) noexcept {
+        switch (target) {
+            case ClipEnvelopeTarget::Gain:  m_gain_envelope_enabled.store(enabled, std::memory_order_relaxed); break;
+            case ClipEnvelopeTarget::Pan:   m_pan_envelope_enabled.store(enabled, std::memory_order_relaxed); break;
+            case ClipEnvelopeTarget::Pitch: m_pitch_envelope_enabled.store(enabled, std::memory_order_relaxed); break;
+        }
+    }
+
+    [[nodiscard]] bool has_active_envelopes() const noexcept {
+        return m_gain_envelope_enabled.load(std::memory_order_relaxed) ||
+               m_pan_envelope_enabled.load(std::memory_order_relaxed) ||
+               m_pitch_envelope_enabled.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] double envelope_length_beats() const noexcept {
+        double b = m_envelope_length_beats.load(std::memory_order_relaxed);
+        if (b > 0.0) return b;
+        if (m_bpm > 0.0 && m_sample_rate > 0 && m_frames > 0) {
+            double dur_sec = static_cast<double>(m_frames) / static_cast<double>(m_sample_rate);
+            return std::max(0.25, (dur_sec / 60.0) * m_bpm);
+        }
+        return 4.0;
+    }
+
+    void set_envelope_length_beats(double beats) noexcept {
+        m_envelope_length_beats.store(std::max(0.1, beats), std::memory_order_relaxed);
+    }
+
+    // Convert frame position in loop to clip envelope beat
+    [[nodiscard]] double frame_to_envelope_beat(double frame_pos, uint32_t loop_start = 0, uint32_t loop_end = 0, double user_bar_length = 0.0) const noexcept {
+        const uint32_t l_start = loop_start;
+        const uint32_t l_end = (loop_end > loop_start && loop_end <= m_frames) ? loop_end : m_frames;
+        const double loop_len = static_cast<double>((l_end > l_start) ? (l_end - l_start) : std::max(1u, m_frames));
+        double clip_beats = (user_bar_length > 0.0) ? (user_bar_length * 4.0) : envelope_length_beats();
+
+        double rel = frame_pos - static_cast<double>(l_start);
+        double u = std::fmod(rel, loop_len);
+        if (u < 0.0) u += loop_len;
+        return (u / loop_len) * clip_beats;
+    }
+
+    // Sample-accurate evaluation of Gain & Pan envelopes across rendered block
+    void apply_envelopes(float* dst_l, float* dst_r, uint32_t frames,
+                         double start_playhead, double end_playhead,
+                         uint32_t loop_start, uint32_t loop_end,
+                         double user_bar_length = 0.0) const noexcept {
+        if (!dst_l || !dst_r || frames == 0) return;
+        const bool gain_active = m_gain_envelope_enabled.load(std::memory_order_relaxed);
+        const bool pan_active = m_pan_envelope_enabled.load(std::memory_order_relaxed);
+        if (!gain_active && !pan_active) return;
+
+        const uint32_t l_start = loop_start;
+        const uint32_t l_end = (loop_end > loop_start && loop_end <= m_frames) ? loop_end : m_frames;
+        const double loop_len = static_cast<double>((l_end > l_start) ? (l_end - l_start) : std::max(1u, m_frames));
+        double clip_beats = (user_bar_length > 0.0) ? (user_bar_length * 4.0) : envelope_length_beats();
+
+        auto f_to_b = [&](double fp) noexcept -> double {
+            double rel = fp - static_cast<double>(l_start);
+            double u = std::fmod(rel, loop_len);
+            if (u < 0.0) u += loop_len;
+            return (u / loop_len) * clip_beats;
+        };
+
+        double b_start = f_to_b(start_playhead);
+        double b_end   = f_to_b(end_playhead);
+
+        alignas(64) float env_buf[2048];
+        const uint32_t chunk = std::min(frames, 2048u);
+
+        bool did_wrap = (end_playhead < start_playhead) || (b_end < b_start);
+
+        auto eval_curve_range = [&](const routing::AutomationCurve& curve, float* out) noexcept {
+            if (!did_wrap) {
+                curve.evaluate_audio_block(b_start, b_end, out, chunk);
+            } else {
+                double rem_frames = static_cast<double>(l_end) - start_playhead;
+                if (rem_frames < 0.0) rem_frames = 0.0;
+                double post_frames = end_playhead - static_cast<double>(l_start);
+                if (post_frames < 0.0) post_frames = 0.0;
+                double tot_span = rem_frames + post_frames;
+                uint32_t k = (tot_span > 1e-6)
+                           ? std::clamp(static_cast<uint32_t>(std::round((rem_frames / tot_span) * static_cast<double>(chunk))), 1u, chunk - 1)
+                           : (chunk / 2);
+                curve.evaluate_audio_block(b_start, clip_beats, out, k);
+                curve.evaluate_audio_block(0.0, b_end, out + k, chunk - k);
+            }
+        };
+
+        // 1. Gain Envelope
+        if (gain_active) {
+            eval_curve_range(m_gain_envelope, env_buf);
+            #if defined(__GNUC__) || defined(__clang__)
+            #pragma GCC ivdep
+            #endif
+            for (uint32_t i = 0; i < chunk; ++i) {
+                dst_l[i] *= env_buf[i];
+                dst_r[i] *= env_buf[i];
+            }
+        }
+
+        // 2. Pan Envelope (Constant-Power)
+        if (pan_active) {
+            eval_curve_range(m_pan_envelope, env_buf);
+            constexpr float kSqrt2 = 1.41421356237f;
+            constexpr float kPi = 3.14159265358979323846f;
+            #if defined(__GNUC__) || defined(__clang__)
+            #pragma GCC ivdep
+            #endif
+            for (uint32_t i = 0; i < chunk; ++i) {
+                const float p = std::clamp(env_buf[i], -1.0f, 1.0f);
+                const float theta = (p + 1.0f) * 0.25f * kPi;
+                const float pan_l = std::cos(theta) * kSqrt2;
+                const float pan_r = std::sin(theta) * kSqrt2;
+                dst_l[i] *= pan_l;
+                dst_r[i] *= pan_r;
+            }
+        }
+    }
+
 private:
     std::string m_name{"UntitledClip"};
     uint32_t m_sample_rate{48000};
@@ -469,6 +681,14 @@ private:
     std::vector<std::vector<float>> m_data;
     std::vector<AudioSlice> m_slices;
     std::shared_ptr<WaveformOverview> m_overview;
+
+    routing::AutomationCurve m_gain_envelope;
+    routing::AutomationCurve m_pan_envelope;
+    routing::AutomationCurve m_pitch_envelope;
+    std::atomic<bool> m_gain_envelope_enabled{false};
+    std::atomic<bool> m_pan_envelope_enabled{false};
+    std::atomic<bool> m_pitch_envelope_enabled{false};
+    std::atomic<double> m_envelope_length_beats{0.0};
 };
 
 } // namespace audio_core::sampling

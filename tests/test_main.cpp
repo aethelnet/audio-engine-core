@@ -8735,6 +8735,279 @@ void test_automation_selection_and_batch_editing() {
     }
 }
 
+void test_clip_relative_envelopes_and_loop_modulation() {
+    std::cout << "[TEST] Running Clip-Relative Envelopes & Loop Modulation Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+    using namespace audio_core::routing;
+
+    const uint32_t kSr = 48000;
+    // 2 seconds = 96,000 frames (4 bars @ 120 BPM = 8 beats)
+    const uint32_t kFrames = 96000;
+
+    // 1. Clip Envelope Initialization, Target Accessors & Presets
+    {
+        AudioClip clip("EnvClip", kSr, 2, kFrames);
+        TEST_CHECK(!clip.has_active_envelopes());
+        TEST_CHECK(!clip.is_envelope_enabled(ClipEnvelopeTarget::Gain));
+        TEST_CHECK(!clip.is_envelope_enabled(ClipEnvelopeTarget::Pan));
+        TEST_CHECK(!clip.is_envelope_enabled(ClipEnvelopeTarget::Pitch));
+
+        clip.set_envelope_length_beats(8.0);
+        TEST_CHECK(std::abs(clip.envelope_length_beats() - 8.0) < 1e-4);
+
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+        TEST_CHECK(clip.is_envelope_enabled(ClipEnvelopeTarget::Gain));
+        TEST_CHECK(clip.has_active_envelopes());
+
+        // Test presets
+        clip.envelope(ClipEnvelopeTarget::Gain).preset_clip_sidechain_pump(8.0);
+        auto gain_pts = clip.envelope(ClipEnvelopeTarget::Gain).get_points();
+        TEST_CHECK(gain_pts.size() >= 2);
+
+        clip.envelope(ClipEnvelopeTarget::Pan).preset_clip_ping_pong_pan(8.0, 1.0);
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Pan, true);
+        auto pan_pts = clip.envelope(ClipEnvelopeTarget::Pan).get_points();
+        TEST_CHECK(pan_pts.size() >= 2);
+
+        clip.envelope(ClipEnvelopeTarget::Pitch).preset_clip_pitch_drop(8.0, -12.0f);
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Pitch, true);
+        auto pitch_pts = clip.envelope(ClipEnvelopeTarget::Pitch).get_points();
+        TEST_CHECK(pitch_pts.size() >= 2);
+
+        std::cout << "  -> Clip Envelope Initialization, Target Accessors & Presets: PASSED" << std::endl;
+    }
+
+    // 2. Frame to Envelope Beat Mapping
+    {
+        AudioClip clip("MapClip", kSr, 2, kFrames);
+        clip.set_envelope_length_beats(8.0);
+
+        // Frame 0 -> 0.0 beats
+        double b0 = clip.frame_to_envelope_beat(0.0, 0, kFrames);
+        TEST_CHECK(std::abs(b0 - 0.0) < 1e-4);
+
+        // Frame 48000 (halfway) -> 4.0 beats
+        double b_mid = clip.frame_to_envelope_beat(48000.0, 0, kFrames);
+        TEST_CHECK(std::abs(b_mid - 4.0) < 1e-4);
+
+        // Frame 24000 (quarter) -> 2.0 beats
+        double b_qtr = clip.frame_to_envelope_beat(24000.0, 0, kFrames);
+        TEST_CHECK(std::abs(b_qtr - 2.0) < 1e-4);
+
+        // Partial loop range: loop from frame 20000 to frame 60000 (len = 40000 frames)
+        double b_sub_start = clip.frame_to_envelope_beat(20000.0, 20000, 60000);
+        TEST_CHECK(std::abs(b_sub_start - 0.0) < 1e-4);
+        double b_sub_mid = clip.frame_to_envelope_beat(40000.0, 20000, 60000);
+        TEST_CHECK(std::abs(b_sub_mid - 4.0) < 1e-4);
+
+        std::cout << "  -> Frame to Envelope Beat Mapping: PASSED" << std::endl;
+    }
+
+    // 3. Sample-Accurate Gain Modulation
+    {
+        AudioClip clip("GainModClip", kSr, 2, kFrames);
+        clip.set_envelope_length_beats(8.0);
+
+        // Set linear gain envelope from 0.0 at beat 0 to 1.0 at beat 8
+        clip.envelope(ClipEnvelopeTarget::Gain).set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Smooth, 0.0f},
+            AutomationPoint{8.0, 1.0f, NodeMode::Smooth, 0.0f}
+        });
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+
+        // Render a 1000-frame block starting at frame 0 (beat 0) to frame 1000
+        std::vector<float> buf_l(1000, 1.0f);
+        std::vector<float> buf_r(1000, 1.0f);
+
+        clip.apply_envelopes(buf_l.data(), buf_r.data(), 1000, 0.0, 1000.0, 0, kFrames);
+
+        // First sample should be close to 0.0
+        TEST_CHECK(buf_l[0] < 0.01f);
+        TEST_CHECK(buf_r[0] < 0.01f);
+
+        // Gain should strictly increase monotonically
+        TEST_CHECK(buf_l[500] > buf_l[100]);
+        TEST_CHECK(buf_l[999] > buf_l[500]);
+        TEST_CHECK(buf_l[999] < 0.2f);
+
+        std::cout << "  -> Sample-Accurate Gain Modulation: PASSED" << std::endl;
+    }
+
+    // 4. Constant-Power Pan Modulation
+    {
+        AudioClip clip("PanModClip", kSr, 2, kFrames);
+        clip.set_envelope_length_beats(4.0);
+
+        // Hard Left at beat 0 (-1.0), Center at beat 2 (0.0), Hard Right at beat 4 (+1.0)
+        clip.envelope(ClipEnvelopeTarget::Pan).set_points({
+            AutomationPoint{0.0, -1.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{2.0,  0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0,  1.0f, NodeMode::Corner, 0.0f}
+        });
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Pan, true);
+
+        // Test Center panning: frame corresponding to beat 2 (half of 4-beat loop = 48000 frames)
+        std::vector<float> buf_l(128, 1.0f);
+        std::vector<float> buf_r(128, 1.0f);
+        clip.apply_envelopes(buf_l.data(), buf_r.data(), 128, 48000.0, 48128.0, 0, kFrames);
+
+        // At center (0.0 pan), gain on both channels should be 1.0 (center-unity normalized)
+        for (size_t i = 0; i < 128; ++i) {
+            TEST_CHECK(std::abs(buf_l[i] - 1.0f) < 0.05f);
+            TEST_CHECK(std::abs(buf_r[i] - 1.0f) < 0.05f);
+        }
+
+        // Test Hard Left panning: frame 0
+        std::fill(buf_l.begin(), buf_l.end(), 1.0f);
+        std::fill(buf_r.begin(), buf_r.end(), 1.0f);
+        clip.apply_envelopes(buf_l.data(), buf_r.data(), 128, 0.0, 128.0, 0, kFrames);
+
+        // Hard Left: L > 1.35f, R < 0.05f
+        TEST_CHECK(buf_l[0] > 1.35f);
+        TEST_CHECK(buf_r[0] < 0.05f);
+
+        std::cout << "  -> Constant-Power Pan Modulation & Center Unity: PASSED" << std::endl;
+    }
+
+    // 5. Loop Boundary Analytical Wrap Continuity
+    {
+        AudioClip clip("WrapClip", kSr, 2, kFrames);
+        clip.set_envelope_length_beats(4.0);
+
+        // Linear envelope from 0.0 at beat 0 to 1.0 at beat 4
+        clip.envelope(ClipEnvelopeTarget::Gain).set_points({
+            AutomationPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            AutomationPoint{4.0, 1.0f, NodeMode::Corner, 0.0f}
+        });
+        clip.set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+
+        // Buffer crossing loop seam: starts at frame 95800, ends at frame 200 (total 400 frames)
+        std::vector<float> buf_l(400, 1.0f);
+        std::vector<float> buf_r(400, 1.0f);
+
+        clip.apply_envelopes(buf_l.data(), buf_r.data(), 400, 95800.0, 200.0, 0, kFrames);
+
+        // Verify segment 1 (samples 0..199) are near 1.0
+        TEST_CHECK(buf_l[0] > 0.95f);
+        TEST_CHECK(buf_l[199] > 0.98f);
+
+        // Verify segment 2 (samples 200..399) wrapped to near 0.0
+        TEST_CHECK(buf_l[200] < 0.05f);
+        TEST_CHECK(buf_l[399] < 0.05f);
+
+        // Ensure no NaNs or Infs
+        for (size_t i = 0; i < 400; ++i) {
+            TEST_CHECK(!std::isnan(buf_l[i]) && !std::isinf(buf_l[i]));
+            TEST_CHECK(!std::isnan(buf_r[i]) && !std::isinf(buf_r[i]));
+        }
+
+        std::cout << "  -> Loop Boundary Analytical Wrap Continuity: PASSED" << std::endl;
+    }
+
+    // 6. VariSpeedStreamer Playback with Dynamic Pitch Envelope
+    {
+        auto clip = std::make_shared<AudioClip>("StreamPitchClip", kSr, 2, kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / kSr);
+            clip->channel(0)[i] = s;
+            clip->channel(1)[i] = s;
+        }
+        clip->set_envelope_length_beats(4.0);
+
+        // Octave drop from 0 st at beat 0 to -12 st at beat 4
+        clip->envelope(ClipEnvelopeTarget::Pitch).preset_clip_pitch_drop(4.0, -12.0f);
+        clip->set_envelope_enabled(ClipEnvelopeTarget::Pitch, true);
+
+        VariSpeedStreamer streamer(static_cast<float>(kSr));
+        streamer.set_clip(clip);
+        streamer.set_loop(true);
+        streamer.set_capstan_inertia_ms(0.0f);
+
+        std::vector<Sample> out_l(512), out_r(512);
+        streamer.render(out_l.data(), out_r.data(), 512, kSr, 120.0, true);
+
+        // Playhead should advance without errors
+        TEST_CHECK(streamer.playhead() > 0.0);
+        for (size_t i = 0; i < 512; ++i) {
+            TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+            TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+        }
+
+        std::cout << "  -> VariSpeedStreamer Playback with Dynamic Pitch Envelope: PASSED" << std::endl;
+    }
+
+    // 7. Session Serialization Round-Trip
+    {
+        using namespace audio_core::serialization;
+
+        MixerGraph mixer(256, false, kSr);
+        Track* trk = mixer.allocate_track("ClipEnvTrack");
+        TEST_CHECK(trk != nullptr);
+
+        auto clip = std::make_shared<AudioClip>("SessionClip", kSr, 2, kFrames);
+        clip->set_envelope_length_beats(8.0);
+        clip->envelope(ClipEnvelopeTarget::Gain).preset_clip_sidechain_pump(8.0);
+        clip->set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+
+        clip->envelope(ClipEnvelopeTarget::Pan).preset_clip_ping_pong_pan(8.0, 1.0);
+        clip->set_envelope_enabled(ClipEnvelopeTarget::Pan, true);
+
+        clip->envelope(ClipEnvelopeTarget::Pitch).preset_clip_pitch_drop(8.0, -12.0f);
+        clip->set_envelope_enabled(ClipEnvelopeTarget::Pitch, true);
+
+        trk->set_clip(clip, true);
+
+        clock::TimelineClock src_clock(kSr, 120.0);
+
+        // Serialize session to JSON
+        ProjectSessionData sess = SessionSerializer::extract_session(mixer, src_clock, "ClipEnvTest");
+        TEST_CHECK(sess.tracks.size() >= 1);
+        const auto& ce_data = sess.tracks[0].clip_envelopes;
+        TEST_CHECK(ce_data.gain_enabled == true);
+        TEST_CHECK(ce_data.gain_points.size() >= 2);
+        TEST_CHECK(ce_data.pan_enabled == true);
+        TEST_CHECK(ce_data.pitch_enabled == true);
+
+        std::string json_str = sess.to_json();
+        TEST_CHECK(!json_str.empty());
+        TEST_CHECK(json_str.find("clip_envelopes") != std::string::npos);
+        TEST_CHECK(json_str.find("gain") != std::string::npos);
+        TEST_CHECK(json_str.find("pan") != std::string::npos);
+        TEST_CHECK(json_str.find("pitch") != std::string::npos);
+
+        // Deserialize from JSON
+        auto parsed_val = json::Parser::parse(json_str);
+        TEST_CHECK(parsed_val.has_value());
+        auto restored_sess = ProjectSessionData::from_json_val(*parsed_val);
+        TEST_CHECK(restored_sess.has_value());
+
+        MixerGraph dst_mixer(256, false, kSr);
+        clock::TimelineClock dst_clock(kSr, 120.0);
+        bool applied = SessionSerializer::apply_session(dst_mixer, dst_clock, *restored_sess);
+        TEST_CHECK(applied);
+
+        Track* restored_trk = dst_mixer.track_by_index(0);
+        TEST_CHECK(restored_trk != nullptr);
+        TEST_CHECK(restored_trk->has_clip());
+
+        auto restored_clip = restored_trk->clip();
+        TEST_CHECK(restored_clip != nullptr);
+        TEST_CHECK(restored_clip->is_envelope_enabled(ClipEnvelopeTarget::Gain));
+        TEST_CHECK(restored_clip->is_envelope_enabled(ClipEnvelopeTarget::Pan));
+        TEST_CHECK(restored_clip->is_envelope_enabled(ClipEnvelopeTarget::Pitch));
+        TEST_CHECK(std::abs(restored_clip->envelope_length_beats() - 8.0) < 1e-4);
+
+        auto r_gain_pts = restored_clip->envelope(ClipEnvelopeTarget::Gain).get_points();
+        TEST_CHECK(r_gain_pts.size() >= 2);
+        auto r_pitch_pts = restored_clip->envelope(ClipEnvelopeTarget::Pitch).get_points();
+        TEST_CHECK(r_pitch_pts.size() >= 2);
+
+        std::cout << "  -> Session Serialization Round-Trip: PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -8807,6 +9080,7 @@ int main() {
     test_automation_curve_and_gain_rendering();
     test_multi_parameter_automation_and_session_serialization();
     test_automation_selection_and_batch_editing();
+    test_clip_relative_envelopes_and_loop_modulation();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
