@@ -1421,8 +1421,8 @@ public:
         }
     }
 
-    void start_scrub(uint64_t target_sample) noexcept {
-        m_clock.start_scrub(target_sample);
+    void start_scrub(uint64_t target_sample, double velocity = 1.0) noexcept {
+        m_clock.start_scrub(target_sample, velocity);
         for (auto& track : m_tracks) {
             if (track) {
                 track->set_clip_playhead(static_cast<double>(target_sample));

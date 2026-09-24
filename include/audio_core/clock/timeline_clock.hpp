@@ -122,8 +122,9 @@ public:
         m_seek_generation.fetch_add(1, std::memory_order_release);
     }
 
-    void start_scrub(uint64_t target_sample) noexcept {
+    void start_scrub(uint64_t target_sample, double velocity = 1.0) noexcept {
         m_is_scrubbing.store(true, std::memory_order_release);
+        m_scrub_velocity.store(velocity, std::memory_order_release);
         seek(target_sample);
     }
 

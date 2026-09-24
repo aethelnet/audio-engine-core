@@ -84,6 +84,10 @@ public:
         m_motor_progress = 0.0f;
         m_needs_smoother_reset = true;
         m_effective_ratio = 1.0f;
+        m_scrub_dc_x_l = 0.0f;
+        m_scrub_dc_y_l = 0.0f;
+        m_scrub_dc_x_r = 0.0f;
+        m_scrub_dc_y_r = 0.0f;
         m_wsola.reset();
     }
 
@@ -417,12 +421,42 @@ public:
                 }
             }
 
+            float raw_l = 0.0f;
+            float raw_r = 0.0f;
             if (loop) {
-                dst_l[i] = sample_hermite_range_wrapped(src_l, ph, l_start, loop_len);
-                dst_r[i] = sample_hermite_range_wrapped(src_r, ph, l_start, loop_len);
+                raw_l = sample_hermite_range_wrapped(src_l, ph, l_start, loop_len);
+                raw_r = sample_hermite_range_wrapped(src_r, ph, l_start, loop_len);
             } else {
-                dst_l[i] = dsp::sample_hermite(src_l, ph, clip_total_frames);
-                dst_r[i] = dsp::sample_hermite(src_r, ph, clip_total_frames);
+                raw_l = dsp::sample_hermite(src_l, ph, clip_total_frames);
+                raw_r = dsp::sample_hermite(src_r, ph, clip_total_frames);
+            }
+
+            if (is_scrubbing) {
+                // DJ-Style Granular Micro-Windowing & Sub-Bass Rumble Protection:
+                // 1. Single-pole highpass / DC-blocker (R = 0.995 => ~25 Hz cutoff at 48kHz)
+                //    eliminates stagnant DC offsets and infrasonic speaker excursions when crawling or reversing.
+                const float y_l = raw_l - m_scrub_dc_x_l + 0.995f * m_scrub_dc_y_l;
+                m_scrub_dc_x_l = raw_l;
+                m_scrub_dc_y_l = y_l;
+
+                const float y_r = raw_r - m_scrub_dc_x_r + 0.995f * m_scrub_dc_y_r;
+                m_scrub_dc_x_r = raw_r;
+                m_scrub_dc_y_r = y_r;
+
+                // 2. Smooth velocity taper: micro-window transitions smoothly towards 0 when stationary (|v| -> 0)
+                //    avoiding sudden rectangular step clicks when scrubbing stops or reverses.
+                const float vel_abs = static_cast<float>(std::abs(scrub_velocity));
+                const float g_vel = std::tanh(vel_abs / 0.12f);
+
+                dst_l[i] = y_l * g_vel;
+                dst_r[i] = y_r * g_vel;
+            } else {
+                m_scrub_dc_x_l = 0.0f;
+                m_scrub_dc_y_l = 0.0f;
+                m_scrub_dc_x_r = 0.0f;
+                m_scrub_dc_y_r = 0.0f;
+                dst_l[i] = raw_l;
+                dst_r[i] = raw_r;
             }
 
             ph += static_cast<double>(active_step);
@@ -458,6 +492,12 @@ private:
     dsp::LiquidParameterSmoother m_smoother;
     bool m_needs_smoother_reset{true};
     float m_effective_ratio{1.0f};
+
+    // Granular Micro-Windowed Jog & Scrub DC Blocker State
+    float m_scrub_dc_x_l{0.0f};
+    float m_scrub_dc_y_l{0.0f};
+    float m_scrub_dc_x_r{0.0f};
+    float m_scrub_dc_y_r{0.0f};
 
     WsolaStreamer m_wsola;
 };

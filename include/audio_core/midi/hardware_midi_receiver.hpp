@@ -59,8 +59,8 @@ class HardwareMidiReceiver {
 public:
     static constexpr size_t kDefaultQueueCapacity = 2048;
 
-    HardwareMidiReceiver()
-        : m_queue(kDefaultQueueCapacity) {
+    explicit HardwareMidiReceiver(size_t queue_capacity = kDefaultQueueCapacity)
+        : m_queue(queue_capacity) {
         m_stop_pipe[0] = -1;
         m_stop_pipe[1] = -1;
     }
@@ -193,6 +193,16 @@ public:
         m_seq_port_id = pinfo.addr.port;
         m_seq_port_name = client_name + ":" + std::to_string(pinfo.addr.port) + " (" + port_name + ")";
 
+        // Maximize ALSA Sequencer Kernel Event Pool (up to 2000 cells)
+        struct snd_seq_client_pool pool{};
+        pool.client = client_id;
+        if (ioctl(fd, SNDRV_SEQ_IOCTL_GET_CLIENT_POOL, &pool) >= 0) {
+            pool.output_pool = 2000;
+            pool.input_pool = 2000;
+            pool.output_room = 1;
+            (void)ioctl(fd, SNDRV_SEQ_IOCTL_SET_CLIENT_POOL, &pool);
+        }
+
         m_is_mock = false;
         ensure_listener_thread_running();
         update_device_path_string();
@@ -266,6 +276,8 @@ public:
         m_in_sysex = false;
         m_sysex_len = 0;
         m_clock_gen.reset();
+        m_event_count.store(0, std::memory_order_relaxed);
+        m_dropped_events.store(0, std::memory_order_relaxed);
     }
 
     [[nodiscard]] bool is_connected() const noexcept {
@@ -720,12 +732,15 @@ public:
     }
 
     void inject_event(const MidiEvent& ev) noexcept {
-        m_queue.try_push(ev);
-        m_event_count.fetch_add(1, std::memory_order_relaxed);
-        m_last_status.store(ev.status, std::memory_order_relaxed);
-        m_last_note.store(ev.data1, std::memory_order_relaxed);
-        m_last_velocity.store(ev.data2, std::memory_order_relaxed);
-        m_activity_flag.store(true, std::memory_order_relaxed);
+        if (m_queue.try_push(ev)) {
+            m_event_count.fetch_add(1, std::memory_order_relaxed);
+            m_last_status.store(ev.status, std::memory_order_relaxed);
+            m_last_note.store(ev.data1, std::memory_order_relaxed);
+            m_last_velocity.store(ev.data2, std::memory_order_relaxed);
+            m_activity_flag.store(true, std::memory_order_relaxed);
+        } else {
+            m_dropped_events.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // ========================================================================
@@ -794,9 +809,18 @@ public:
     // Live Telemetry Queries
     // ========================================================================
     [[nodiscard]] uint64_t event_count() const noexcept { return m_event_count.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t dropped_events() const noexcept { return m_dropped_events.load(std::memory_order_relaxed); }
     [[nodiscard]] uint8_t last_status() const noexcept { return m_last_status.load(std::memory_order_relaxed); }
     [[nodiscard]] uint8_t last_note() const noexcept { return m_last_note.load(std::memory_order_relaxed); }
     [[nodiscard]] uint8_t last_velocity() const noexcept { return m_last_velocity.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] size_t queue_capacity() const noexcept { return m_queue.capacity(); }
+    [[nodiscard]] size_t queue_size() const noexcept { return m_queue.size(); }
+
+    void reset_counters() noexcept {
+        m_event_count.store(0, std::memory_order_relaxed);
+        m_dropped_events.store(0, std::memory_order_relaxed);
+    }
 
     [[nodiscard]] bool has_activity_and_clear() noexcept {
         return m_activity_flag.exchange(false, std::memory_order_relaxed);
@@ -858,7 +882,6 @@ private:
     void read_loop() {
         struct pollfd fds[3];
         uint8_t buffer[256];
-        struct snd_seq_event seq_ev;
 
         while (m_running.load(std::memory_order_relaxed)) {
             int nfds = 0;
@@ -922,10 +945,14 @@ private:
 
             // ALSA Sequencer input
             if (seq_idx >= 0 && (fds[seq_idx].revents & POLLIN)) {
+                struct snd_seq_event seq_batch[64];
                 while (true) {
-                    ssize_t bytes_read = ::read(m_seq_fd, &seq_ev, sizeof(seq_ev));
-                    if (bytes_read == static_cast<ssize_t>(sizeof(seq_ev))) {
-                        parse_seq_event(seq_ev);
+                    ssize_t bytes_read = ::read(m_seq_fd, seq_batch, sizeof(seq_batch));
+                    if (bytes_read > 0) {
+                        size_t num_events = static_cast<size_t>(bytes_read) / sizeof(struct snd_seq_event);
+                        for (size_t i = 0; i < num_events; ++i) {
+                            parse_seq_event(seq_batch[i]);
+                        }
                     } else {
                         break;
                     }
@@ -1035,28 +1062,40 @@ private:
                 case SNDRV_SEQ_EVENT_CLOCK: { // 36
                     uint64_t ts = static_cast<uint64_t>(ev.time.time.tv_sec) * 1'000'000'000ULL + ev.time.time.tv_nsec;
                     m_sync_tracker.on_clock_tick(ts);
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_START: { // 30
                     m_sync_tracker.on_start();
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_CONTINUE: { // 31
                     m_sync_tracker.on_continue();
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_STOP: { // 32
                     m_sync_tracker.on_stop();
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_SONGPOS: { // 20
                     uint16_t spp = static_cast<uint16_t>(std::clamp(ev.data.control.value, 0, 16383));
                     m_sync_tracker.on_song_position_pointer(spp);
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_QFRAME: { // 22
                     uint8_t qf = static_cast<uint8_t>(ev.data.control.value & 0xFF);
                     m_sync_tracker.on_mtc_quarter_frame(qf);
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_SYSEX: { // 130
@@ -1074,6 +1113,8 @@ private:
                             m_sync_tracker.on_mtc_full_frame(hr, mn, sc, fr, rate);
                         }
                     }
+                    m_event_count.fetch_add(1, std::memory_order_relaxed);
+                    m_activity_flag.store(true, std::memory_order_relaxed);
                     break;
                 }
                 // Dynamic hotplug & kernel announce events
@@ -1130,6 +1171,8 @@ private:
         // 1. System Realtime messages (0xF8..0xFF) can appear ANYWHERE in the byte stream
         // without interrupting or corrupting running status for channel messages!
         if (byte >= 0xF8) {
+            m_event_count.fetch_add(1, std::memory_order_relaxed);
+            m_activity_flag.store(true, std::memory_order_relaxed);
             switch (byte) {
                 case 0xF8: // Timing Clock (24 PPQN)
                     m_sync_tracker.on_clock_tick();
@@ -1266,12 +1309,15 @@ private:
             .data2 = d2
         };
 
-        m_queue.try_push(ev);
-        m_event_count.fetch_add(1, std::memory_order_relaxed);
-        m_last_status.store(status, std::memory_order_relaxed);
-        m_last_note.store(d1, std::memory_order_relaxed);
-        m_last_velocity.store(d2, std::memory_order_relaxed);
-        m_activity_flag.store(true, std::memory_order_relaxed);
+        if (m_queue.try_push(ev)) {
+            m_event_count.fetch_add(1, std::memory_order_relaxed);
+            m_last_status.store(status, std::memory_order_relaxed);
+            m_last_note.store(d1, std::memory_order_relaxed);
+            m_last_velocity.store(d2, std::memory_order_relaxed);
+            m_activity_flag.store(true, std::memory_order_relaxed);
+        } else {
+            m_dropped_events.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     int m_fd{-1};
@@ -1300,6 +1346,7 @@ private:
 
     // Live atomic telemetry
     std::atomic<uint64_t> m_event_count{0};
+    std::atomic<uint64_t> m_dropped_events{0};
     std::atomic<uint8_t> m_last_status{0};
     std::atomic<uint8_t> m_last_note{0};
     std::atomic<uint8_t> m_last_velocity{0};

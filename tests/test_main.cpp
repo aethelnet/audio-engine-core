@@ -11082,6 +11082,254 @@ void test_timeline_scrubbing_and_mtc_full_frame_broadcast() {
     std::cout << "  -> Timeline Scrubbing, SPP & MTC Full Frame SysEx Broadcast: ALL PASSED" << std::endl;
 }
 
+void test_alsa_hardware_loopback_stress_and_scrub_attenuation() {
+    std::cout << "[TEST 78] Running ALSA Hardware Loopback Stress & Scrub Attenuation..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::midi;
+    using namespace audio_core::sampling;
+
+    // ========================================================================
+    // Part 1: Granular Micro-Windowed Scrubbing & DC-Blocker Attenuation
+    // ========================================================================
+    {
+        constexpr size_t kFrames = 48000;
+        auto clip = std::make_shared<AudioClip>("DcClip", 48000, 2, static_cast<uint32_t>(kFrames));
+        // Synthesize test wave with significant DC bias (+0.50 offset) + 100Hz sine
+        for (size_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / 48000.0f;
+            float val = 0.50f + 0.35f * std::sin(2.0f * std::numbers::pi_v<float> * 750.0f * t);
+            clip->channel(0)[i] = val;
+            clip->channel(1)[i] = val;
+        }
+
+        VariSpeedStreamer streamer;
+        streamer.set_clip(clip);
+
+        std::vector<Sample> out_l(128, 0.0f);
+        std::vector<Sample> out_r(128, 0.0f);
+
+        // 1a. Stationary Scrub (velocity = 0.0): Smooth taper attenuates completely to 0
+        streamer.render(out_l.data(), out_r.data(), 128, 48000, 120.0, false, 0.0, true, 0.0);
+        float rms_zero = 0.0f;
+        for (size_t i = 0; i < 128; ++i) {
+            rms_zero += out_l[i] * out_l[i];
+        }
+        rms_zero = std::sqrt(rms_zero / 128.0f);
+        TEST_CHECK(rms_zero == 0.0f); // Velocity taper tanh(0) = 0.0 completely silent!
+
+        // 1b. Ultra-slow Micro-Creep (velocity = 0.015): Taper heavily attenuates to protect speakers
+        streamer.render(out_l.data(), out_r.data(), 128, 48000, 120.0, false, 0.0, true, 0.015);
+        float rms_creep = 0.0f;
+        for (size_t i = 0; i < 128; ++i) {
+            rms_creep += out_l[i] * out_l[i];
+        }
+        rms_creep = std::sqrt(rms_creep / 128.0f);
+        TEST_CHECK(rms_creep > 0.0f && rms_creep < 0.20f); // Significantly attenuated
+
+        // 1c. Active Scrub (velocity = 1.0): Clearly audible, single-pole DC blocker eliminates DC bias
+        // Render 10 blocks to let DC blocker filter settle (R = 0.995 => ~25 Hz cutoff)
+        float sum_val = 0.0f;
+        float rms_active = 0.0f;
+        for (int b = 0; b < 10; ++b) {
+            streamer.render(out_l.data(), out_r.data(), 128, 48000, 120.0, false, 0.0, true, 1.0);
+        }
+        for (size_t i = 0; i < 128; ++i) {
+            sum_val += out_l[i];
+            rms_active += out_l[i] * out_l[i];
+        }
+        float mean_dc = sum_val / 128.0f;
+        rms_active = std::sqrt(rms_active / 128.0f);
+
+        TEST_CHECK(rms_active > 0.15f); // Clearly audible audio
+        TEST_CHECK(std::abs(mean_dc) < 0.05f); // DC offset 0.50 is stripped to < 0.05!
+
+        // 1d. Reset clears filter state cleanly
+        streamer.reset();
+        streamer.render(out_l.data(), out_r.data(), 128, 48000, 120.0, false, 0.0, true, 0.0);
+        TEST_CHECK(out_l[0] == 0.0f && out_r[0] == 0.0f);
+
+        std::cout << "  -> Granular Micro-Windowed Scrubbing & DC-Blocker Attenuation: PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part 2: ALSA Hardware Loopback Stress & Concurrent Audio Engine Render
+    // ========================================================================
+    {
+        HardwareMidiReceiver rx(16384);
+        bool seq_ok = rx.open_alsa_sequencer("Aethel Test 78", "Stress RX In");
+
+        if (seq_ok && rx.has_alsa_seq()) {
+            int tx_fd = ::open("/dev/snd/seq", O_RDWR | O_CLOEXEC);
+            TEST_CHECK(tx_fd >= 0);
+
+            int tx_client = -1;
+            TEST_CHECK(ioctl(tx_fd, SNDRV_SEQ_IOCTL_CLIENT_ID, &tx_client) >= 0);
+
+            struct snd_seq_port_info p_info{};
+            p_info.addr.client = static_cast<unsigned char>(tx_client);
+            p_info.capability = SNDRV_SEQ_PORT_CAP_WRITE | SNDRV_SEQ_PORT_CAP_SUBS_WRITE | SNDRV_SEQ_PORT_CAP_READ;
+            p_info.type = SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC | SNDRV_SEQ_PORT_TYPE_APPLICATION;
+            std::strncpy(p_info.name, "Test 78 TX", sizeof(p_info.name) - 1);
+            TEST_CHECK(ioctl(tx_fd, SNDRV_SEQ_IOCTL_CREATE_PORT, &p_info) >= 0);
+            int tx_port = p_info.addr.port;
+
+            struct snd_seq_client_pool pool{};
+            pool.client = tx_client;
+            if (ioctl(tx_fd, SNDRV_SEQ_IOCTL_GET_CLIENT_POOL, &pool) >= 0) {
+                pool.output_pool = 2000;
+                pool.input_pool = 2000;
+                pool.output_room = 1;
+                (void)ioctl(tx_fd, SNDRV_SEQ_IOCTL_SET_CLIENT_POOL, &pool);
+            }
+
+            // Configure audio engine with PolySynth + ModulationMatrix
+            MixerGraph mixer(128, false, 48000);
+            mixer.clock().set_bpm(130.0);
+            mixer.clock().set_playing(true);
+
+            modulation::ModulationMatrix matrix;
+            matrix.init(48000);
+            matrix.poly_synth().set_polyphony_limit(16);
+            matrix.poly_synth().set_osc1_waveform(dsp::Waveform::Saw);
+            matrix.poly_synth().set_osc2_waveform(dsp::Waveform::Square);
+
+            auto trk = mixer.add_track("Synth Track");
+            trk->set_input_mode(TrackInputMode::PolySynth);
+            trk->set_poly_synth(&matrix.poly_synth(), &matrix);
+
+            // Connect destination: prefer 14:0 if subscribed, else direct
+            unsigned char dst_client = rx.is_subscribed(14, 0) ? 14 : static_cast<unsigned char>(rx.seq_client_id());
+            unsigned char dst_port = rx.is_subscribed(14, 0) ? 0 : static_cast<unsigned char>(rx.seq_port_id());
+
+            constexpr uint32_t kStressEvents = 10000;
+            constexpr uint32_t kBatchSize = 250;
+            const uint32_t num_batches = kStressEvents / kBatchSize;
+
+            std::atomic<bool> tx_done{false};
+            std::atomic<uint32_t> total_sent{0};
+
+            // Spawn transmitter thread to blast 10,000 events
+            std::thread tx_thread([&]() {
+                std::vector<struct snd_seq_event> batch(kBatchSize);
+                for (uint32_t b = 0; b < num_batches; ++b) {
+                    for (uint32_t i = 0; i < kBatchSize; ++i) {
+                        uint32_t ev_idx = b * kBatchSize + i;
+                        auto& ev = batch[i];
+                        ev = {};
+                        ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+                        ev.source.client = static_cast<unsigned char>(tx_client);
+                        ev.source.port = static_cast<unsigned char>(tx_port);
+                        ev.dest.client = dst_client;
+                        ev.dest.port = dst_port;
+
+                        uint32_t pat = ev_idx % 8;
+                        switch (pat) {
+                            case 0:
+                            case 1:
+                                ev.type = SNDRV_SEQ_EVENT_NOTEON;
+                                ev.data.note.channel = ev_idx % 4;
+                                ev.data.note.note = 36 + ((ev_idx * 7) % 52);
+                                ev.data.note.velocity = 70 + (ev_idx % 50);
+                                break;
+                            case 2:
+                                ev.type = SNDRV_SEQ_EVENT_NOTEOFF;
+                                ev.data.note.channel = ev_idx % 4;
+                                ev.data.note.note = 36 + (((ev_idx - 2) * 7) % 52);
+                                ev.data.note.velocity = 0;
+                                break;
+                            case 3:
+                                ev.type = SNDRV_SEQ_EVENT_PITCHBEND;
+                                ev.data.control.channel = ev_idx % 4;
+                                ev.data.control.value = static_cast<int>(8191.0 * std::sin(static_cast<double>(ev_idx) * 0.1));
+                                break;
+                            case 4:
+                                ev.type = SNDRV_SEQ_EVENT_CONTROLLER;
+                                ev.data.control.channel = ev_idx % 4;
+                                ev.data.control.param = 1; // Mod wheel
+                                ev.data.control.value = static_cast<int>(64.0 + 63.0 * std::sin(static_cast<double>(ev_idx) * 0.05));
+                                break;
+                            case 5:
+                                ev.type = SNDRV_SEQ_EVENT_CONTROLLER;
+                                ev.data.control.channel = ev_idx % 4;
+                                ev.data.control.param = 74; // Filter Cutoff
+                                ev.data.control.value = static_cast<int>(64.0 + 63.0 * std::cos(static_cast<double>(ev_idx) * 0.05));
+                                break;
+                            case 6:
+                                ev.type = SNDRV_SEQ_EVENT_CLOCK;
+                                break;
+                            case 7:
+                                ev.type = SNDRV_SEQ_EVENT_QFRAME;
+                                ev.data.control.value = (ev_idx % 8) << 4;
+                                break;
+                        }
+                    }
+
+                    size_t bytes_to_write = kBatchSize * sizeof(struct snd_seq_event);
+                    size_t written = 0;
+                    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(batch.data());
+                    while (written < bytes_to_write) {
+                        ssize_t w = ::write(tx_fd, ptr + written, bytes_to_write - written);
+                        if (w > 0) {
+                            written += w;
+                        } else if (errno == EAGAIN || errno == ENOSPC) {
+                            std::this_thread::yield();
+                        } else {
+                            break;
+                        }
+                    }
+                    total_sent.fetch_add(kBatchSize, std::memory_order_relaxed);
+                    std::this_thread::sleep_for(std::chrono::microseconds(2500));
+                }
+                tx_done.store(true, std::memory_order_release);
+            });
+
+            // Concurrently render audio blocks in the main thread
+            AudioBuffer master_buf(2, 128);
+            auto master_view = master_buf.view();
+            uint64_t total_drained = 0;
+            float max_synth_rms = 0.0f;
+            bool no_nan_or_inf = true;
+
+            while (!tx_done.load(std::memory_order_acquire) || rx.event_count() < kStressEvents) {
+                total_drained += rx.drain_to(matrix);
+                mixer.render(master_view);
+
+                float block_rms = 0.0f;
+                for (uint32_t f = 0; f < 128; ++f) {
+                    float l = master_view.channel(0)[f];
+                    float r = master_view.channel(1)[f];
+                    if (std::isnan(l) || std::isnan(r) || std::isinf(l) || std::isinf(r)) {
+                        no_nan_or_inf = false;
+                    }
+                    block_rms += l * l + r * r;
+                }
+                block_rms = std::sqrt(block_rms / 256.0f);
+                if (block_rms > max_synth_rms) max_synth_rms = block_rms;
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+
+            tx_thread.join();
+            total_drained += rx.drain_to(matrix);
+
+            TEST_CHECK(rx.event_count() == kStressEvents);
+            TEST_CHECK(rx.dropped_events() == 0);
+            TEST_CHECK(total_drained > 0);
+            TEST_CHECK(max_synth_rms > 0.01f);
+            TEST_CHECK(no_nan_or_inf);
+
+            std::cout << "  -> ALSA Hardware Loopback Stress (10,000 events @ 100% reception, 0 drops, Max RMS="
+                      << max_synth_rms << "): PASSED" << std::endl;
+
+            ::close(tx_fd);
+        } else {
+            std::cout << "  -> ALSA Hardware Loopback: Skipped (no /dev/snd/seq access)" << std::endl;
+        }
+    }
+
+    std::cout << "  -> ALSA Hardware Loopback Stress & Scrub Attenuation: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -11164,7 +11412,7 @@ int main() {
     test_midi_sync_beat_clock_spp_and_mtc_timecode();
     test_master_clock_and_mtc_generator();
     test_timeline_scrubbing_and_mtc_full_frame_broadcast();
-
+    test_alsa_hardware_loopback_stress_and_scrub_attenuation();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

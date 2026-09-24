@@ -139,6 +139,12 @@ add_executable(webmixer_daemon
 )
 target_link_libraries(webmixer_daemon PRIVATE audio_core)
 
+# ALSA Hardware Loopback & Real-Time Engine Stress Benchmark
+add_executable(alsa_hardware_stress_bench
+    examples/alsa_hardware_stress_bench.cpp
+)
+target_link_libraries(alsa_hardware_stress_bench PRIVATE audio_core)
+
 # ============================================================================
 # Dear ImGui & Desktop UI Workstation (aethel_desk)
 # ============================================================================
