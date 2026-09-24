@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -32,15 +32,34 @@
   </script>
   <style>
     :root {
+      --bg-primary: #f8f8f6;
+      --bg-secondary: #f0f0ec;
+      --bg-card: #ffffff;
+      --border-hairline: #e2e2dc;
+      --border-strong: #1a1a1a;
+      --text-primary: #121212;
+      --text-secondary: #5a5a54;
+      --text-muted: #8c8c82;
+      --code-bg: #ecece6;
+      --scope-bg: #f4f4ee;
+    }
+    .dark {
       --bg-primary: #0a0a0c;
-      --bg-card: #121216;
+      --bg-secondary: #121216;
+      --bg-card: #141418;
       --border-hairline: rgba(255, 255, 255, 0.08);
       --border-strong: rgba(255, 255, 255, 0.2);
+      --text-primary: #f3f4f6;
+      --text-secondary: #9ca3af;
+      --text-muted: #6b7280;
+      --code-bg: rgba(0, 0, 0, 0.7);
+      --scope-bg: rgba(0, 0, 0, 0.6);
     }
     body {
       background-color: var(--bg-primary);
-      color: #f3f4f6;
+      color: var(--text-primary);
       font-family: 'Space Grotesk', sans-serif;
+      transition: background-color 0.2s ease, color 0.2s ease;
     }
     .font-mono-tech {
       font-family: 'JetBrains Mono', monospace;
@@ -52,7 +71,7 @@
   <!-- 01 // Header -->
   <header class="w-full px-6 py-4 border-b border-[var(--border-hairline)] bg-[var(--bg-card)]/80 backdrop-blur-md flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
     <div class="flex items-center gap-3.5">
-      <div class="w-8 h-8 rounded border border-[var(--border-strong)] bg-black/40 flex items-center justify-center p-1.5 shadow-sm text-rose-500">
+      <div class="w-8 h-8 rounded border border-[var(--border-strong)] bg-[var(--bg-secondary)] flex items-center justify-center p-1.5 shadow-sm text-rose-500">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" class="w-full h-full" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2 12h20" stroke-width="0.75" stroke-dasharray="2 2" stroke-opacity="0.5"/>
           <path d="M2 12c2.5-8 4-8 6.5 0s4 8 6.5 0c2-5 3.5-5 5 0" stroke-width="1.75"/>
@@ -62,29 +81,32 @@
       </div>
       <div>
         <div class="flex items-baseline gap-2">
-          <span class="font-bold tracking-tight text-sm text-white uppercase">AETHELBURG // AUDIO CORE</span>
+          <span class="font-bold tracking-tight text-sm text-[var(--text-primary)] uppercase">AETHELBURG // AUDIO CORE</span>
           <span class="text-[10px] font-mono-tech text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded border border-rose-500/20">C++20 WASM</span>
         </div>
-        <div class="text-[10px] font-mono-tech text-gray-400 mt-0.5">
+        <div class="text-[10px] font-mono-tech text-[var(--text-secondary)] mt-0.5">
           Zero Heap Allocations in Render Loop // Real-Time Audio DSP
         </div>
       </div>
     </div>
 
     <!-- Live Status HUD -->
-    <div class="flex items-center gap-3 font-mono-tech text-xs text-gray-300">
+    <div class="flex items-center gap-3 font-mono-tech text-xs text-[var(--text-secondary)]">
       <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" id="engine-status-dot"></span>
       <span id="engine-status-text">WASM READY // AUDIO STANDBY</span>
-      <span class="text-gray-500 hidden sm:inline">|</span>
-      <span class="text-gray-400 text-[11px] hidden sm:inline" id="sr-readout">SR: 48000 Hz</span>
+      <span class="text-[var(--text-muted)] hidden sm:inline">|</span>
+      <span class="text-[var(--text-secondary)] text-[11px] hidden sm:inline" id="sr-readout">SR: 48000 Hz</span>
     </div>
 
     <!-- Navigation Links -->
     <div class="flex items-center gap-3 font-mono-tech text-xs">
-      <a href="https://github.com/aethelnet/audio-engine-core" target="_blank" rel="noreferrer" class="px-3 py-1.5 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 hover:text-white transition-all">
+      <button id="theme-toggle-btn" class="px-3 py-1.5 rounded border border-[var(--border-hairline)] hover:border-[var(--text-primary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] font-mono-tech text-xs transition-all flex items-center gap-1.5 cursor-pointer">
+        <span id="theme-mode-label">THEME: LIGHT</span>
+      </button>
+      <a href="https://github.com/aethelnet/audio-engine-core" target="_blank" rel="noreferrer" class="px-3 py-1.5 rounded border border-[var(--border-hairline)] hover:border-[var(--text-primary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-all">
         GITHUB REPO ↗
       </a>
-      <a href="https://aethelburg.info" class="px-3 py-1.5 rounded bg-white text-black font-bold hover:bg-gray-200 transition-all">
+      <a href="https://aethelburg.info" class="px-3 py-1.5 rounded bg-[var(--text-primary)] text-[var(--bg-primary)] font-bold hover:opacity-90 transition-all">
         PORTFOLIO ↗
       </a>
     </div>
@@ -96,10 +118,10 @@
     <!-- Hero Box & Master Action -->
     <div class="p-6 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] flex flex-col md:flex-row items-start md:items-center justify-between gap-6 shadow-xl">
       <div class="space-y-1.5 max-w-2xl">
-        <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-white">
+        <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-[var(--text-primary)]">
           Kompilierte C++20 Audio-Engine im Web-Browser
         </h1>
-        <p class="text-xs sm:text-sm text-gray-400 leading-relaxed">
+        <p class="text-xs sm:text-sm text-[var(--text-secondary)] leading-relaxed">
           Alle Audiosignale auf dieser Seite werden nicht in JavaScript berechnet, sondern laufen bit-exakt durch die nativen C++20 Airwindows-DSPs (PurestDrive, Baxandall-EQ, ButterComp2, ClipOnly2), kompiliert zu WebAssembly mit 0 Heap-Allokationen im Audio-Thread.
         </p>
       </div>
@@ -116,19 +138,19 @@
     <div class="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] p-4 sm:p-6 space-y-4 shadow-xl">
       <div class="flex items-center justify-between text-xs font-mono-tech">
         <div class="flex items-center gap-2">
-          <span class="font-bold text-white uppercase tracking-wider">// ECHTZEIT-OSZILLOSKOP</span>
-          <span class="text-[10px] text-gray-500">[WASM HEAP READOUT]</span>
+          <span class="font-bold text-[var(--text-primary)] uppercase tracking-wider">// ECHTZEIT-OSZILLOSKOP</span>
+          <span class="text-[10px] text-[var(--text-muted)]">[WASM HEAP READOUT]</span>
         </div>
-        <div class="flex items-center gap-4 text-[11px] text-gray-400">
+        <div class="flex items-center gap-4 text-[11px] text-[var(--text-secondary)]">
           <span>L: <strong id="peak-l-val" class="text-rose-400 font-mono">-∞ dB</strong></span>
           <span>R: <strong id="peak-r-val" class="text-rose-400 font-mono">-∞ dB</strong></span>
         </div>
       </div>
 
       <!-- Oscilloscope Canvas -->
-      <div class="relative w-full h-44 sm:h-56 bg-black/60 rounded border border-[var(--border-hairline)] overflow-hidden">
+      <div class="relative w-full h-44 sm:h-56 bg-[var(--scope-bg)] rounded border border-[var(--border-hairline)] overflow-hidden">
         <canvas id="scope-canvas" class="w-full h-full block"></canvas>
-        <div class="pointer-events-none absolute top-2 right-3 font-mono-tech text-[10px] text-gray-500">
+        <div class="pointer-events-none absolute top-2 right-3 font-mono-tech text-[10px] text-[var(--text-muted)]">
           TIME DOMAIN // 512 SAMPLES PER BLOCK
         </div>
       </div>
@@ -140,21 +162,21 @@
       <!-- Module 1: Synthesizer Source -->
       <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
         <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
-          <span class="font-bold text-white">01 // SIGNAL SOURCE</span>
+          <span class="font-bold text-[var(--text-primary)]">01 // SIGNAL SOURCE</span>
           <span class="text-[10px] text-rose-400">OSCILLATOR</span>
         </div>
         <div>
-          <label class="block text-[10px] text-gray-400 mb-1">WAVEFORM:</label>
+          <label class="block text-[10px] text-[var(--text-secondary)] mb-1">WAVEFORM:</label>
           <div class="grid grid-cols-3 gap-1">
-            <button class="wave-btn active px-2 py-1 rounded bg-rose-500 text-white font-bold text-[10px]" data-wave="0">SAW</button>
-            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 text-[10px]" data-wave="1">SQR</button>
-            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 text-[10px]" data-wave="2">SIN</button>
+            <button class="wave-btn active px-2 py-1 rounded bg-rose-500 text-[var(--text-primary)] font-bold text-[10px]" data-wave="0">SAW</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-[var(--text-secondary)] text-[10px]" data-wave="1">SQR</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-[var(--text-secondary)] text-[10px]" data-wave="2">SIN</button>
           </div>
         </div>
         <div>
-          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
             <span>FREQUENCY</span>
-            <span id="freq-val" class="text-white font-bold">110 Hz (A2)</span>
+            <span id="freq-val" class="text-[var(--text-primary)] font-bold">110 Hz (A2)</span>
           </div>
           <input type="range" id="slider-freq" min="55" max="880" step="1" value="110" class="w-full accent-rose-500 cursor-pointer" />
         </div>
@@ -163,17 +185,17 @@
       <!-- Module 2: Airwindows PurestDrive -->
       <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
         <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
-          <span class="font-bold text-white">02 // PURESTDRIVE</span>
+          <span class="font-bold text-[var(--text-primary)]">02 // PURESTDRIVE</span>
           <span class="text-[10px] text-amber-400">HARMONICS</span>
         </div>
         <div>
-          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
             <span>DRIVE AMOUNT</span>
-            <span id="drive-val" class="text-white font-bold">40%</span>
+            <span id="drive-val" class="text-[var(--text-primary)] font-bold">40%</span>
           </div>
           <input type="range" id="slider-drive" min="0" max="1" step="0.01" value="0.4" class="w-full accent-amber-500 cursor-pointer" />
         </div>
-        <p class="text-[10px] text-gray-500 leading-normal">
+        <p class="text-[10px] text-[var(--text-muted)] leading-normal">
           Airwindows Frequenz-Auslöschung sättigt Bässe, hält Höhen transparent.
         </p>
       </div>
@@ -181,20 +203,20 @@
       <!-- Module 3: Airwindows Baxandall EQ -->
       <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
         <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
-          <span class="font-bold text-white">03 // BAXANDALL EQ</span>
+          <span class="font-bold text-[var(--text-primary)]">03 // BAXANDALL EQ</span>
           <span class="text-[10px] text-cyan-400">SHELVING</span>
         </div>
         <div>
-          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
             <span>BASS GAIN</span>
-            <span id="bass-val" class="text-white font-bold">+3.0 dB</span>
+            <span id="bass-val" class="text-[var(--text-primary)] font-bold">+3.0 dB</span>
           </div>
           <input type="range" id="slider-bass" min="-15" max="15" step="0.5" value="3.0" class="w-full accent-cyan-500 cursor-pointer" />
         </div>
         <div>
-          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
             <span>TREBLE GAIN</span>
-            <span id="treble-val" class="text-white font-bold">+1.5 dB</span>
+            <span id="treble-val" class="text-[var(--text-primary)] font-bold">+1.5 dB</span>
           </div>
           <input type="range" id="slider-treble" min="-15" max="15" step="0.5" value="1.5" class="w-full accent-cyan-500 cursor-pointer" />
         </div>
@@ -203,13 +225,13 @@
       <!-- Module 4: ButterComp2 & ClipOnly2 -->
       <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
         <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
-          <span class="font-bold text-white">04 // DYNAMICS</span>
+          <span class="font-bold text-[var(--text-primary)]">04 // DYNAMICS</span>
           <span class="text-[10px] text-purple-400">COMP &amp; LIMIT</span>
         </div>
         <div>
-          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
             <span>BUTTERCOMP2</span>
-            <span id="comp-val" class="text-white font-bold">35%</span>
+            <span id="comp-val" class="text-[var(--text-primary)] font-bold">35%</span>
           </div>
           <input type="range" id="slider-comp" min="0" max="1" step="0.01" value="0.35" class="w-full accent-purple-500 cursor-pointer" />
         </div>
@@ -226,8 +248,8 @@
     <div class="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] p-6 space-y-4 shadow-xl">
       <div class="flex items-center justify-between border-b border-[var(--border-hairline)] pb-3 font-mono-tech text-xs">
         <div class="flex items-center gap-2">
-          <span class="font-bold text-white uppercase tracking-wider">// 05 SIGNALFLOW &amp; ECHTZEIT-PIPELINE</span>
-          <span class="text-[10px] text-gray-500">[DETERMINISTISCHE AUDIT-SERIE]</span>
+          <span class="font-bold text-[var(--text-primary)] uppercase tracking-wider">// 05 SIGNALFLOW &amp; ECHTZEIT-PIPELINE</span>
+          <span class="text-[10px] text-[var(--text-muted)]">[DETERMINISTISCHE AUDIT-SERIE]</span>
         </div>
         <span class="text-[10px] text-rose-400 font-mono-tech">PDC LATENZ: 0 SAMPLES OVERHEAD</span>
       </div>
@@ -235,41 +257,41 @@
       <!-- Flow Chart Diagram -->
       <div class="grid grid-cols-1 md:grid-cols-5 gap-3 font-mono-tech text-[11px]">
         <div class="p-3 rounded border border-[var(--border-hairline)] bg-[var(--bg-primary)] space-y-1.5">
-          <div class="text-[10px] text-gray-500 uppercase tracking-wider">STAGE 01 // SOURCE</div>
-          <div class="font-bold text-white">Oszillator / Buffer</div>
-          <div class="text-[10px] text-gray-400 leading-normal">
+          <div class="text-[10px] text-[var(--text-muted)] uppercase tracking-wider">STAGE 01 // SOURCE</div>
+          <div class="font-bold text-[var(--text-primary)]">Oszillator / Buffer</div>
+          <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
             Phasen-akkumulierter Synthesizer oder SPSC-Ringpuffer-Stream. 0.0 ms RAM-Pre-Roll.
           </div>
         </div>
 
         <div class="p-3 rounded border border-rose-500/30 bg-rose-500/5 space-y-1.5">
           <div class="text-[10px] text-rose-400 uppercase tracking-wider">STAGE 02 // SATURATION</div>
-          <div class="font-bold text-white">PurestDrive</div>
-          <div class="text-[10px] text-gray-400 leading-normal">
+          <div class="font-bold text-[var(--text-primary)]">PurestDrive</div>
+          <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
             Phasen-kohärente harmonische Obertöne. Dynamische Auslöschung bei Hochfrequenzen.
           </div>
         </div>
 
         <div class="p-3 rounded border border-cyan-500/30 bg-cyan-500/5 space-y-1.5">
           <div class="text-[10px] text-cyan-400 uppercase tracking-wider">STAGE 03 // EQUALIZATION</div>
-          <div class="font-bold text-white">Baxandall EQ</div>
-          <div class="text-[10px] text-gray-400 leading-normal">
+          <div class="font-bold text-[var(--text-primary)]">Baxandall EQ</div>
+          <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
             150 Hz &amp; 8 kHz Biquads in nichtlinearer Console-Trägerwelle (sin -> Biquad -> asin).
           </div>
         </div>
 
         <div class="p-3 rounded border border-purple-500/30 bg-purple-500/5 space-y-1.5">
           <div class="text-[10px] text-purple-400 uppercase tracking-wider">STAGE 04 // DYNAMICS</div>
-          <div class="font-bold text-white">ButterComp2</div>
-          <div class="text-[10px] text-gray-400 leading-normal">
+          <div class="font-bold text-[var(--text-primary)]">ButterComp2</div>
+          <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
             Quad-interleaved bipolare RMS-Glättung. Beseitigt Bass-Pumping vollständig.
           </div>
         </div>
 
         <div class="p-3 rounded border border-emerald-500/30 bg-emerald-500/5 space-y-1.5">
           <div class="text-[10px] text-emerald-400 uppercase tracking-wider">STAGE 05 // LIMITER</div>
-          <div class="font-bold text-white">ClipOnly2</div>
-          <div class="text-[10px] text-gray-400 leading-normal">
+          <div class="font-bold text-[var(--text-primary)]">ClipOnly2</div>
+          <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
             2nd-Order Polynom-Slew-Rounder. Null Latenz, keine Inter-Sample-Clipping-Kanten.
           </div>
         </div>
@@ -281,32 +303,32 @@
       
       <div class="p-5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-2.5 shadow-lg">
         <div class="text-[10px] text-emerald-400 uppercase tracking-wider">// INVARIANT I</div>
-        <div class="font-bold text-white text-sm">Zero Heap Allocations</div>
-        <p class="text-gray-400 text-[11px] leading-relaxed">
+        <div class="font-bold text-[var(--text-primary)] text-sm">Zero Heap Allocations</div>
+        <p class="text-[var(--text-secondary)] text-[11px] leading-relaxed">
           Strikte Allokationsfreiheit im Audio-Render-Thread. Keine dynamischen <code class="text-gray-200">malloc</code>-, <code class="text-gray-200">new</code>- oder STL-Reallokationen. Deterministische O(1) Laufzeit ohne GC-Stottern.
         </p>
       </div>
 
       <div class="p-5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-2.5 shadow-lg">
         <div class="text-[10px] text-cyan-400 uppercase tracking-wider">// INVARIANT II</div>
-        <div class="font-bold text-white text-sm">Lock-Free SPSC Queues</div>
-        <p class="text-gray-400 text-[11px] leading-relaxed">
+        <div class="font-bold text-[var(--text-primary)] text-sm">Lock-Free SPSC Queues</div>
+        <p class="text-[var(--text-secondary)] text-[11px] leading-relaxed">
           Thread-Kommunikation zwischen UI und Audio-Callback erfolgt über atomare Ringpuffer mit <code class="text-gray-200">memory_order_acquire/release</code>. Null blockierende Mutexes, keine Priority Inversion.
         </p>
       </div>
 
       <div class="p-5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-2.5 shadow-lg">
         <div class="text-[10px] text-amber-400 uppercase tracking-wider">// INVARIANT III</div>
-        <div class="font-bold text-white text-sm">Plugin Delay Compensation</div>
-        <p class="text-gray-400 text-[11px] leading-relaxed">
+        <div class="font-bold text-[var(--text-primary)] text-sm">Plugin Delay Compensation</div>
+        <p class="text-[var(--text-secondary)] text-[11px] leading-relaxed">
           Sample-genaue PDC gleicht Latenzen asymmetrischer Plugin-Ketten im Routing-Graphen über zirkuläre Ringpuffer-Verzögerungsleitungen bit-exakt aus. Vollständige Vermeidung von Kammfilter-Phasenauslöschungen.
         </p>
       </div>
 
       <div class="p-5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-2.5 shadow-lg">
         <div class="text-[10px] text-purple-400 uppercase tracking-wider">// INVARIANT IV</div>
-        <div class="font-bold text-white text-sm">Sample-Accurate Ramping</div>
-        <p class="text-gray-400 text-[11px] leading-relaxed">
+        <div class="font-bold text-[var(--text-primary)] text-sm">Sample-Accurate Ramping</div>
+        <p class="text-[var(--text-secondary)] text-[11px] leading-relaxed">
           Kontinuierliche Vektor-Interpolation (FMA) für alle Gain-, Filter- und Plugin-Parameter. Verhindert Reißverschluss-Rauschen und Phasensprünge bei dynamischen Regler-Bewegungen.
         </p>
       </div>
@@ -317,47 +339,47 @@
     <div class="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] p-6 space-y-4 shadow-xl font-mono-tech text-xs">
       <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 border-b border-[var(--border-hairline)] pb-3">
         <div class="flex items-center gap-2">
-          <span class="font-bold text-white uppercase tracking-wider">// 07 DETERMINISTISCHE VERIFIKATION</span>
+          <span class="font-bold text-[var(--text-primary)] uppercase tracking-wider">// 07 DETERMINISTISCHE VERIFIKATION</span>
           <span class="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">80 / 80 CTESTS PASSED (100%)</span>
         </div>
-        <span class="text-[10px] text-gray-500">CMAKE TEST SUITE // GOLDEN MASTER FNV-1a &amp; SHA-256</span>
+        <span class="text-[10px] text-[var(--text-muted)]">CMAKE TEST SUITE // GOLDEN MASTER FNV-1a &amp; SHA-256</span>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-[11px]">
         <div class="space-y-2">
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">PurestDrive Nichtlineare Obertöne</span>
+            <span class="text-[var(--text-secondary)]">PurestDrive Nichtlineare Obertöne</span>
             <span class="text-emerald-400 font-bold">PASS // 0 NaNs</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">Baxandall Console-5 Carrier (+12dB Low-Shelf)</span>
+            <span class="text-[var(--text-secondary)]">Baxandall Console-5 Carrier (+12dB Low-Shelf)</span>
             <span class="text-emerald-400 font-bold">PASS // Bounded</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">ButterComp2 Interleaved RMS Leveling</span>
+            <span class="text-[var(--text-secondary)]">ButterComp2 Interleaved RMS Leveling</span>
             <span class="text-emerald-400 font-bold">PASS // Peak &lt; 1.2</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">ClipOnly2 Zero-Latency Slew Rounder</span>
+            <span class="text-[var(--text-secondary)]">ClipOnly2 Zero-Latency Slew Rounder</span>
             <span class="text-emerald-400 font-bold">PASS // Bounded [-1, 1]</span>
           </div>
         </div>
 
         <div class="space-y-2">
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">PDC Ringbuffer Phase Alignment (48 Samples)</span>
+            <span class="text-[var(--text-secondary)]">PDC Ringbuffer Phase Alignment (48 Samples)</span>
             <span class="text-emerald-400 font-bold">PASS // Bit-Exakt</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">Asynchroner Disk-Streamer (64k Pre-Roll)</span>
+            <span class="text-[var(--text-secondary)]">Asynchroner Disk-Streamer (64k Pre-Roll)</span>
             <span class="text-emerald-400 font-bold">PASS // 0.0 ms Latenz</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">LR4 Linkwitz-Riley 4-Way Crossover Filter</span>
+            <span class="text-[var(--text-secondary)]">LR4 Linkwitz-Riley 4-Way Crossover Filter</span>
             <span class="text-emerald-400 font-bold">PASS // Flat Sum</span>
           </div>
           <div class="flex justify-between items-center p-2 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)]">
-            <span class="text-gray-300">Kryptographische Signalpfad-Prüfsummen</span>
+            <span class="text-[var(--text-secondary)]">Kryptographische Signalpfad-Prüfsummen</span>
             <span class="text-emerald-400 font-bold">PASS // 10/10 Pipelines</span>
           </div>
         </div>
@@ -367,15 +389,15 @@
     <!-- 08 // Open-Source Toolchain & Developer Integration -->
     <div class="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] p-6 space-y-4 shadow-xl font-mono-tech text-xs">
       <div class="flex items-center justify-between border-b border-[var(--border-hairline)] pb-3">
-        <span class="font-bold text-white uppercase tracking-wider">// 08 BUILD-TOOLCHAIN &amp; INTEGRATION</span>
-        <span class="text-[10px] text-gray-500">STANDALONE DAEMON // VST3 // WEBASSEMBLY</span>
+        <span class="font-bold text-[var(--text-primary)] uppercase tracking-wider">// 08 BUILD-TOOLCHAIN &amp; INTEGRATION</span>
+        <span class="text-[10px] text-[var(--text-muted)]">STANDALONE DAEMON // VST3 // WEBASSEMBLY</span>
       </div>
 
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <!-- Terminal command box -->
-        <div class="lg:col-span-2 p-4 rounded bg-black/80 border border-[var(--border-hairline)] space-y-2 text-[11px]">
-          <div class="text-[10px] text-gray-500">// Lokale Kompilierung &amp; Testsuite ausführen:</div>
-          <pre class="text-gray-300 overflow-x-auto leading-relaxed"><code><span class="text-rose-400">git clone</span> https://github.com/aethelnet/audio-engine-core.git
+        <div class="lg:col-span-2 p-4 rounded bg-[var(--code-bg)] border border-[var(--border-hairline)] space-y-2 text-[11px]">
+          <div class="text-[10px] text-[var(--text-muted)]">// Lokale Kompilierung &amp; Testsuite ausführen:</div>
+          <pre class="text-[var(--text-secondary)] overflow-x-auto leading-relaxed"><code><span class="text-rose-400">git clone</span> https://github.com/aethelnet/audio-engine-core.git
 <span class="text-rose-400">cd</span> audio-engine-core
 <span class="text-rose-400">cmake</span> -B build -DCMAKE_BUILD_TYPE=Release -DAUDIO_BUILD_TESTS=ON
 <span class="text-rose-400">cmake</span> --build build -j$(nproc)
@@ -385,17 +407,17 @@
         <!-- Action Card -->
         <div class="p-4 rounded bg-[var(--bg-primary)] border border-[var(--border-hairline)] flex flex-col justify-between space-y-3">
           <div class="space-y-1">
-            <div class="font-bold text-white text-xs">Open-Source C++20 Core</div>
-            <div class="text-[10px] text-gray-400 leading-normal">
+            <div class="font-bold text-[var(--text-primary)] text-xs">Open-Source C++20 Core</div>
+            <div class="text-[10px] text-[var(--text-secondary)] leading-normal">
               Vollständiger Quelltext auf GitHub lizenziert unter MIT. Einschließlich ALSA-, Jack- und PipeWire-Audiotreibern.
             </div>
           </div>
           <div class="space-y-2">
-            <a href="https://github.com/aethelnet/audio-engine-core" target="_blank" rel="noreferrer" class="w-full py-2.5 px-3 rounded bg-rose-500 hover:bg-rose-400 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition-all shadow-md">
+            <a href="https://github.com/aethelnet/audio-engine-core" target="_blank" rel="noreferrer" class="w-full py-2.5 px-3 rounded bg-rose-500 hover:bg-rose-400 text-[var(--text-primary)] font-bold text-xs flex items-center justify-center gap-1.5 transition-all shadow-md">
               <span>C++ GITHUB REPO ÖFFNEN</span>
               <span>↗</span>
             </a>
-            <a href="https://aethelburg.info" class="w-full py-2 px-3 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 hover:text-white text-xs flex items-center justify-center gap-1.5 transition-all text-center">
+            <a href="https://aethelburg.info" class="w-full py-2 px-3 rounded border border-[var(--border-hairline)] hover:border-white text-[var(--text-secondary)] hover:text-white text-xs flex items-center justify-center gap-1.5 transition-all text-center">
               <span>ZURÜCK ZUM PORTFOLIO</span>
               <span>↗</span>
             </a>
@@ -406,7 +428,7 @@
   </main>
 
   <!-- 03 // Footer -->
-  <footer class="w-full px-6 py-4 border-t border-[var(--border-hairline)] bg-[var(--bg-card)]/80 text-[10px] font-mono-tech text-gray-500 flex flex-wrap items-center justify-between gap-4">
+  <footer class="w-full px-6 py-4 border-t border-[var(--border-hairline)] bg-[var(--bg-card)]/80 text-[10px] font-mono-tech text-[var(--text-muted)] flex flex-wrap items-center justify-between gap-4">
     <div>
       AETHELBURG DSP LABS // C++20 GOLDEN-MASTER STANDARDS
     </div>
@@ -533,10 +555,10 @@
       btn.addEventListener('click', () => {
         document.querySelectorAll('.wave-btn').forEach(b => {
           b.classList.remove('active', 'bg-rose-500', 'text-white');
-          b.classList.add('border', 'border-[var(--border-hairline)]', 'text-gray-300');
+          b.classList.add('border', 'border-[var(--border-hairline)]', 'text-[var(--text-secondary)]');
         });
         btn.classList.add('active', 'bg-rose-500', 'text-white');
-        btn.classList.remove('border', 'border-[var(--border-hairline)]', 'text-gray-300');
+        btn.classList.remove('border', 'border-[var(--border-hairline)]', 'text-[var(--text-secondary)]');
         currentWave = parseInt(btn.getAttribute('data-wave'));
         if (wasmModule && isPlaying) {
           wasmModule._wasm_set_synth(1, parseFloat(document.getElementById('slider-freq').value), currentWave);
@@ -582,7 +604,7 @@
       if (limiterActive) {
         e.target.className = 'w-full py-1.5 px-3 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300 font-bold text-[10px] hover:bg-purple-500/30 transition-all';
       } else {
-        e.target.className = 'w-full py-1.5 px-3 rounded bg-gray-800 border border-gray-700 text-gray-400 font-bold text-[10px] hover:bg-gray-700 transition-all';
+        e.target.className = 'w-full py-1.5 px-3 rounded bg-gray-800 border border-gray-700 text-[var(--text-secondary)] font-bold text-[10px] hover:bg-gray-700 transition-all';
       }
       if (wasmModule) wasmModule._wasm_set_limiter(limiterActive ? 1 : 0);
     });
@@ -594,6 +616,29 @@
       document.getElementById('peak-r-val').textContent = dbR;
     }
 
+    // Theme Toggle Handler
+    const themeBtn = document.getElementById('theme-toggle-btn');
+    const themeLabel = document.getElementById('theme-mode-label');
+    const storedTheme = localStorage.getItem('aethelburg-theme') || 'light';
+
+    function applyTheme(theme) {
+      if (theme === 'dark') {
+        document.documentElement.classList.add('dark');
+        if (themeLabel) themeLabel.textContent = 'THEME: DARK';
+      } else {
+        document.documentElement.classList.remove('dark');
+        if (themeLabel) themeLabel.textContent = 'THEME: LIGHT';
+      }
+    }
+    applyTheme(storedTheme);
+
+    themeBtn?.addEventListener('click', () => {
+      const isDark = document.documentElement.classList.toggle('dark');
+      const newTheme = isDark ? 'dark' : 'light';
+      localStorage.setItem('aethelburg-theme', newTheme);
+      applyTheme(newTheme);
+    });
+
     // 4. Oscilloscope Canvas Animation
     function drawScope() {
       requestAnimationFrame(drawScope);
@@ -601,8 +646,13 @@
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
+      const isDark = document.documentElement.classList.contains('dark');
+      const gridColor = isDark ? 'rgba(255, 255, 255, 0.06)' : 'rgba(18, 18, 18, 0.08)';
+      const traceColor = isDark ? '#f43f5e' : '#e11d48';
+      const flatlineColor = isDark ? 'rgba(244, 63, 94, 0.3)' : 'rgba(225, 29, 72, 0.35)';
+
       // Grid
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.strokeStyle = gridColor;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, h / 2);
@@ -610,7 +660,7 @@
       ctx.stroke();
 
       if (!isPlaying) {
-        ctx.strokeStyle = 'rgba(244, 63, 94, 0.3)';
+        ctx.strokeStyle = flatlineColor;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(0, h / 2);
@@ -620,7 +670,7 @@
       }
 
       // Live Waveform trace straight from C++ memory
-      ctx.strokeStyle = '#f43f5e';
+      ctx.strokeStyle = traceColor;
       ctx.lineWidth = 2 * window.devicePixelRatio;
       ctx.beginPath();
 
