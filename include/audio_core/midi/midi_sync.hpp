@@ -444,6 +444,25 @@ public:
         m_current_tc = MtcTimecode{};
     }
 
+    // Re-aligns internal phase after discontinuous seek or timeline scrub
+    void align_to_sample_position(uint64_t sample_pos, const clock::TimelineClock& clock) noexcept {
+        const double spb = clock.samples_per_beat();
+        const double spc = spb / 24.0;
+        if (spc > 0.0) {
+            m_clock_phase = std::fmod(static_cast<double>(sample_pos), spc);
+        } else {
+            m_clock_phase = 0.0;
+        }
+
+        const auto rate = m_mtc_framerate.load(std::memory_order_relaxed);
+        const double sr = static_cast<double>(clock.sample_rate());
+        const double total_secs = static_cast<double>(sample_pos) / std::max(1.0, sr);
+        m_current_tc = MtcTimecode::from_seconds(total_secs, rate);
+        m_mtc_phase = 0.0;
+        m_mtc_piece = 0;
+    }
+
+
     void set_beat_clock_enabled(bool enabled) noexcept {
         m_beat_clock_enabled.store(enabled, std::memory_order_relaxed);
     }

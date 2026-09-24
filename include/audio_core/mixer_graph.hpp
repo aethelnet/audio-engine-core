@@ -611,7 +611,14 @@ public:
                 }
             } else if (m_clip) {
                 if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
-                    // Stopped transport: no clip addition
+                    if (clock.is_scrubbing()) {
+                        m_streamer.render(tmp_l, tmp_r, f_proc, clock);
+                        m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
+                        for (uint32_t f = 0; f < f_proc; ++f) {
+                            left[f] += tmp_l[f];
+                            right[f] += tmp_r[f];
+                        }
+                    }
                 } else {
                     m_streamer.render(tmp_l, tmp_r, f_proc, clock);
                     m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
@@ -636,13 +643,19 @@ public:
             m_sequencer->render(left, right, frames, clock, boundary_events);
         } else if (m_clip) {
             if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
-                std::memset(left, 0, frames * sizeof(Sample));
-                std::memset(right, 0, frames * sizeof(Sample));
+                if (clock.is_scrubbing()) {
+                    m_streamer.render(left, right, frames, clock);
+                    m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
+                } else {
+                    std::memset(left, 0, frames * sizeof(Sample));
+                    std::memset(right, 0, frames * sizeof(Sample));
+                }
             } else {
                 m_streamer.render(left, right, frames, clock);
                 m_clip_playhead.store(m_streamer.playhead(), std::memory_order_relaxed);
             }
         }
+
     }
 
     void render_input(uint32_t frames) noexcept {
@@ -1391,6 +1404,50 @@ public:
         }
         m_master_bus.reset_playback_state();
     }
+
+    // ========================================================================
+    // Unified Timeline Scrubbing & Seek Architecture
+    // ========================================================================
+    void seek(uint64_t target_sample, bool reset_dsp = false) noexcept {
+        m_clock.seek(target_sample);
+        for (auto& track : m_tracks) {
+            if (track) {
+                if (reset_dsp) {
+                    track->reset_playback_state(static_cast<double>(target_sample));
+                } else {
+                    track->set_clip_playhead(static_cast<double>(target_sample));
+                }
+            }
+        }
+    }
+
+    void start_scrub(uint64_t target_sample) noexcept {
+        m_clock.start_scrub(target_sample);
+        for (auto& track : m_tracks) {
+            if (track) {
+                track->set_clip_playhead(static_cast<double>(target_sample));
+            }
+        }
+    }
+
+    void update_scrub(uint64_t target_sample, double velocity = 1.0) noexcept {
+        m_clock.update_scrub(target_sample, velocity);
+        for (auto& track : m_tracks) {
+            if (track) {
+                track->set_clip_playhead(static_cast<double>(target_sample));
+            }
+        }
+    }
+
+    void end_scrub(uint64_t target_sample) noexcept {
+        m_clock.end_scrub(target_sample);
+        for (auto& track : m_tracks) {
+            if (track) {
+                track->set_clip_playhead(static_cast<double>(target_sample));
+            }
+        }
+    }
+
 
     bool set_bus_target_bus(uint32_t bus_id, int32_t target_bus_id) noexcept {
         if (bus_id < 1 || bus_id > kMaxBuses) return false;

@@ -109,8 +109,8 @@ void Engine::transport_stop() noexcept {
 
 void Engine::transport_seek(double beat) noexcept {
     const uint64_t pos = static_cast<uint64_t>(std::round(beat * m_clock.samples_per_beat()));
-    m_clock.set_sample_position(pos);
-    m_mixer.clock().set_sample_position(pos);
+    m_clock.seek(pos);
+    m_mixer.seek(pos);
 }
 
 void Engine::set_tempo(double bpm) noexcept {

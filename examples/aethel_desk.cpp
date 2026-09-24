@@ -657,7 +657,10 @@ int main(int argc, char** argv) {
                 if (playhead_seconds >= loop_length_seconds) {
                     playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
                 }
+                mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
             }
+        } else if (!mixer.clock().is_scrubbing()) {
+            playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
         }
 
         // Drain incoming Hardware MIDI events into ModulationMatrix & PolyphonicSynth
@@ -681,11 +684,14 @@ int main(int argc, char** argv) {
 
         // Master Clock Transmission (24 PPQN Beat Clock & MTC SMPTE Timecode):
         if (mixer.clock().authority() == clock::ClockAuthority::Master) {
-            mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
+            if (is_playing) {
+                mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
+            }
             mixer.clock().set_playing(is_playing);
             mixer.clock().set_bpm(bpm);
             midi_rx.process_master_clock(is_playing ? mod_sim_frames : 0, mixer.clock());
         }
+
 
         // Lock-free telemetry query
         mixer.capture_telemetry_snapshot(telemetry);
@@ -779,8 +785,7 @@ int main(int argc, char** argv) {
             if (ImGui::Button("[ [] STOP ]", ImVec2(80, 32))) {
                 is_playing = false;
                 mixer.clock().set_playing(false);
-                mixer.clock().set_sample_position(0);
-                trk0->set_clip_playhead(0.0);
+                mixer.seek(0, true);
                 playhead_seconds = 0.0f;
             }
 
@@ -793,6 +798,28 @@ int main(int argc, char** argv) {
             } else if (ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f")) {
                 mixer.clock().set_bpm(bpm);
             }
+
+            // Timecode & Musical Position Readout + Scrub Status
+            auto tc = midi::MtcTimecode::from_seconds(playhead_seconds, midi_rx.clock_generator().mtc_framerate());
+            auto pos = mixer.clock().position_snapshot();
+            ImGui::SameLine(0, 15);
+            ImGui::TextColored(mixer.clock().is_scrubbing() ? ImVec4(1.0f, 0.75f, 0.20f, 1.0f) : ImVec4(0.20f, 0.85f, 0.45f, 1.0f),
+                               "[SMPTE %02d:%02d:%02d:%02d | BAR %u.%u.%u]",
+                               tc.hours, tc.minutes, tc.seconds, tc.frames,
+                               pos.bar_index + 1, pos.beat_within_bar + 1,
+                               static_cast<uint32_t>(pos.beat_progress * 4.0) + 1);
+            if (mixer.clock().is_scrubbing()) {
+                ImGui::SameLine(0, 6);
+                double vel = mixer.clock().scrub_velocity();
+                if (std::abs(vel) < 0.05) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.20f, 1.0f), "[SCRUB JOG]");
+                } else if (vel > 0.0) {
+                    ImGui::TextColored(ImVec4(0.20f, 0.90f, 0.40f, 1.0f), "[SCRUB FWD %+.1fx]", vel);
+                } else {
+                    ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.25f, 1.0f), "[SCRUB REV %+.1fx]", vel);
+                }
+            }
+
 
             // Keyboard Shortcuts: Ctrl+S (Save), Ctrl+O (Load)
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
@@ -1174,16 +1201,28 @@ int main(int argc, char** argv) {
 
                         // Interactive scrubbing on ruler
                         ImGui::InvisibleButton("ArrangerCanvasSeekBtn", canvas_size);
-                        if (ImGui::IsItemActive()) {
+                        if (ImGui::IsItemActivated()) {
                             ImVec2 m = ImGui::GetIO().MousePos;
                             float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
                             playhead_seconds = ratio * loop_length_seconds;
                             uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
-                            mixer.clock().set_sample_position(target_sample);
-                            trk0->set_clip_playhead(static_cast<double>(target_sample));
-                            trk1->set_clip_playhead(static_cast<double>(target_sample));
-                            trk2->set_clip_playhead(static_cast<double>(target_sample));
+                            mixer.start_scrub(target_sample);
+                        } else if (ImGui::IsItemActive()) {
+                            ImVec2 m = ImGui::GetIO().MousePos;
+                            float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                            float prev_sec = playhead_seconds;
+                            playhead_seconds = ratio * loop_length_seconds;
+                            float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
+                            uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                            mixer.update_scrub(target_sample, static_cast<double>(vel));
+                        } else if (ImGui::IsItemDeactivated()) {
+                            ImVec2 m = ImGui::GetIO().MousePos;
+                            float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                            playhead_seconds = ratio * loop_length_seconds;
+                            uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                            mixer.end_scrub(target_sample);
                         }
+
                     }
                     ImGui::EndChild();
 
@@ -4433,14 +4472,16 @@ int main(int argc, char** argv) {
                                 midi_rx.clock_generator().set_mtc_framerate(static_cast<midi::MtcFrameRate>(fps_idx));
                             }
                             ImGui::SameLine();
-                            ImGui::TextDisabled("| Out: %llu Clocks | %llu QFrames",
+                            ImGui::TextDisabled("| Out: %llu Clocks | %llu QFrames | %llu SPP | %llu SysEx FF",
                                 static_cast<unsigned long long>(midi_rx.clock_generator().tick_count()),
-                                static_cast<unsigned long long>(midi_rx.clock_generator().qframe_count()));
+                                static_cast<unsigned long long>(midi_rx.clock_generator().qframe_count()),
+                                static_cast<unsigned long long>(midi_rx.spp_tx_count()),
+                                static_cast<unsigned long long>(midi_rx.mtc_full_frame_tx_count()));
                             ImGui::SameLine();
                             if (ImGui::SmallButton(" ⤓ Locate Full Frame SysEx ")) {
-                                auto cur_tc = midi_rx.clock_generator().current_mtc_timecode();
-                                midi_rx.send_mtc_full_frame(cur_tc);
+                                midi_rx.broadcast_seek_position(mixer.clock());
                             }
+
                         }
                     }
                     ImGui::Separator();

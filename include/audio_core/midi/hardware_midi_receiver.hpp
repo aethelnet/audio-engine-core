@@ -503,10 +503,52 @@ public:
         m_sync_tracker.apply_to_timeline_clock(clock);
     }
 
+    void broadcast_seek_position(const clock::TimelineClock& clock) noexcept {
+        if (clock.authority() != clock::ClockAuthority::Master) {
+            return;
+        }
+
+        const uint64_t sample_pos = clock.sample_position();
+        const double sr = static_cast<double>(clock.sample_rate());
+        const double total_secs = static_cast<double>(sample_pos) / std::max(1.0, sr);
+
+        // 1. Send SPP if Beat Clock is enabled
+        if (m_clock_gen.is_beat_clock_enabled()) {
+            const double total_beats = clock.position_snapshot().total_beats;
+            uint16_t spp = static_cast<uint16_t>(std::clamp(std::floor(total_beats * 4.0), 0.0, 16383.0));
+            send_midi_spp(spp);
+            m_spp_tx_count.fetch_add(1, std::memory_order_relaxed);
+            m_last_tx_spp.store(spp, std::memory_order_relaxed);
+        }
+
+        // 2. Send MTC Full Frame SysEx if MTC is enabled
+        if (m_clock_gen.is_mtc_enabled()) {
+            auto tc = MtcTimecode::from_seconds(total_secs, m_clock_gen.mtc_framerate());
+            send_mtc_full_frame(tc);
+            m_mtc_full_frame_tx_count.fetch_add(1, std::memory_order_relaxed);
+            m_last_tx_mtc_packed.store(tc.pack(), std::memory_order_relaxed);
+        }
+
+        // 3. Re-align phase in clock generator
+        m_clock_gen.align_to_sample_position(sample_pos, clock);
+    }
+
     void process_master_clock(uint32_t frames, const clock::TimelineClock& clock) noexcept {
         if (clock.authority() != clock::ClockAuthority::Master) {
             return;
         }
+
+        // 1. Detect discontinuous seek or timeline scrub and broadcast locator messages
+        const uint64_t cur_seek_gen = clock.seek_generation();
+        if (cur_seek_gen != m_last_handled_seek_gen.load(std::memory_order_relaxed)) {
+            m_last_handled_seek_gen.store(cur_seek_gen, std::memory_order_relaxed);
+            broadcast_seek_position(clock);
+        }
+
+        if (frames == 0 && !clock.is_playing()) {
+            return;
+        }
+
         const uint64_t sr = std::max(1u, clock.sample_rate());
         const uint64_t block_ts_ns = (clock.sample_position() * 1'000'000'000ULL) / sr;
 
@@ -526,6 +568,14 @@ public:
             }
         );
     }
+
+    [[nodiscard]] uint64_t spp_tx_count() const noexcept { return m_spp_tx_count.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t mtc_full_frame_tx_count() const noexcept { return m_mtc_full_frame_tx_count.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint16_t last_tx_spp() const noexcept { return m_last_tx_spp.load(std::memory_order_relaxed); }
+    [[nodiscard]] MtcTimecode last_tx_mtc() const noexcept {
+        return MtcTimecode::unpack(m_last_tx_mtc_packed.load(std::memory_order_relaxed));
+    }
+
 
     bool send_midi_clock_tick(uint64_t timestamp_ns = 0) noexcept {
         if (m_fd >= 0) {
@@ -1262,6 +1312,14 @@ private:
     // MIDI Clock & MTC Synchronization Tracker & Master Generator
     MidiSyncTracker m_sync_tracker;
     MidiClockGenerator m_clock_gen;
+
+    // Master Clock & Locator Outgoing Telemetry
+    std::atomic<uint64_t> m_spp_tx_count{0};
+    std::atomic<uint64_t> m_mtc_full_frame_tx_count{0};
+    std::atomic<uint16_t> m_last_tx_spp{0};
+    std::atomic<uint64_t> m_last_tx_mtc_packed{0};
+    std::atomic<uint64_t> m_last_handled_seek_gen{0};
+
 
     // SysEx Parser State
     bool m_in_sysex{false};

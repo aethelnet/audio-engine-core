@@ -10857,6 +10857,231 @@ void test_master_clock_and_mtc_generator() {
     std::cout << "  -> Master Clock Engine, MTC Generator & Linear Timecode Broadcast: ALL PASSED" << std::endl;
 }
 
+void test_timeline_scrubbing_and_mtc_full_frame_broadcast() {
+    std::cout << "[TEST 77] Running Timeline Scrubbing, SPP & MTC Full Frame SysEx Broadcast..." << std::endl;
+
+    using namespace audio_core::midi;
+    using namespace audio_core::clock;
+    using namespace audio_core::sampling;
+    using namespace audio_core;
+
+    // 1. TimelineClock Scrub & Seek State Tracking
+    {
+        TimelineClock clock(48000, 120.0);
+        TEST_CHECK(!clock.is_scrubbing());
+        TEST_CHECK(clock.seek_generation() == 0);
+        TEST_CHECK(clock.sample_position() == 0);
+
+        clock.seek(48000);
+        TEST_CHECK(clock.seek_generation() == 1);
+        TEST_CHECK(clock.sample_position() == 48000);
+        TEST_CHECK(clock.last_seek_sample() == 48000);
+
+        clock.start_scrub(96000);
+        TEST_CHECK(clock.is_scrubbing());
+        TEST_CHECK(clock.seek_generation() == 2);
+        TEST_CHECK(clock.sample_position() == 96000);
+
+        clock.update_scrub(120000, 2.5);
+        TEST_CHECK(clock.is_scrubbing());
+        TEST_CHECK(clock.seek_generation() == 3);
+        TEST_CHECK(clock.sample_position() == 120000);
+        TEST_CHECK(std::abs(clock.scrub_velocity() - 2.5) < 1e-4);
+
+        clock.end_scrub(144000);
+        TEST_CHECK(!clock.is_scrubbing());
+        TEST_CHECK(clock.seek_generation() == 4);
+        TEST_CHECK(clock.sample_position() == 144000);
+        TEST_CHECK(std::abs(clock.scrub_velocity() - 0.0) < 1e-4);
+
+        std::cout << "  -> TimelineClock Scrub & Seek State Tracking: PASSED" << std::endl;
+    }
+
+    // 2. HardwareMidiReceiver Master Broadcast on Discontinuous Seek / Scrub
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false);
+
+        MixerGraph mixer(48000, 128);
+        mixer.clock().set_authority(ClockAuthority::Master);
+        mixer.clock().set_bpm(120.0);
+        mixer.clock().set_playing(false); // Transport stopped!
+
+        rx.clock_generator().set_beat_clock_enabled(true);
+        rx.clock_generator().set_mtc_enabled(true);
+        rx.clock_generator().set_mtc_framerate(MtcFrameRate::Fps25);
+
+        TEST_CHECK(rx.spp_tx_count() == 0);
+        TEST_CHECK(rx.mtc_full_frame_tx_count() == 0);
+
+        // Seek while stopped: 1 second = 48000 samples = 2 beats at 120 BPM = 8 SPP units (1/16th notes)
+        // MTC PAL 25fps = 00:00:01:00
+        mixer.seek(48000);
+
+        // Process master clock with 0 frames (idle transport)
+        rx.process_master_clock(0, mixer.clock());
+
+        TEST_CHECK(rx.spp_tx_count() == 1);
+        TEST_CHECK(rx.last_tx_spp() == 8); // 2 beats * 4 = 8
+        TEST_CHECK(rx.mtc_full_frame_tx_count() == 1);
+        auto tc = rx.last_tx_mtc();
+        TEST_CHECK(tc.is_valid);
+        TEST_CHECK(tc.hours == 0 && tc.minutes == 0 && tc.seconds == 1 && tc.frames == 0);
+
+        // Verify mock loopback receiver received both SPP and Full Frame SysEx
+        TEST_CHECK(rx.sync_tracker().song_position_spp() == 8);
+        auto loop_tc = rx.sync_tracker().mtc_timecode();
+        TEST_CHECK(loop_tc.is_valid);
+        TEST_CHECK(loop_tc.hours == 0 && loop_tc.minutes == 0 && loop_tc.seconds == 1 && loop_tc.frames == 0);
+
+        // Multiple scrubs in sequence while stopped
+        mixer.start_scrub(72000); // 1.5 seconds = 3 beats = 12 SPP; 00:00:01:12 (12 frames @ 25fps)
+        rx.process_master_clock(0, mixer.clock());
+        TEST_CHECK(rx.spp_tx_count() == 2);
+        TEST_CHECK(rx.last_tx_spp() == 12);
+        TEST_CHECK(rx.mtc_full_frame_tx_count() == 2);
+        tc = rx.last_tx_mtc();
+        TEST_CHECK(tc.seconds == 1 && tc.frames == 12);
+
+        mixer.update_scrub(96000, 1.0); // 2.0 seconds = 4 beats = 16 SPP (Bar 2, Beat 1); 00:00:02:00
+        rx.process_master_clock(0, mixer.clock());
+        TEST_CHECK(rx.spp_tx_count() == 3);
+        TEST_CHECK(rx.last_tx_spp() == 16);
+        TEST_CHECK(rx.mtc_full_frame_tx_count() == 3);
+        tc = rx.last_tx_mtc();
+        TEST_CHECK(tc.seconds == 2 && tc.frames == 0);
+
+        mixer.end_scrub(96000);
+        TEST_CHECK(mixer.clock().seek_generation() == 4);
+        rx.process_master_clock(0, mixer.clock());
+        TEST_CHECK(rx.spp_tx_count() == 4);
+
+        std::cout << "  -> HardwareMidiReceiver SPP & MTC Full Frame SysEx Automatic Broadcast: PASSED" << std::endl;
+    }
+
+    // 3. SMPTE Multi-Framerate Broadcast on Scrub
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false);
+
+        MixerGraph mixer(48000, 128);
+        mixer.clock().set_authority(ClockAuthority::Master);
+        mixer.clock().set_playing(false);
+
+        // 29.97 drop-frame test: seek to 60.06 seconds = 2,882,880 samples
+        rx.clock_generator().set_mtc_framerate(MtcFrameRate::Fps2997Drop);
+        uint64_t sample_60s = static_cast<uint64_t>(60.06 * 48000.0);
+        mixer.seek(sample_60s);
+        rx.process_master_clock(0, mixer.clock());
+
+        auto tc = rx.last_tx_mtc();
+        TEST_CHECK(tc.is_valid);
+        TEST_CHECK(tc.rate == MtcFrameRate::Fps2997Drop);
+        TEST_CHECK(tc.hours == 0 && tc.minutes == 1 && tc.seconds == 0 && tc.frames == 2);
+
+        std::cout << "  -> SMPTE Multi-Framerate Broadcast on Scrub (29.97df): PASSED" << std::endl;
+    }
+
+    // 4. Audible Audio Scrubbing Engine Integration
+    {
+        MixerGraph mixer(48000, 128);
+        mixer.clock().set_authority(ClockAuthority::Master);
+        mixer.clock().set_playing(false); // Transport stopped!
+
+        // Attach synthetic sine wave audio clip to Track 0
+        constexpr size_t kClipFrames = 48000 * 2; // 2 seconds
+        auto clip = std::make_shared<AudioClip>("ScrubClip", 48000, 2, static_cast<uint32_t>(kClipFrames));
+        for (size_t i = 0; i < kClipFrames; ++i) {
+            float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * (static_cast<float>(i) / 48000.0f));
+            clip->channel(0)[i] = s;
+            clip->channel(1)[i] = s;
+        }
+        auto trk0 = mixer.add_track("Scrub Track");
+        TEST_CHECK(trk0 != nullptr);
+        trk0->set_clip(clip);
+        trk0->set_sync_to_transport(true);
+
+        // 4a. When stopped and NOT scrubbing: output should be completely silent (zero RMS)
+        AudioBuffer master_buf(2, 128);
+        auto view = master_buf.view();
+        mixer.render(view);
+
+        float rms_silent = 0.0f;
+        for (uint32_t i = 0; i < 128; ++i) {
+            rms_silent += view.channel(0)[i] * view.channel(0)[i];
+        }
+        rms_silent = std::sqrt(rms_silent / 128.0f);
+        TEST_CHECK(rms_silent == 0.0f);
+
+        // 4b. When stopped and SCRUBBING: output should be audible (non-zero RMS)
+        mixer.start_scrub(24000); // 0.5s into clip (middle of 440Hz sine wave)
+        mixer.render(view);
+
+        float rms_scrub = 0.0f;
+        for (uint32_t i = 0; i < 128; ++i) {
+            rms_scrub += view.channel(0)[i] * view.channel(0)[i];
+        }
+        rms_scrub = std::sqrt(rms_scrub / 128.0f);
+        TEST_CHECK(rms_scrub > 0.05f); // Clearly audible audio playback during scrub!
+
+        // 4c. When scrubbing ends: output returns to silence
+        mixer.end_scrub(24000);
+        mixer.render(view);
+
+        float rms_after = 0.0f;
+        for (uint32_t i = 0; i < 128; ++i) {
+            rms_after += view.channel(0)[i] * view.channel(0)[i];
+        }
+        rms_after = std::sqrt(rms_after / 128.0f);
+        TEST_CHECK(rms_after == 0.0f);
+
+        std::cout << "  -> Audible Audio Scrubbing Engine (Silence -> Scrub Audible -> Silence): PASSED (RMS=" << rms_scrub << ")" << std::endl;
+    }
+
+    // 5. Playback Transport Continuity Post-Seek
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false);
+
+
+        MixerGraph mixer(48000, 128);
+        mixer.clock().set_authority(ClockAuthority::Master);
+        mixer.clock().set_bpm(120.0);
+        mixer.clock().set_playing(true);
+
+        rx.clock_generator().set_beat_clock_enabled(true);
+        rx.clock_generator().set_mtc_enabled(true);
+        rx.clock_generator().set_mtc_framerate(MtcFrameRate::Fps25);
+
+        // Render 10 blocks (1280 samples)
+        for (int b = 0; b < 10; ++b) {
+            rx.process_master_clock(128, mixer.clock());
+            mixer.clock().advance_block(128);
+        }
+        uint64_t ticks_before = rx.clock_generator().tick_count();
+        TEST_CHECK(ticks_before > 0);
+
+        // Seek while playing: should broadcast SPP and MTC Full Frame SysEx, and continue seamlessly
+        mixer.seek(48000); // 1.0 second (2 beats)
+        rx.process_master_clock(128, mixer.clock());
+
+        TEST_CHECK(rx.spp_tx_count() == 1);
+        TEST_CHECK(rx.last_tx_spp() == 8);
+        TEST_CHECK(rx.mtc_full_frame_tx_count() == 1);
+
+        // Advance 10 more blocks: clocks continue ticking from the new playhead
+        for (int b = 0; b < 10; ++b) {
+            mixer.clock().advance_block(128);
+            rx.process_master_clock(128, mixer.clock());
+        }
+        TEST_CHECK(rx.clock_generator().tick_count() > ticks_before);
+
+        std::cout << "  -> Playback Transport Continuity Post-Seek: PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Timeline Scrubbing, SPP & MTC Full Frame SysEx Broadcast: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -10938,6 +11163,8 @@ int main() {
     test_alsa_sequencer_subscriptions_and_hotplug();
     test_midi_sync_beat_clock_spp_and_mtc_timecode();
     test_master_clock_and_mtc_generator();
+    test_timeline_scrubbing_and_mtc_full_frame_broadcast();
+
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -192,13 +192,15 @@ public:
     // Render with timeline clock
     void render(Sample* dst_l, Sample* dst_r, uint32_t frames, const clock::TimelineClock& clock) noexcept {
         const auto musical_pos = clock.position_snapshot();
-        render(dst_l, dst_r, frames, clock.sample_rate(), clock.bpm(), clock.is_playing(), musical_pos.total_beats);
+        render(dst_l, dst_r, frames, clock.sample_rate(), clock.bpm(), clock.is_playing(),
+               musical_pos.total_beats, clock.is_scrubbing(), clock.scrub_velocity());
     }
 
     // Render with raw parameters
     void render(Sample* dst_l, Sample* dst_r, uint32_t frames,
                 uint32_t session_sr, double session_bpm, bool is_playing,
-                double transport_total_beats = 0.0) noexcept {
+                double transport_total_beats = 0.0,
+                bool is_scrubbing = false, double scrub_velocity = 1.0) noexcept {
         if (!dst_l || !dst_r || frames == 0) return;
         if (!m_clip || m_clip->num_frames() == 0 || m_clip->num_channels() == 0) {
             std::memset(dst_l, 0, frames * sizeof(Sample));
@@ -271,7 +273,7 @@ public:
                 m_wsola.set_beat_sync(false);
                 m_wsola.set_stretch_factor(m_speed_ratio.load(std::memory_order_relaxed));
             }
-            m_wsola.render(dst_l, dst_r, frames, session_sr, session_bpm, is_playing);
+            m_wsola.render(dst_l, dst_r, frames, session_sr, session_bpm, is_playing || is_scrubbing);
             double end_ph = m_wsola.playhead();
             m_playhead.store(end_ph, std::memory_order_relaxed);
             m_effective_ratio = m_wsola.effective_stretch_ratio();
@@ -301,7 +303,11 @@ public:
         double manual_speed = static_cast<double>(m_speed_ratio.load(std::memory_order_relaxed));
 
         // Target Playhead Step per session frame
-        const double nominal_step = sr_ratio * tempo_ratio * pitch_ratio * manual_speed * (rev ? -1.0 : 1.0);
+        double scrub_factor = 1.0;
+        if (is_scrubbing) {
+            scrub_factor = (std::abs(scrub_velocity) > 1e-4) ? scrub_velocity : 1.0;
+        }
+        const double nominal_step = sr_ratio * tempo_ratio * pitch_ratio * manual_speed * scrub_factor * (rev ? -1.0 : 1.0);
 
         // 5. Transport Phase Lock Hard Sync
         if (mode == PlaybackMode::TransportPhaseLock && is_playing && loop_bpm > 10.0) {
@@ -331,8 +337,10 @@ public:
 
         if (m_needs_smoother_reset) {
             float init_factor = 1.0f;
-            if (motor == TapeMotorState::Stopped) init_factor = 0.0f;
-            else if (motor == TapeMotorState::Starting) init_factor = 0.0f;
+            if (!is_scrubbing) {
+                if (motor == TapeMotorState::Stopped) init_factor = 0.0f;
+                else if (motor == TapeMotorState::Starting) init_factor = 0.0f;
+            }
             m_smoother.reset(static_cast<float>(nominal_step * init_factor));
             m_needs_smoother_reset = false;
         }
@@ -347,7 +355,9 @@ public:
         // 7. Render Frame-by-Frame with Continuous Hermite Spline Interpolation & Motor Ballistics
         for (uint32_t i = 0; i < frames; ++i) {
             float motor_factor = 1.0f;
-            if (motor == TapeMotorState::Stopping) {
+            if (is_scrubbing) {
+                motor_factor = 1.0f;
+            } else if (motor == TapeMotorState::Stopping) {
                 m_motor_progress += 1.0f;
                 if (m_motor_progress >= total_stop_frames) {
                     motor = TapeMotorState::Stopped;
@@ -384,7 +394,7 @@ public:
 
             const float sample_target_step = static_cast<float>(nominal_step * motor_factor * pitch_env_mult);
             float active_step = sample_target_step;
-            if (inertia_ms > 0.001f) {
+            if (!is_scrubbing && inertia_ms > 0.001f) {
                 m_smoother.set_target(sample_target_step);
                 active_step = m_smoother.process_sample();
             }

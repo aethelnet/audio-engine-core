@@ -99,6 +99,46 @@ public:
         m_sample_position.store(pos, std::memory_order_relaxed);
     }
 
+    // Timeline Scrubbing & Discontinuous Seek Architecture
+    [[nodiscard]] bool is_scrubbing() const noexcept {
+        return m_is_scrubbing.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t seek_generation() const noexcept {
+        return m_seek_generation.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t last_seek_sample() const noexcept {
+        return m_last_seek_sample.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] double scrub_velocity() const noexcept {
+        return m_scrub_velocity.load(std::memory_order_relaxed);
+    }
+    void set_scrub_velocity(double vel) noexcept {
+        m_scrub_velocity.store(vel, std::memory_order_relaxed);
+    }
+
+    void seek(uint64_t target_sample) noexcept {
+        m_sample_position.store(target_sample, std::memory_order_release);
+        m_last_seek_sample.store(target_sample, std::memory_order_release);
+        m_seek_generation.fetch_add(1, std::memory_order_release);
+    }
+
+    void start_scrub(uint64_t target_sample) noexcept {
+        m_is_scrubbing.store(true, std::memory_order_release);
+        seek(target_sample);
+    }
+
+    void update_scrub(uint64_t target_sample, double velocity = 1.0) noexcept {
+        m_scrub_velocity.store(velocity, std::memory_order_relaxed);
+        seek(target_sample);
+    }
+
+    void end_scrub(uint64_t target_sample) noexcept {
+        m_is_scrubbing.store(false, std::memory_order_release);
+        m_scrub_velocity.store(0.0, std::memory_order_relaxed);
+        seek(target_sample);
+    }
+
+
     // External Sync Ingestion Hooks
     void sync_from_midi_clock(double external_bpm, uint64_t sample_pos, bool is_playing) noexcept {
         if (m_authority.load(std::memory_order_relaxed) != ClockAuthority::MidiClockSlave) {
@@ -236,6 +276,12 @@ private:
 
     std::atomic<bool> m_is_playing{false};
     std::atomic<uint64_t> m_sample_position{0};
+
+    // Scrubbing and Discontinuous Seek State
+    std::atomic<bool> m_is_scrubbing{false};
+    std::atomic<uint64_t> m_seek_generation{0};
+    std::atomic<uint64_t> m_last_seek_sample{0};
+    std::atomic<double> m_scrub_velocity{0.0};
 };
 
 } // namespace audio_core::clock
