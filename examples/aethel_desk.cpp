@@ -5384,6 +5384,8 @@ int main(int argc, char** argv) {
                 ImGui::EndTabBar();
             }
         }
+        ImGui::EndChild();
+
         // ====================================================================
         // SESSION PERSISTENCE & OFFLINE BOUNCE MODAL DIALOGS
         // ====================================================================
