@@ -10,6 +10,7 @@
 #include "audio_core/dsp/interstage.hpp"
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
+#include "audio_core/dsp/lookahead_dnl.hpp"
 
 #include <string_view>
 #include <memory>
@@ -34,6 +35,8 @@ inline std::shared_ptr<IProcessor> create_processor_by_name(std::string_view nam
         p = std::make_shared<dsp::LiquidVactrolProcessor>(sample_rate);
     } else if (name == "MultiHeadOde" || name == "MultiHeadOdeProcessor" || name == "Sovereign MultiHead ODE Compressor") {
         p = std::make_shared<dsp::MultiHeadOdeProcessor>(sample_rate);
+    } else if (name == "LookaheadDnl" || name == "LookaheadDnlProcessor" || name == "Sovereign Lookahead Multiband DNL" || name == "MultibandDNL") {
+        p = std::make_shared<dsp::LookaheadDnlProcessor>(sample_rate);
     }
 
     if (p) {

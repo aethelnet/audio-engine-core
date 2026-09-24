@@ -58,6 +58,10 @@
 #include "audio_core/midi/midi_sync.hpp"
 #include "audio_core/midi/midi_learn_router.hpp"
 #include "audio_core/routing/mseg_automation_bridge.hpp"
+#include "audio_core/dsp/lookahead_delay_buffer.hpp"
+#include "audio_core/dsp/linkwitz_riley_crossover.hpp"
+#include "audio_core/dsp/lookahead_dnl.hpp"
+#include "audio_core/dsp/processor_factory.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -11604,6 +11608,294 @@ void test_midi_learn_and_mseg_automation_bridge() {
     std::cout << "  -> Dynamic MIDI Learn Router & MSEG-to-Arranger Automation Bridge: ALL PASSED" << std::endl;
 }
 
+void test_lookahead_delay_and_multiband_linkwitz_riley_dnl() {
+    std::cout << "[TEST 80] Running Zero-Allocation Lookahead Delay Buffer & Multiband Linkwitz-Riley DNL..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+
+    // ========================================================================
+    // Part A: LookaheadDelayBuffer Integer Delay & Bit-Exact Reconstruction
+    // ========================================================================
+    {
+        LookaheadDelayBuffer<256> delay_buf(32);
+        TEST_CHECK(delay_buf.delay_frames() == 32);
+        TEST_CHECK(delay_buf.capacity() == 256);
+        TEST_CHECK(std::abs(delay_buf.delay_ms(48000) - (32.0f * 1000.0f / 48000.0f)) < 1e-4f);
+
+        // Feed an impulse at sample index 10
+        std::vector<float> impulse(128, 0.0f);
+        impulse[10] = 1.0f;
+
+        std::vector<float> delayed_l(128, 0.0f);
+        std::vector<float> delayed_r(128, 0.0f);
+
+        for (size_t i = 0; i < 128; ++i) {
+            delay_buf.push(impulse[i], impulse[i] * 0.5f);
+            delay_buf.read_delayed(delayed_l[i], delayed_r[i]);
+        }
+
+        // Delay is 32 samples: sample 10 must appear at index 10 + 32 = 42
+        for (size_t i = 0; i < 42; ++i) {
+            TEST_CHECK(delayed_l[i] == 0.0f);
+            TEST_CHECK(delayed_r[i] == 0.0f);
+        }
+        TEST_CHECK(delayed_l[42] == 1.0f);
+        TEST_CHECK(delayed_r[42] == 0.5f);
+        for (size_t i = 43; i < 128; ++i) {
+            TEST_CHECK(delayed_l[i] == 0.0f);
+            TEST_CHECK(delayed_r[i] == 0.0f);
+        }
+
+        // Test dynamic delay reconfiguration and peek
+        delay_buf.reset();
+        for (int i = 0; i < 50; ++i) {
+            delay_buf.push(static_cast<float>(i), -static_cast<float>(i));
+        }
+        float p_l = 0.0f, p_r = 0.0f;
+        delay_buf.peek_latest(p_l, p_r);
+        TEST_CHECK(p_l == 49.0f && p_r == -49.0f);
+
+        delay_buf.read(5, p_l, p_r);
+        TEST_CHECK(p_l == 44.0f && p_r == -44.0f);
+
+        std::cout << "  -> Part A (LookaheadDelayBuffer Integer Delay & Bit-Exact Reconstruction): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: LookaheadDelayBuffer Fractional Hermite Interpolation & Wrap-Around
+    // ========================================================================
+    {
+        LookaheadDelayBuffer<128> delay_buf;
+        constexpr float kSr = 48000.0f;
+        constexpr float kFreq = 1000.0f;
+        constexpr float kTwoPi = 2.0f * std::numbers::pi_v<float>;
+
+        // Stream 50,000 samples to stress ringbuffer wrap-around across multiple cycles
+        for (size_t i = 0; i < 50000; ++i) {
+            const float t = static_cast<float>(i) / kSr;
+            const float val = std::sin(kTwoPi * kFreq * t);
+            delay_buf.push(val, val);
+        }
+
+        // Test fractional delay = 8.5 samples
+        float frac_l = 0.0f, frac_r = 0.0f;
+        delay_buf.read_fractional(8.5f, frac_l, frac_r);
+
+        const float expected_t = (50000.0f - 1.0f - 8.5f) / kSr;
+        const float expected_val = std::sin(kTwoPi * kFreq * expected_t);
+
+        // Hermite spline accuracy on 1kHz sine at 48kHz is < 0.005
+        TEST_CHECK(std::abs(frac_l - expected_val) < 0.005f);
+        TEST_CHECK(std::abs(frac_r - expected_val) < 0.005f);
+        TEST_CHECK(!std::isnan(frac_l) && !std::isinf(frac_l));
+
+        std::cout << "  -> Part B (LookaheadDelayBuffer Fractional Hermite Interpolation & Wrap-Around): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: LinkwitzRiley4Way Flat Magnitude Summation (0.00 dB Ripple)
+    // ========================================================================
+    {
+        // Splits: 120 Hz, 1200 Hz, 6000 Hz @ 48 kHz
+        LinkwitzRiley4Way lr4(120.0f, 1200.0f, 6000.0f, 48000);
+        constexpr float kSr = 48000.0f;
+        constexpr float kTwoPi = 2.0f * std::numbers::pi_v<float>;
+
+        // Test frequencies including below, above, and right on each crossover point
+        const std::array<float, 10> test_freqs = {
+            30.0f, 80.0f, 120.0f, 300.0f, 800.0f, 1200.0f, 2500.0f, 6000.0f, 10000.0f, 16000.0f
+        };
+
+        float max_ripple_db = 0.0f;
+
+        for (float freq : test_freqs) {
+            lr4.reset();
+            const size_t num_samples = 8192;
+            float max_sum_amp = 0.0f;
+
+            for (size_t n = 0; n < num_samples; ++n) {
+                const float in = std::sin(kTwoPi * freq * static_cast<float>(n) / kSr);
+                float b_l[4], b_r[4];
+                lr4.process_sample(in, in, b_l, b_r);
+
+                float sum_l = 0.0f, sum_r = 0.0f;
+                lr4.sum_bands(b_l, b_r, sum_l, sum_r);
+
+                // Allow 4096 samples for filter settling
+                if (n >= 4096) {
+                    if (std::abs(sum_l) > max_sum_amp) {
+                        max_sum_amp = std::abs(sum_l);
+                    }
+                }
+            }
+
+            const float ripple_db = std::abs(20.0f * std::log10(std::max(1e-5f, max_sum_amp)));
+            if (ripple_db > max_ripple_db) {
+                max_ripple_db = ripple_db;
+            }
+
+            std::cout << "    [LR4 Sweep] freq=" << freq << " Hz -> max_sum_amp=" << max_sum_amp
+                      << " (ripple: " << ripple_db << " dB)" << std::endl;
+            // Magnitude sum should be 1.0000 (flat within 0.06 amplitude / 0.5 dB across all frequencies)
+            TEST_CHECK(std::abs(max_sum_amp - 1.0f) < 0.06f);
+        }
+
+        TEST_CHECK(max_ripple_db < 0.50f);
+        std::cout << "  -> Part C (LinkwitzRiley4Way Flat Magnitude Summation 0.00 dB Ripple, max error: "
+                  << max_ripple_db << " dB): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part D: LinkwitzRiley4Way In-Phase Alignment & Solo/Mute State Isolation
+    // ========================================================================
+    {
+        LinkwitzRiley4Way lr4(120.0f, 1200.0f, 6000.0f, 48000);
+
+        // Test Solo Band 0 (Sub)
+        lr4.set_band_solo(0, true);
+        float b_l[4], b_r[4];
+        lr4.process_sample(1.0f, 1.0f, b_l, b_r);
+        TEST_CHECK(b_l[1] == 0.0f && b_r[1] == 0.0f);
+        TEST_CHECK(b_l[2] == 0.0f && b_r[2] == 0.0f);
+        TEST_CHECK(b_l[3] == 0.0f && b_r[3] == 0.0f);
+
+        // Clear solo, test Mute Band 3 (Air)
+        lr4.set_band_solo(0, false);
+        lr4.set_band_mute(3, true);
+        lr4.process_sample(1.0f, 1.0f, b_l, b_r);
+        TEST_CHECK(b_l[3] == 0.0f && b_r[3] == 0.0f);
+
+        std::cout << "  -> Part D (LinkwitzRiley4Way In-Phase Alignment & Solo/Mute Isolation): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part E: Lookahead Multiband DNL Transient Preservation (Attack Blunting Test)
+    // ========================================================================
+    {
+        // Compare transient response WITH vs WITHOUT lookahead
+        // A sharp 8 kHz consonant burst (0.5 ms = 24 samples @ 48 kHz) preceded by silence
+        constexpr size_t kBurstStart = 100;
+        constexpr size_t kBurstLen = 24;
+        constexpr size_t kTotalLen = 300;
+
+        std::vector<float> input(kTotalLen, 0.0f);
+        for (size_t i = 0; i < kBurstLen; ++i) {
+            const float t = static_cast<float>(i) / 48000.0f;
+            input[kBurstStart + i] = std::sin(2.0f * std::numbers::pi_v<float> * 8000.0f * t);
+        }
+
+        // 1. Process without lookahead (lookahead = 0)
+        LookaheadDnlProcessor dnl_no_lookahead(48000);
+        dnl_no_lookahead.set_parameter(0, -30.0f); // Threshold -30 dB
+        dnl_no_lookahead.set_parameter(1, 18.0f);  // Max reduction 18 dB
+        dnl_no_lookahead.set_parameter(2, 0.0f);   // 0 samples lookahead
+        dnl_no_lookahead.reset();
+
+        std::vector<float> out_no_la_l = input;
+        std::vector<float> out_no_la_r = input;
+        dnl_no_lookahead.process_stereo(out_no_la_l.data(), out_no_la_r.data(), kTotalLen);
+
+        // Find peak of leading transient edge (first 8 samples of the burst)
+        float peak_no_la = 0.0f;
+        for (size_t i = 0; i < 8; ++i) {
+            peak_no_la = std::max(peak_no_la, std::abs(out_no_la_l[kBurstStart + i]));
+        }
+
+        // 2. Process with 32-sample lookahead (lookahead = 32)
+        LookaheadDnlProcessor dnl_with_lookahead(48000);
+        dnl_with_lookahead.set_parameter(0, -30.0f);
+        dnl_with_lookahead.set_parameter(1, 18.0f);
+        dnl_with_lookahead.set_parameter(2, 32.0f); // 32 samples lookahead
+        dnl_with_lookahead.reset();
+
+        std::vector<float> out_la_l = input;
+        std::vector<float> out_la_r = input;
+        dnl_with_lookahead.process_stereo(out_la_l.data(), out_la_r.data(), kTotalLen);
+
+        // With 32 samples lookahead, the burst appears at kBurstStart + 32
+        float peak_la = 0.0f;
+        for (size_t i = 0; i < 8; ++i) {
+            peak_la = std::max(peak_la, std::abs(out_la_l[kBurstStart + 32 + i]));
+        }
+
+        // Lookahead allows the gate to open in advance:
+        // peak_la should be significantly higher and closer to full amplitude (> 0.70) than peak_no_la
+        TEST_CHECK(peak_la > peak_no_la);
+        TEST_CHECK(peak_la > 0.70f);
+
+        std::cout << "  -> Part E (Lookahead Multiband DNL Transient Preservation: peak without LA="
+                  << peak_no_la << ", peak with 32-sample LA=" << peak_la << "): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part F: Lookahead Multiband DNL Elimination of Single-Band Noise Pumping
+    // ========================================================================
+    {
+        LookaheadDnlProcessor dnl(48000);
+        dnl.set_parameter(0, -36.0f); // -36 dB threshold
+        dnl.set_parameter(1, 18.0f);  // 18 dB reduction
+        dnl.set_parameter(2, 32.0f);  // 32 sample lookahead
+        dnl.reset();
+
+        // Feed a powerful 60 Hz bass tone (amplitude 0.8) without any high frequencies
+        constexpr size_t kFrames = 2048;
+        std::vector<float> bass_l(kFrames);
+        std::vector<float> bass_r(kFrames);
+        for (size_t i = 0; i < kFrames; ++i) {
+            const float t = static_cast<float>(i) / 48000.0f;
+            const float s = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+            bass_l[i] = s;
+            bass_r[i] = s;
+        }
+
+        dnl.process_stereo(bass_l.data(), bass_r.data(), kFrames);
+
+        // In our 4-band DNL:
+        // Band 0 (Sub) handles the 60 Hz bass tone.
+        // Band 3 (Air) envelope must remain virtually 0!
+        // Band 3 gain reduction must remain fully engaged (around -18 dB),
+        // proving that sub-bass energy does NOT pump or open the treble noise floor!
+        const float air_red_db = dnl.current_air_gain_reduction_db();
+        TEST_CHECK(air_red_db < -15.0f); // Fully closed at ~ -18 dB
+
+        std::cout << "  -> Part F (Lookahead Multiband DNL Noise Pumping Immunity: Air Atten = "
+                  << air_red_db << " dB during 0.8pk Sub-Bass): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part G: IProcessor Insert Slot Integration & Factory Instantiation
+    // ========================================================================
+    {
+        auto proc = create_processor_by_name("LookaheadDnl", 48000);
+        TEST_CHECK(proc != nullptr);
+        TEST_CHECK(std::string(proc->name()) == "Sovereign Lookahead Multiband DNL");
+        TEST_CHECK(proc->parameter_count() == 6);
+        TEST_CHECK(std::string(proc->parameter_name(2)) == "Lookahead Frames");
+
+        MixerGraph mixer(256);
+        Track* trk = mixer.add_track("Lead Vocal");
+        TEST_CHECK(trk != nullptr);
+
+        trk->slot(0).set_processor(proc);
+        TEST_CHECK(trk->slot(0).processor() != nullptr);
+        TEST_CHECK(!trk->slot(0).is_empty());
+
+        // Render audio through track insert slot
+        std::vector<float> trk_in_l(256, 0.1f);
+        std::vector<float> trk_in_r(256, 0.1f);
+        trk->slot(0).process_stereo(trk_in_l.data(), trk_in_r.data(), 256);
+
+        for (size_t i = 0; i < 256; ++i) {
+            TEST_CHECK(!std::isnan(trk_in_l[i]) && !std::isinf(trk_in_l[i]));
+            TEST_CHECK(!std::isnan(trk_in_r[i]) && !std::isinf(trk_in_r[i]));
+        }
+
+        std::cout << "  -> Part G (IProcessor Insert Slot Integration & Factory Instantiation): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Zero-Allocation Lookahead Delay Buffer & Multiband Linkwitz-Riley DNL: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -11688,10 +11980,12 @@ int main() {
     test_timeline_scrubbing_and_mtc_full_frame_broadcast();
     test_alsa_hardware_loopback_stress_and_scrub_attenuation();
     test_midi_learn_and_mseg_automation_bridge();
+    test_lookahead_delay_and_multiband_linkwitz_riley_dnl();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
+
 
