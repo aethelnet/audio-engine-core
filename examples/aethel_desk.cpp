@@ -14,6 +14,7 @@
 #include "audio_core/dsp/derez.hpp"
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
+#include "audio_core/dsp/lookahead_dnl.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/engine.hpp"
@@ -3006,6 +3007,36 @@ int main(int argc, char** argv) {
                                         float opto_gr = pr * 0.85f;
                                         ImGui::ProgressBar(opto_gr, ImVec2(-1, 6), "");
                                         ImGui::TextDisabled("Optical CdS Dark Memory Photocell Leveler");
+                                    } else if (pname.find("Lookahead") != std::string::npos || pname.find("DNL") != std::string::npos) {
+                                        float thresh = proc->get_parameter(0);
+                                        float red = proc->get_parameter(1);
+                                        float la = proc->get_parameter(2);
+
+                                        ImGui::SetNextItemWidth(80);
+                                        if (ImGui::SliderFloat("Thr##dnl", &thresh, -60.0f, -10.0f, "%.0fdB")) {
+                                            proc->set_parameter(0, thresh);
+                                        }
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::SetNextItemWidth(75);
+                                        if (ImGui::SliderFloat("Red##dnl", &red, 0.0f, 36.0f, "%.0fdB")) {
+                                            proc->set_parameter(1, red);
+                                        }
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::SetNextItemWidth(65);
+                                        if (ImGui::SliderFloat("LA##dnl", &la, 0.0f, 64.0f, "%.0fsm")) {
+                                            proc->set_parameter(2, la);
+                                        }
+
+                                        auto* dnl_proc = dynamic_cast<dsp::LookaheadDnlProcessor*>(proc);
+                                        float air_atten = dnl_proc ? dnl_proc->current_air_gain_reduction_db() : 0.0f;
+                                        float norm_gr = std::clamp(-air_atten / (red > 0.0f ? red : 18.0f), 0.0f, 1.0f);
+
+                                        char atten_txt[64];
+                                        std::snprintf(atten_txt, sizeof(atten_txt), "Air Hiss Atten: %.1f dB", air_atten);
+                                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.85f, 0.25f, 0.15f, 1.0f));
+                                        ImGui::ProgressBar(norm_gr, ImVec2(-1, 8), atten_txt);
+                                        ImGui::PopStyleColor();
+                                        ImGui::TextDisabled("4-Band LR4 Crossover + 32-Sample Lookahead Noise Gate");
                                     } else {
                                         float p0 = proc->get_parameter(0);
                                         float p1 = proc->get_parameter(1);
@@ -3076,6 +3107,15 @@ int main(int argc, char** argv) {
                                         if (ImGui::MenuItem("Sovereign MultiHead ODE Compressor")) {
                                             auto p = std::make_shared<dsp::MultiHeadOdeProcessor>(kSampleRate, 4);
                                             p->init(kSampleRate);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Sovereign Lookahead Multiband DNL")) {
+                                            auto p = std::make_shared<dsp::LookaheadDnlProcessor>(kSampleRate);
+                                            p->init(kSampleRate);
+                                            p->set_parameter(0, -36.0f);
+                                            p->set_parameter(1, 18.0f);
+                                            p->set_parameter(2, 32.0f);
+                                            p->set_parameter(3, 25.0f);
                                             sel_trk->slot(s).set_processor(p);
                                         }
                                         ImGui::EndPopup();
