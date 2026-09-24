@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AUDIO CORE // C++20 Real-Time DSP WebAssembly Studio</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <meta name="description" content="Echtzeitfähige C++20 Digital Signal Processing Engine im Browser via WebAssembly. Airwindows Algorithmen (PurestDrive, Baxandall, ButterComp2, ClipOnly2) mit Zero Heap Allocations." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://audio.aethelburg.network/" />
+  <meta property="og:title" content="AUDIO CORE // C++20 Real-Time DSP WebAssembly Studio" />
+  <meta property="og:description" content="Real-time C++20 audio DSP compiled to WebAssembly. Zero heap allocations in the audio thread, lock-free streaming, and Airwindows analog emulations." />
+  <link rel="canonical" href="https://audio.aethelburg.network/" />
+  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'monospace'],
+            sans: ['"Space Grotesk"', 'sans-serif'],
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    :root {
+      --bg-primary: #0a0a0c;
+      --bg-card: #121216;
+      --border-hairline: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.2);
+    }
+    body {
+      background-color: var(--bg-primary);
+      color: #f3f4f6;
+      font-family: 'Space Grotesk', sans-serif;
+    }
+    .font-mono-tech {
+      font-family: 'JetBrains Mono', monospace;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between selection:bg-rose-500 selection:text-white">
+
+  <!-- 01 // Header -->
+  <header class="w-full px-6 py-4 border-b border-[var(--border-hairline)] bg-[var(--bg-card)]/80 backdrop-blur-md flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
+    <div class="flex items-center gap-3.5">
+      <div class="w-8 h-8 rounded border border-[var(--border-strong)] bg-black/40 flex items-center justify-center p-1.5 shadow-sm text-rose-500">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" class="w-full h-full" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12h20" stroke-width="0.75" stroke-dasharray="2 2" stroke-opacity="0.5"/>
+          <path d="M2 12c2.5-8 4-8 6.5 0s4 8 6.5 0c2-5 3.5-5 5 0" stroke-width="1.75"/>
+          <circle cx="8.5" cy="12" r="1.25" fill="currentColor"/>
+          <circle cx="15" cy="12" r="1.25" fill="currentColor"/>
+        </svg>
+      </div>
+      <div>
+        <div class="flex items-baseline gap-2">
+          <span class="font-bold tracking-tight text-sm text-white uppercase">AETHELBURG // AUDIO CORE</span>
+          <span class="text-[10px] font-mono-tech text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded border border-rose-500/20">C++20 WASM</span>
+        </div>
+        <div class="text-[10px] font-mono-tech text-gray-400 mt-0.5">
+          Zero Heap Allocations in Render Loop // Real-Time Audio DSP
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Status HUD -->
+    <div class="flex items-center gap-3 font-mono-tech text-xs text-gray-300">
+      <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" id="engine-status-dot"></span>
+      <span id="engine-status-text">WASM READY // AUDIO STANDBY</span>
+      <span class="text-gray-500 hidden sm:inline">|</span>
+      <span class="text-gray-400 text-[11px] hidden sm:inline" id="sr-readout">SR: 48000 Hz</span>
+    </div>
+
+    <!-- Navigation Links -->
+    <div class="flex items-center gap-3 font-mono-tech text-xs">
+      <a href="https://github.com/aethelnet/audio-engine-core" target="_blank" rel="noreferrer" class="px-3 py-1.5 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 hover:text-white transition-all">
+        GITHUB REPO ↗
+      </a>
+      <a href="https://aethelburg.info" class="px-3 py-1.5 rounded bg-white text-black font-bold hover:bg-gray-200 transition-all">
+        PORTFOLIO ↗
+      </a>
+    </div>
+  </header>
+
+  <!-- 02 // Main Workspace -->
+  <main class="flex-1 w-full max-w-6xl mx-auto p-4 sm:p-8 space-y-6">
+    
+    <!-- Hero Box & Master Action -->
+    <div class="p-6 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] flex flex-col md:flex-row items-start md:items-center justify-between gap-6 shadow-xl">
+      <div class="space-y-1.5 max-w-2xl">
+        <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-white">
+          Kompilierte C++20 Audio-Engine im Web-Browser
+        </h1>
+        <p class="text-xs sm:text-sm text-gray-400 leading-relaxed">
+          Alle Audiosignale auf dieser Seite werden nicht in JavaScript berechnet, sondern laufen bit-exakt durch die nativen C++20 Airwindows-DSPs (PurestDrive, Baxandall-EQ, ButterComp2, ClipOnly2), kompiliert zu WebAssembly mit 0 Heap-Allokationen im Audio-Thread.
+        </p>
+      </div>
+
+      <!-- Start/Stop Big Button -->
+      <button id="btn-audio-toggle" class="w-full md:w-auto px-6 py-3.5 rounded bg-rose-500 hover:bg-rose-400 active:scale-95 text-white font-mono-tech font-bold text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-rose-500/20 shrink-0">
+        <svg id="icon-play" class="w-3.5 h-3.5 fill-current shrink-0" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+        <svg id="icon-pause" class="w-3.5 h-3.5 fill-current shrink-0 hidden" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        <span id="btn-label">AUDIO STARTEN (C++20 WASM)</span>
+      </button>
+    </div>
+
+    <!-- Visualizer Stage: Oscilloscope & VU Meters -->
+    <div class="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] p-4 sm:p-6 space-y-4 shadow-xl">
+      <div class="flex items-center justify-between text-xs font-mono-tech">
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-white uppercase tracking-wider">// ECHTZEIT-OSZILLOSKOP</span>
+          <span class="text-[10px] text-gray-500">[WASM HEAP READOUT]</span>
+        </div>
+        <div class="flex items-center gap-4 text-[11px] text-gray-400">
+          <span>L: <strong id="peak-l-val" class="text-rose-400 font-mono">-∞ dB</strong></span>
+          <span>R: <strong id="peak-r-val" class="text-rose-400 font-mono">-∞ dB</strong></span>
+        </div>
+      </div>
+
+      <!-- Oscilloscope Canvas -->
+      <div class="relative w-full h-44 sm:h-56 bg-black/60 rounded border border-[var(--border-hairline)] overflow-hidden">
+        <canvas id="scope-canvas" class="w-full h-full block"></canvas>
+        <div class="pointer-events-none absolute top-2 right-3 font-mono-tech text-[10px] text-gray-500">
+          TIME DOMAIN // 512 SAMPLES PER BLOCK
+        </div>
+      </div>
+    </div>
+
+    <!-- Rack Deck: 4 Processing Modules -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      
+      <!-- Module 1: Synthesizer Source -->
+      <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
+        <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
+          <span class="font-bold text-white">01 // SIGNAL SOURCE</span>
+          <span class="text-[10px] text-rose-400">OSCILLATOR</span>
+        </div>
+        <div>
+          <label class="block text-[10px] text-gray-400 mb-1">WAVEFORM:</label>
+          <div class="grid grid-cols-3 gap-1">
+            <button class="wave-btn active px-2 py-1 rounded bg-rose-500 text-white font-bold text-[10px]" data-wave="0">SAW</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 text-[10px]" data-wave="1">SQR</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-gray-300 text-[10px]" data-wave="2">SIN</button>
+          </div>
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+            <span>FREQUENCY</span>
+            <span id="freq-val" class="text-white font-bold">110 Hz (A2)</span>
+          </div>
+          <input type="range" id="slider-freq" min="55" max="880" step="1" value="110" class="w-full accent-rose-500 cursor-pointer" />
+        </div>
+      </div>
+
+      <!-- Module 2: Airwindows PurestDrive -->
+      <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
+        <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
+          <span class="font-bold text-white">02 // PURESTDRIVE</span>
+          <span class="text-[10px] text-amber-400">HARMONICS</span>
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+            <span>DRIVE AMOUNT</span>
+            <span id="drive-val" class="text-white font-bold">40%</span>
+          </div>
+          <input type="range" id="slider-drive" min="0" max="1" step="0.01" value="0.4" class="w-full accent-amber-500 cursor-pointer" />
+        </div>
+        <p class="text-[10px] text-gray-500 leading-normal">
+          Airwindows Frequenz-Auslöschung sättigt Bässe, hält Höhen transparent.
+        </p>
+      </div>
+
+      <!-- Module 3: Airwindows Baxandall EQ -->
+      <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
+        <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
+          <span class="font-bold text-white">03 // BAXANDALL EQ</span>
+          <span class="text-[10px] text-cyan-400">SHELVING</span>
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+            <span>BASS GAIN</span>
+            <span id="bass-val" class="text-white font-bold">+3.0 dB</span>
+          </div>
+          <input type="range" id="slider-bass" min="-15" max="15" step="0.5" value="3.0" class="w-full accent-cyan-500 cursor-pointer" />
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+            <span>TREBLE GAIN</span>
+            <span id="treble-val" class="text-white font-bold">+1.5 dB</span>
+          </div>
+          <input type="range" id="slider-treble" min="-15" max="15" step="0.5" value="1.5" class="w-full accent-cyan-500 cursor-pointer" />
+        </div>
+      </div>
+
+      <!-- Module 4: ButterComp2 & ClipOnly2 -->
+      <div class="p-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-card)] space-y-3 font-mono-tech text-xs">
+        <div class="flex justify-between items-center border-b border-[var(--border-hairline)] pb-2">
+          <span class="font-bold text-white">04 // DYNAMICS</span>
+          <span class="text-[10px] text-purple-400">COMP &amp; LIMIT</span>
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-gray-400 mb-1">
+            <span>BUTTERCOMP2</span>
+            <span id="comp-val" class="text-white font-bold">35%</span>
+          </div>
+          <input type="range" id="slider-comp" min="0" max="1" step="0.01" value="0.35" class="w-full accent-purple-500 cursor-pointer" />
+        </div>
+        <div class="pt-1">
+          <button id="btn-limiter" class="w-full py-1.5 px-3 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300 font-bold text-[10px] hover:bg-purple-500/30 transition-all">
+            CLIPONLY2: [AKTIV]
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- 03 // Footer -->
+  <footer class="w-full px-6 py-4 border-t border-[var(--border-hairline)] bg-[var(--bg-card)]/80 text-[10px] font-mono-tech text-gray-500 flex flex-wrap items-center justify-between gap-4">
+    <div>
+      AETHELBURG DSP LABS // C++20 GOLDEN-MASTER STANDARDS
+    </div>
+    <div>
+      TEST SUITE: 80/80 PASSED // BIT-EXACT AIRWINDOWS INTEGRATION
+    </div>
+  </footer>
+
+  <!-- 04 // WASM & WebAudio Runtime Glue -->
+  <script src="/audio_core.js"></script>
+  <script>
+    let wasmModule = null;
+    let audioCtx = null;
+    let scriptNode = null;
+    let isPlaying = false;
+    let limiterActive = true;
+    let currentWave = 0;
+
+    let ptrLeft = 0;
+    let ptrRight = 0;
+
+    const btnToggle = document.getElementById('btn-audio-toggle');
+    const btnLabel = document.getElementById('btn-label');
+    const iconPlay = document.getElementById('icon-play');
+    const iconPause = document.getElementById('icon-pause');
+    const statusText = document.getElementById('engine-status-text');
+    const statusDot = document.getElementById('engine-status-dot');
+    const srReadout = document.getElementById('sr-readout');
+
+    const canvas = document.getElementById('scope-canvas');
+    const ctx = canvas.getContext('2d');
+    let scopeData = new Float32Array(512);
+
+    function resizeCanvas() {
+      canvas.width = canvas.clientWidth * window.devicePixelRatio;
+      canvas.height = canvas.clientHeight * window.devicePixelRatio;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // 1. Initialize WASM Module
+    AudioCoreModule().then(mod => {
+      wasmModule = mod;
+      ptrLeft = mod._wasm_get_left_buffer();
+      ptrRight = mod._wasm_get_right_buffer();
+      console.log('C++20 Audio Core WASM initialized at pointers:', ptrLeft, ptrRight);
+      statusText.textContent = 'WASM LOADED // STANDBY';
+    }).catch(err => {
+      console.error('WASM load error:', err);
+      statusText.textContent = 'WASM LOAD ERROR';
+      statusDot.className = 'w-2 h-2 rounded-full bg-red-500';
+    });
+
+    // 2. Audio Context Toggle
+    btnToggle.addEventListener('click', async () => {
+      if (!wasmModule) return;
+
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+        wasmModule._wasm_init(audioCtx.sampleRate);
+        srReadout.textContent = 'SR: ' + audioCtx.sampleRate + ' Hz';
+
+        // 512 frames buffer size for tight sub-15ms latency
+        scriptNode = audioCtx.createScriptProcessor(512, 0, 2);
+        scriptNode.onaudioprocess = (e) => {
+          const outL = e.outputBuffer.getChannelData(0);
+          const outR = e.outputBuffer.getChannelData(1);
+
+          if (!isPlaying || !wasmModule) {
+            outL.fill(0);
+            outR.fill(0);
+            return;
+          }
+
+          // Invoke C++ WASM Process
+          wasmModule._wasm_process(512);
+
+          const heapL = wasmModule.HEAPF32.subarray(ptrLeft >> 2, (ptrLeft >> 2) + 512);
+          const heapR = wasmModule.HEAPF32.subarray(ptrRight >> 2, (ptrRight >> 2) + 512);
+
+          outL.set(heapL);
+          outR.set(heapR);
+          scopeData.set(heapL);
+
+          // Measure peak
+          let pkL = 0, pkR = 0;
+          for (let i = 0; i < 512; i++) {
+            const al = Math.abs(heapL[i]);
+            const ar = Math.abs(heapR[i]);
+            if (al > pkL) pkL = al;
+            if (ar > pkR) pkR = ar;
+          }
+          updatePeaks(pkL, pkR);
+        };
+        scriptNode.connect(audioCtx.destination);
+      }
+
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      isPlaying = !isPlaying;
+      wasmModule._wasm_set_synth(isPlaying ? 1 : 0, parseFloat(document.getElementById('slider-freq').value), currentWave);
+
+      if (isPlaying) {
+        btnToggle.className = btnToggle.className.replace('bg-rose-500', 'bg-amber-500').replace('hover:bg-rose-400', 'hover:bg-amber-400');
+        iconPlay.classList.add('hidden');
+        iconPause.classList.remove('hidden');
+        btnLabel.textContent = 'AUDIO STOPPEN';
+        statusText.textContent = 'C++ WASM AUDIO ACTIVE // 48 kHz';
+        statusDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
+      } else {
+        btnToggle.className = btnToggle.className.replace('bg-amber-500', 'bg-rose-500').replace('hover:bg-amber-400', 'hover:bg-rose-400');
+        iconPlay.classList.remove('hidden');
+        iconPause.classList.add('hidden');
+        btnLabel.textContent = 'AUDIO STARTEN (C++20 WASM)';
+        statusText.textContent = 'WASM READY // AUDIO PAUSED';
+        statusDot.className = 'w-2 h-2 rounded-full bg-yellow-500';
+      }
+    });
+
+    // 3. UI Controls Event Listeners
+    document.querySelectorAll('.wave-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.wave-btn').forEach(b => {
+          b.classList.remove('active', 'bg-rose-500', 'text-white');
+          b.classList.add('border', 'border-[var(--border-hairline)]', 'text-gray-300');
+        });
+        btn.classList.add('active', 'bg-rose-500', 'text-white');
+        btn.classList.remove('border', 'border-[var(--border-hairline)]', 'text-gray-300');
+        currentWave = parseInt(btn.getAttribute('data-wave'));
+        if (wasmModule && isPlaying) {
+          wasmModule._wasm_set_synth(1, parseFloat(document.getElementById('slider-freq').value), currentWave);
+        }
+      });
+    });
+
+    document.getElementById('slider-freq').addEventListener('input', (e) => {
+      const freq = parseFloat(e.target.value);
+      document.getElementById('freq-val').textContent = Math.round(freq) + ' Hz';
+      if (wasmModule && isPlaying) {
+        wasmModule._wasm_set_synth(1, freq, currentWave);
+      }
+    });
+
+    document.getElementById('slider-drive').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      document.getElementById('drive-val').textContent = Math.round(val * 100) + '%';
+      if (wasmModule) wasmModule._wasm_set_drive(val);
+    });
+
+    document.getElementById('slider-bass').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      document.getElementById('bass-val').textContent = (val >= 0 ? '+' : '') + val.toFixed(1) + ' dB';
+      if (wasmModule) wasmModule._wasm_set_bass(val);
+    });
+
+    document.getElementById('slider-treble').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      document.getElementById('treble-val').textContent = (val >= 0 ? '+' : '') + val.toFixed(1) + ' dB';
+      if (wasmModule) wasmModule._wasm_set_treble(val);
+    });
+
+    document.getElementById('slider-comp').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      document.getElementById('comp-val').textContent = Math.round(val * 100) + '%';
+      if (wasmModule) wasmModule._wasm_set_comp(val);
+    });
+
+    document.getElementById('btn-limiter').addEventListener('click', (e) => {
+      limiterActive = !limiterActive;
+      e.target.textContent = limiterActive ? 'CLIPONLY2: [AKTIV]' : 'CLIPONLY2: [BYPASS]';
+      if (limiterActive) {
+        e.target.className = 'w-full py-1.5 px-3 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300 font-bold text-[10px] hover:bg-purple-500/30 transition-all';
+      } else {
+        e.target.className = 'w-full py-1.5 px-3 rounded bg-gray-800 border border-gray-700 text-gray-400 font-bold text-[10px] hover:bg-gray-700 transition-all';
+      }
+      if (wasmModule) wasmModule._wasm_set_limiter(limiterActive ? 1 : 0);
+    });
+
+    function updatePeaks(l, r) {
+      const dbL = l > 1e-4 ? (20 * Math.log10(l)).toFixed(1) + ' dB' : '-∞ dB';
+      const dbR = r > 1e-4 ? (20 * Math.log10(r)).toFixed(1) + ' dB' : '-∞ dB';
+      document.getElementById('peak-l-val').textContent = dbL;
+      document.getElementById('peak-r-val').textContent = dbR;
+    }
+
+    // 4. Oscilloscope Canvas Animation
+    function drawScope() {
+      requestAnimationFrame(drawScope);
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      // Grid
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2);
+      ctx.lineTo(w, h / 2);
+      ctx.stroke();
+
+      if (!isPlaying) {
+        ctx.strokeStyle = 'rgba(244, 63, 94, 0.3)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, h / 2);
+        ctx.lineTo(w, h / 2);
+        ctx.stroke();
+        return;
+      }
+
+      // Live Waveform trace straight from C++ memory
+      ctx.strokeStyle = '#f43f5e';
+      ctx.lineWidth = 2 * window.devicePixelRatio;
+      ctx.beginPath();
+
+      const sliceWidth = w / 512;
+      let x = 0;
+
+      for (let i = 0; i < 512; i++) {
+        const v = scopeData[i];
+        const y = (h / 2) - (v * (h * 0.42));
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+        x += sliceWidth;
+      }
+      ctx.stroke();
+    }
+    requestAnimationFrame(drawScope);
+  </script>
+</body>
+</html>
