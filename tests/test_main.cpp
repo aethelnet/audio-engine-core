@@ -56,6 +56,8 @@
 #include "audio_core/modulation/modulation_matrix.hpp"
 #include "audio_core/midi/hardware_midi_receiver.hpp"
 #include "audio_core/midi/midi_sync.hpp"
+#include "audio_core/midi/midi_learn_router.hpp"
+#include "audio_core/routing/mseg_automation_bridge.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -11330,6 +11332,278 @@ void test_alsa_hardware_loopback_stress_and_scrub_attenuation() {
     std::cout << "  -> ALSA Hardware Loopback Stress & Scrub Attenuation: ALL PASSED" << std::endl;
 }
 
+void test_midi_learn_and_mseg_automation_bridge() {
+    std::cout << "[TEST 79] Running Dynamic MIDI Learn Router & MSEG-to-Arranger Automation Bridge..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::midi;
+    using namespace audio_core::routing;
+    using namespace audio_core::modulation;
+    using namespace audio_core::serialization;
+
+    // ------------------------------------------------------------------------
+    // Part A: MIDI Learn Direct Lock-Free Parameter Dispatch
+    // ------------------------------------------------------------------------
+    {
+        MixerGraph mixer(512);
+        Track* trk1 = mixer.add_track("Vocal Track");
+        Track* trk2 = mixer.add_track("Lead Synth");
+        TEST_CHECK(trk1 != nullptr && trk2 != nullptr);
+        uint32_t t1 = trk1->id();
+        uint32_t t2 = trk2->id();
+        mixer.add_submix_bus("Reverb Bus"); // Bus 1
+        mixer.add_submix_bus("Delay Bus");  // Bus 2
+
+        ModulationMatrix mod_matrix;
+        MidiLearnRouter router;
+
+        // Bind parameters:
+        // CC 7 -> Track 1 Volume [0.0, 1.25]
+        router.bind(0, 7, MidiLearnTargetType::TrackGain, t1, 0, 0, 0.0f, 1.25f, "Trk1 Vol");
+        // CC 10 -> Track 1 Pan [-1.0, +1.0]
+        router.bind(0, 10, MidiLearnTargetType::TrackPan, t1, 0, 0, -1.0f, 1.0f, "Trk1 Pan");
+        // CC 91 -> Track 1 Aux 1 (Send A) [0.0, 1.0]
+        router.bind(0, 91, MidiLearnTargetType::TrackAux1, t1, 0, 0, 0.0f, 1.0f, "Trk1 Aux1");
+        // CC 14 -> Master Volume [0.0, 1.25]
+        router.bind(0, 14, MidiLearnTargetType::MasterVolume, 0, 0, 0, 0.0f, 1.25f, "Master Vol");
+        // CC 74 -> PolySynth Cutoff [20.0, 20000.0]
+        router.bind(0, 74, MidiLearnTargetType::SynthParam, 0, 0, 0, 20.0f, 20000.0f, "Synth Cutoff");
+
+        TEST_CHECK(router.binding_count() == 5);
+
+        // Inject CC 7 val 127 -> Track 1 Volume should be 1.25
+        MidiEvent ev1{.frame_offset = 0, .status = 0xB0, .data1 = 7, .data2 = 127};
+        bool handled1 = router.process_midi_event(ev1, mixer, &mod_matrix);
+        TEST_CHECK(handled1);
+        TEST_CHECK(std::abs(mixer.get_track(t1)->gain() - 1.25f) < 1e-4f);
+
+        // Inject CC 10 val 64 -> Track 1 Pan
+        MidiEvent ev2{.frame_offset = 0, .status = 0xB0, .data1 = 10, .data2 = 64};
+        bool handled2 = router.process_midi_event(ev2, mixer, &mod_matrix);
+        TEST_CHECK(handled2);
+        float expected_pan = -1.0f + (64.0f / 127.0f) * 2.0f;
+        TEST_CHECK(std::abs(mixer.get_track(t1)->pan() - expected_pan) < 1e-4f);
+
+        // Inject CC 91 val 100 -> Track 1 Aux 1 Send
+        MidiEvent ev3{.frame_offset = 0, .status = 0xB0, .data1 = 91, .data2 = 100};
+        bool handled3 = router.process_midi_event(ev3, mixer, &mod_matrix);
+        TEST_CHECK(handled3);
+        float expected_send = (100.0f / 127.0f);
+        float actual_send = 0.0f;
+        for (const auto& s : mixer.get_track(t1)->sends()) {
+            if (s.active && s.bus_id == 1) actual_send = s.amount;
+        }
+        TEST_CHECK(std::abs(actual_send - expected_send) < 1e-4f);
+
+        // Inject CC 14 val 0 -> Master Volume
+        MidiEvent ev4{.frame_offset = 0, .status = 0xB0, .data1 = 14, .data2 = 0};
+        bool handled4 = router.process_midi_event(ev4, mixer, &mod_matrix);
+        TEST_CHECK(handled4);
+        TEST_CHECK(std::abs(mixer.master_volume() - 0.0f) < 1e-4f);
+
+        // Inject CC 74 val 127 -> PolySynth Cutoff
+        MidiEvent ev5{.frame_offset = 0, .status = 0xB0, .data1 = 74, .data2 = 127};
+        bool handled5 = router.process_midi_event(ev5, mixer, &mod_matrix);
+        TEST_CHECK(handled5);
+        TEST_CHECK(std::abs(mod_matrix.poly_synth().base_cutoff() - 20000.0f) < 1.0f);
+
+        std::cout << "  -> Part A (MIDI Learn Direct Lock-Free Parameter Dispatch): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part B: One-Click Learn Mode Interception
+        // --------------------------------------------------------------------
+        router.arm_learn(MidiLearnTargetType::TrackGain, t2, 0, 0, 0.0f, 1.25f, "Learned Trk 2 Gain");
+        TEST_CHECK(router.is_learning());
+        TEST_CHECK(router.learn_target().type == MidiLearnTargetType::TrackGain);
+        TEST_CHECK(router.learn_target().track_id == t2);
+
+        // Non-CC events (Note On) must be ignored and not cancel learn
+        MidiEvent ev_note{.frame_offset = 0, .status = 0x90, .data1 = 60, .data2 = 100};
+        bool handled_note = router.process_midi_event(ev_note, mixer, &mod_matrix);
+        TEST_CHECK(!handled_note);
+        TEST_CHECK(router.is_learning());
+
+        // Send hardware CC 23 val 90 -> Automatically binds CC 23 and updates Track 2 Gain
+        MidiEvent ev_learn{.frame_offset = 0, .status = 0xB0, .data1 = 23, .data2 = 90};
+        bool handled_learn = router.process_midi_event(ev_learn, mixer, &mod_matrix);
+        TEST_CHECK(handled_learn);
+        TEST_CHECK(!router.is_learning());
+        TEST_CHECK(router.last_learned_cc() == 23);
+        float expected_t2_gain = (90.0f / 127.0f) * 1.25f;
+        TEST_CHECK(std::abs(mixer.get_track(t2)->gain() - expected_t2_gain) < 1e-4f);
+        TEST_CHECK(router.binding_count() == 6);
+
+        std::cout << "  -> Part B (One-Click Learn Mode Interception): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part C: Unbinding & Inactive Target Isolation
+        // --------------------------------------------------------------------
+        bool unbound = router.unbind_cc(0, 23);
+        TEST_CHECK(unbound);
+        TEST_CHECK(router.binding_count() == 5);
+
+        // Subsequent CC 23 events must not affect Track 2 Gain
+        MidiEvent ev_unbound{.frame_offset = 0, .status = 0xB0, .data1 = 23, .data2 = 10};
+        bool handled_unbound = router.process_midi_event(ev_unbound, mixer, &mod_matrix);
+        TEST_CHECK(!handled_unbound);
+        TEST_CHECK(std::abs(mixer.get_track(t2)->gain() - expected_t2_gain) < 1e-4f);
+
+        std::cout << "  -> Part C (Unbinding & Inactive Target Isolation): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part D: Session JSON Serialization Roundtrip
+        // --------------------------------------------------------------------
+        ProjectSessionData session_data;
+        session_data.midi_learn = SessionSerializer::extract_midi_learn(router);
+        TEST_CHECK(session_data.midi_learn.has_value());
+        TEST_CHECK(session_data.midi_learn->bindings.size() == 5);
+
+        std::string json_str = session_data.to_json();
+        auto parsed_val = json::Parser::parse(json_str);
+        TEST_CHECK(parsed_val.has_value());
+        auto deserialized_opt = ProjectSessionData::from_json_val(*parsed_val);
+        TEST_CHECK(deserialized_opt.has_value());
+        TEST_CHECK(deserialized_opt->midi_learn.has_value());
+        TEST_CHECK(deserialized_opt->midi_learn->bindings.size() == 5);
+
+        MidiLearnRouter router2;
+        SessionSerializer::apply_midi_learn(router2, *deserialized_opt->midi_learn);
+        TEST_CHECK(router2.binding_count() == 5);
+
+        // Verify that router2 successfully dispatches loaded bindings
+        MidiEvent ev_r2{.frame_offset = 0, .status = 0xB0, .data1 = 7, .data2 = 64};
+        bool r2_handled = router2.process_midi_event(ev_r2, mixer, &mod_matrix);
+        TEST_CHECK(r2_handled);
+        float expected_r2_gain = (64.0f / 127.0f) * 1.25f;
+        TEST_CHECK(std::abs(mixer.get_track(t1)->gain() - expected_r2_gain) < 1e-4f);
+
+        std::cout << "  -> Part D (Session JSON Serialization Roundtrip): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part E: MSEG Baking & Repetitions onto Arranger Timeline
+    // ------------------------------------------------------------------------
+    {
+        // Construct a 4-beat triangular pulse MSEG:
+        // (0.0, 0.0) -> (1.0, 1.0) -> (4.0, 0.0)
+        MultiStageEnvelope mseg;
+        mseg.set_points({
+            MsegPoint{0.0, 0.0f, NodeMode::Smooth, 0.0f},
+            MsegPoint{1.0, 1.0f, NodeMode::Smooth, 0.0f},
+            MsegPoint{4.0, 0.0f, NodeMode::Smooth, 0.0f}
+        }, MsegTimeMode::BeatSync, MsegLoopMode::OneShot, -1);
+
+        // Bake 4 repetitions across [0.0, 16.0] beats (4 beats per cycle)
+        AutomationCurve baked_curve = MsegAutomationBridge::create_baked_curve(
+            mseg, 0.0, 16.0, 4, 0.0f, 1.0f, MsegAutomationBridge::FitMode::FitDuration, 120.0
+        );
+
+        // Verify points count and continuity
+        auto pts = baked_curve.get_points();
+        TEST_CHECK(pts.size() >= 9);
+
+        // Evaluate peaks: beats 1.0, 5.0, 9.0, 13.0 should be close to 1.0f
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(1.0) - 1.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(5.0) - 1.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(9.0) - 1.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(13.0) - 1.0f) < 0.05f);
+
+        // Evaluate valleys: beats 0.0, 4.0, 8.0, 12.0, 16.0 should be close to 0.0f
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(0.0) - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(4.0) - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(8.0) - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(12.0) - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(baked_curve.evaluate_audio_sample(16.0) - 0.0f) < 0.05f);
+
+        std::cout << "  -> Part E (MSEG Baking & Repetitions onto Arranger Timeline): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part F: Time-Mode Translation (Milliseconds <-> Beats @ BPM)
+        // --------------------------------------------------------------------
+        // 1000 ms duration MSEG at 120 BPM (1 beat = 500ms -> 1000ms = 2.0 beats)
+        MultiStageEnvelope mseg_ms;
+        mseg_ms.set_points({
+            MsegPoint{0.0, 0.0f, NodeMode::Corner, 0.0f},
+            MsegPoint{1000.0, 1.0f, NodeMode::Corner, 0.0f}
+        }, MsegTimeMode::Milliseconds, MsegLoopMode::OneShot, -1);
+
+        // Bake 4 repetitions over 8.0 beats (each cycle is 2 beats) with scaling [0.0, 10.0]
+        AutomationCurve curve_ms = MsegAutomationBridge::create_baked_curve(
+            mseg_ms, 0.0, 8.0, 4, 0.0f, 10.0f, MsegAutomationBridge::FitMode::FitDuration, 120.0
+        );
+
+        TEST_CHECK(std::abs(curve_ms.evaluate_audio_sample(0.0) - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(curve_ms.evaluate_audio_sample(1.0) - 5.0f) < 0.1f);
+        TEST_CHECK(std::abs(curve_ms.evaluate_audio_sample(3.0) - 5.0f) < 0.1f);
+        TEST_CHECK(std::abs(curve_ms.evaluate_audio_sample(5.0) - 5.0f) < 0.1f);
+
+        std::cout << "  -> Part F (Time-Mode Translation Milliseconds <-> Beats @ BPM): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part G: Extraction from Arranger Curve back to MSEG
+        // --------------------------------------------------------------------
+        MultiStageEnvelope extracted_mseg;
+        MsegAutomationBridge::extract_to_mseg(
+            baked_curve, extracted_mseg, 0.0, 4.0, MsegTimeMode::BeatSync, 0.0f, 1.0f, 120.0
+        );
+
+        auto ext_pts = extracted_mseg.get_points();
+        TEST_CHECK(ext_pts.size() >= 3);
+        TEST_CHECK(std::abs(ext_pts.front().time - 0.0) < 1e-4);
+        TEST_CHECK(std::abs(ext_pts.front().value - 0.0f) < 0.05f);
+        TEST_CHECK(std::abs(ext_pts.back().time - 4.0) < 1e-4);
+        TEST_CHECK(std::abs(ext_pts.back().value - 0.0f) < 0.05f);
+
+        std::cout << "  -> Part G (Extraction from Arranger Curve back to MSEG): PASSED" << std::endl;
+
+        // --------------------------------------------------------------------
+        // Part H: Dynamic MSEG Modulator (Real-Time Block Processing)
+        // --------------------------------------------------------------------
+        DynamicMsegModulator modulator;
+        modulator.arm(0.5f, 2.0f);
+        TEST_CHECK(modulator.is_active());
+
+        std::array<float, 256> mod_buf{};
+        modulator.process_block(mod_buf.data(), 256, mseg, 48000, 120.0);
+
+        for (size_t s = 0; s < 256; ++s) {
+            TEST_CHECK(!std::isnan(mod_buf[s]));
+            TEST_CHECK(!std::isinf(mod_buf[s]));
+            TEST_CHECK(mod_buf[s] >= 0.45f && mod_buf[s] <= 2.05f);
+        }
+
+        std::cout << "  -> Part H (Dynamic MSEG Modulator Real-Time Block Processing): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part I: HardwareMidiReceiver Integration (drain_to router)
+    // ------------------------------------------------------------------------
+    {
+        MixerGraph mixer(512);
+        Track* trk = mixer.add_track("Synth Track");
+        TEST_CHECK(trk != nullptr);
+        uint32_t trk_id = trk->id();
+
+        ModulationMatrix mod_matrix;
+        MidiLearnRouter router;
+        // Bind CC 20 to Track Pan [-1.0, 1.0]
+        router.bind(0, 20, MidiLearnTargetType::TrackPan, trk_id, 0, 0, -1.0f, 1.0f, "Trk Pan");
+
+        HardwareMidiReceiver rx;
+        const uint8_t cc20_bytes[] = { 0xB0, 20, 85 };
+        rx.inject_raw_bytes(cc20_bytes, sizeof(cc20_bytes));
+
+        size_t drained = rx.drain_to(router, mixer, &mod_matrix);
+        TEST_CHECK(drained > 0);
+
+        float expected_pan = -1.0f + (85.0f / 127.0f) * 2.0f;
+        TEST_CHECK(std::abs(trk->pan() - expected_pan) < 1e-4f);
+
+        std::cout << "  -> Part I (HardwareMidiReceiver drain_to Integration): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Dynamic MIDI Learn Router & MSEG-to-Arranger Automation Bridge: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -11413,6 +11687,7 @@ int main() {
     test_master_clock_and_mtc_generator();
     test_timeline_scrubbing_and_mtc_full_frame_broadcast();
     test_alsa_hardware_loopback_stress_and_scrub_attenuation();
+    test_midi_learn_and_mseg_automation_bridge();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

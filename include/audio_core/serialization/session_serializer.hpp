@@ -5,6 +5,7 @@
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/dsp/processor_factory.hpp"
 #include "audio_core/modulation/modulation_matrix.hpp"
+#include "audio_core/midi/midi_learn_router.hpp"
 
 #include <string>
 #include <string_view>
@@ -653,6 +654,77 @@ struct ModulationMatrixData {
     }
 };
 
+struct MidiBindingData {
+    uint8_t channel{255};
+    uint8_t cc{0};
+    uint8_t target_type{0};
+    uint32_t track_id{0};
+    uint32_t slot_idx{0};
+    uint32_t param_idx{0};
+    float min_val{0.0f};
+    float max_val{1.0f};
+    bool active{true};
+    std::string label{};
+};
+
+struct MidiLearnData {
+    bool has_data{false};
+    std::vector<MidiBindingData> bindings{};
+
+    [[nodiscard]] std::string to_json(int indent = 4) const {
+        std::string ind(indent, ' ');
+        std::string ind2(indent + 2, ' ');
+        std::string ind3(indent + 4, ' ');
+        std::ostringstream ss;
+        ss << ind << "{\n";
+        ss << ind2 << "\"bindings\": [\n";
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            const auto& b = bindings[i];
+            ss << ind3 << "{\n";
+            ss << ind3 << "  \"channel\": " << static_cast<int>(b.channel) << ",\n";
+            ss << ind3 << "  \"cc\": " << static_cast<int>(b.cc) << ",\n";
+            ss << ind3 << "  \"type\": " << static_cast<int>(b.target_type) << ",\n";
+            ss << ind3 << "  \"track_id\": " << b.track_id << ",\n";
+            ss << ind3 << "  \"slot_idx\": " << b.slot_idx << ",\n";
+            ss << ind3 << "  \"param_idx\": " << b.param_idx << ",\n";
+            ss << ind3 << "  \"min_val\": " << b.min_val << ",\n";
+            ss << ind3 << "  \"max_val\": " << b.max_val << ",\n";
+            ss << ind3 << "  \"active\": " << (b.active ? "true" : "false") << ",\n";
+            ss << ind3 << "  \"label\": \"" << b.label << "\"\n";
+            ss << ind3 << "}" << (i + 1 < bindings.size() ? ",\n" : "\n");
+        }
+        ss << ind2 << "]\n";
+        ss << ind << "}";
+        return ss.str();
+    }
+
+    static std::optional<MidiLearnData> from_json_val(const json::Value& val) {
+        if (!val.is_object()) return std::nullopt;
+        MidiLearnData mld;
+        mld.has_data = true;
+        if (auto* barr = val.get("bindings")) {
+            if (barr->is_array()) {
+                for (const auto& item : barr->arr_val) {
+                    if (!item.is_object()) continue;
+                    MidiBindingData bd;
+                    if (auto* ch = item.get("channel")) bd.channel = static_cast<uint8_t>(ch->as_uint(255));
+                    if (auto* cc = item.get("cc")) bd.cc = static_cast<uint8_t>(cc->as_uint(0));
+                    if (auto* ty = item.get("type")) bd.target_type = static_cast<uint8_t>(ty->as_uint(0));
+                    if (auto* tid = item.get("track_id")) bd.track_id = tid->as_uint(0);
+                    if (auto* si = item.get("slot_idx")) bd.slot_idx = si->as_uint(0);
+                    if (auto* pi = item.get("param_idx")) bd.param_idx = pi->as_uint(0);
+                    if (auto* minv = item.get("min_val")) bd.min_val = minv->as_float(0.0f);
+                    if (auto* maxv = item.get("max_val")) bd.max_val = maxv->as_float(1.0f);
+                    if (auto* act = item.get("active")) bd.active = act->as_bool(true);
+                    if (auto* lbl = item.get("label")) bd.label = lbl->as_string("");
+                    mld.bindings.push_back(std::move(bd));
+                }
+            }
+        }
+        return mld;
+    }
+};
+
 struct ProjectSessionData {
     std::string project_name{"Untitled Project"};
     uint32_t sample_rate{48000};
@@ -662,6 +734,7 @@ struct ProjectSessionData {
     RackPresetData master_rack{};
     std::vector<TrackPresetData> tracks{};
     std::optional<ModulationMatrixData> modulation_matrix{std::nullopt};
+    std::optional<MidiLearnData> midi_learn{std::nullopt};
 
     [[nodiscard]] std::string to_json() const {
         std::ostringstream ss;
@@ -790,6 +863,9 @@ struct ProjectSessionData {
         ss << "  ]";
         if (modulation_matrix.has_value()) {
             ss << ",\n  \"modulation_matrix\": " << modulation_matrix->to_json(2);
+        }
+        if (midi_learn.has_value()) {
+            ss << ",\n  \"midi_learn\": " << midi_learn->to_json(2);
         }
         ss << "\n}";
         return ss.str();
@@ -942,6 +1018,10 @@ struct ProjectSessionData {
 
         if (auto* mm_val = val.get("modulation_matrix")) {
             data.modulation_matrix = ModulationMatrixData::from_json_val(*mm_val);
+        }
+
+        if (auto* ml_val = val.get("midi_learn")) {
+            data.midi_learn = MidiLearnData::from_json_val(*ml_val);
         }
 
         return data;
@@ -1154,9 +1234,45 @@ public:
         ps.set_master_level(data.poly_synth.master_level);
     }
 
+    static MidiLearnData extract_midi_learn(const midi::MidiLearnRouter& router) {
+        MidiLearnData data;
+        data.has_data = true;
+        auto bindings = router.get_bindings();
+        for (const auto& b : bindings) {
+            MidiBindingData bd;
+            bd.channel = b.channel;
+            bd.cc = b.cc_number;
+            bd.target_type = static_cast<uint8_t>(b.target.type);
+            bd.track_id = b.target.track_id;
+            bd.slot_idx = b.target.slot_idx;
+            bd.param_idx = b.target.param_idx;
+            bd.min_val = b.min_val;
+            bd.max_val = b.max_val;
+            bd.active = b.active;
+            bd.label = b.custom_label;
+            data.bindings.push_back(std::move(bd));
+        }
+        return data;
+    }
+
+    static void apply_midi_learn(midi::MidiLearnRouter& router, const MidiLearnData& data) {
+        router.clear_all_bindings();
+        for (const auto& bd : data.bindings) {
+            if (!bd.active) continue;
+            midi::MidiLearnTarget target{
+                .type = static_cast<midi::MidiLearnTargetType>(bd.target_type),
+                .track_id = bd.track_id,
+                .slot_idx = bd.slot_idx,
+                .param_idx = bd.param_idx
+            };
+            router.bind(bd.channel, bd.cc, target, bd.min_val, bd.max_val, bd.label);
+        }
+    }
+
     static ProjectSessionData extract_session(const MixerGraph& mixer, const clock::TimelineClock& clock,
                                               const std::string& name = "Untitled Project",
-                                              const modulation::ModulationMatrix* mod_matrix = nullptr) {
+                                              const modulation::ModulationMatrix* mod_matrix = nullptr,
+                                              const midi::MidiLearnRouter* midi_learn = nullptr) {
         ProjectSessionData data;
         data.project_name = name;
         data.sample_rate = mixer.sample_rate();
@@ -1166,6 +1282,9 @@ public:
 
         if (mod_matrix) {
             data.modulation_matrix = extract_modulation_matrix(*mod_matrix);
+        }
+        if (midi_learn) {
+            data.midi_learn = extract_midi_learn(*midi_learn);
         }
 
         // Extract tracks
@@ -1270,13 +1389,18 @@ public:
     }
 
     static bool apply_session(MixerGraph& mixer, clock::TimelineClock& clock, const ProjectSessionData& data,
-                              modulation::ModulationMatrix* mod_matrix = nullptr) {
+                              modulation::ModulationMatrix* mod_matrix = nullptr,
+                              midi::MidiLearnRouter* midi_learn = nullptr) {
         clock.set_bpm(data.bpm);
         mixer.set_master_volume(data.master_volume);
         mixer.set_master_limiter_enabled(data.master_limiter_enabled);
 
         if (mod_matrix && data.modulation_matrix.has_value()) {
             apply_modulation_matrix(*mod_matrix, *data.modulation_matrix);
+        }
+
+        if (midi_learn && data.midi_learn.has_value()) {
+            apply_midi_learn(*midi_learn, *data.midi_learn);
         }
 
         for (const auto& tdata : data.tracks) {
@@ -1391,8 +1515,9 @@ public:
     // High-Level File Persistence
     static bool save_session_file(const std::string& filepath, const MixerGraph& mixer,
                                   const clock::TimelineClock& clock, const std::string& name = "Untitled Project",
-                                  const modulation::ModulationMatrix* mod_matrix = nullptr) {
-        auto data = extract_session(mixer, clock, name, mod_matrix);
+                                  const modulation::ModulationMatrix* mod_matrix = nullptr,
+                                  const midi::MidiLearnRouter* midi_learn = nullptr) {
+        auto data = extract_session(mixer, clock, name, mod_matrix, midi_learn);
         std::ofstream file(filepath);
         if (!file.is_open()) return false;
         file << data.to_json();
@@ -1400,7 +1525,8 @@ public:
     }
 
     static bool load_session_file(const std::string& filepath, MixerGraph& mixer, clock::TimelineClock& clock,
-                                  modulation::ModulationMatrix* mod_matrix = nullptr) {
+                                  modulation::ModulationMatrix* mod_matrix = nullptr,
+                                  midi::MidiLearnRouter* midi_learn = nullptr) {
         std::ifstream file(filepath);
         if (!file.is_open()) return false;
         std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -1408,7 +1534,7 @@ public:
         if (!parsed) return false;
         auto data = ProjectSessionData::from_json_val(*parsed);
         if (!data) return false;
-        return apply_session(mixer, clock, *data, mod_matrix);
+        return apply_session(mixer, clock, *data, mod_matrix, midi_learn);
     }
 
     static bool save_rack_preset_file(const std::string& filepath, const Track& track, const std::string& name = "User Preset") {

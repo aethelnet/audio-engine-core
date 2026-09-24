@@ -19,6 +19,8 @@
 #include "audio_core/engine.hpp"
 #include "audio_core/midi/hardware_midi_receiver.hpp"
 #include "audio_core/midi/midi_sync.hpp"
+#include "audio_core/midi/midi_learn_router.hpp"
+#include "audio_core/routing/mseg_automation_bridge.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
 
 
@@ -529,6 +531,12 @@ int main(int argc, char** argv) {
     midi::HardwareMidiReceiver midi_rx;
     midi_rx.auto_connect();
 
+    // Dynamic MIDI Learn Router
+    midi::MidiLearnRouter midi_learn;
+    midi_learn.bind(midi::MidiLearnRouter::kOmniChannel, 7, midi::MidiLearnTargetType::MasterVolume, 0, 0, 0, 0.0f, 1.25f, "Master Volume (CC 7)");
+    midi_learn.bind(midi::MidiLearnRouter::kOmniChannel, 74, midi::MidiLearnTargetType::SynthParam, 0, 0, 0, 20.0f, 20000.0f, "PolySynth Cutoff (CC 74)");
+    midi_learn.bind(midi::MidiLearnRouter::kOmniChannel, 71, midi::MidiLearnTargetType::SynthParam, 0, 0, 1, 0.5f, 15.0f, "PolySynth Res (CC 71)");
+
     // Auto-route Track 1 ("Acid 303 Lead" / Poly Synth) to PolyphonicSynth + ModulationMatrix
     trk1->set_name("Poly Synth / Lead");
     mixer.assign_track_poly_synth(trk1->id(), &mod_matrix.poly_synth(), &mod_matrix);
@@ -663,8 +671,8 @@ int main(int argc, char** argv) {
             playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
         }
 
-        // Drain incoming Hardware MIDI events into ModulationMatrix & PolyphonicSynth
-        midi_rx.drain_to(mod_matrix);
+        // Drain incoming Hardware MIDI events through MidiLearnRouter into ModulationMatrix & PolyphonicSynth
+        midi_rx.drain_to(midi_learn, mixer, &mod_matrix);
         midi_rx.sync_to_clock(mixer.clock());
         if (mixer.clock().authority() == clock::ClockAuthority::MidiClockSlave ||
             mixer.clock().authority() == clock::ClockAuthority::MtcSlave) {
@@ -2637,6 +2645,9 @@ int main(int argc, char** argv) {
                             }
 
                             // Vertical Fader & Meter Bridge
+                            if (trk_ptr) {
+                                track_gains[t] = trk_ptr->gain();
+                            }
                             ImGui::VSliderFloat("##fader", ImVec2(34, 110), &track_gains[t], 0.0f, 1.25f, "");
 
                             if (ImGui::IsItemEdited()) {
@@ -2647,6 +2658,24 @@ int main(int argc, char** argv) {
                                 mixer.post_command(cmd);
                             }
 
+                            if (ImGui::BeginPopupContextItem("FaderMidiCtx")) {
+                                uint8_t b_ch = 0, b_cc = 0;
+                                midi::MidiLearnTarget tgt{midi::MidiLearnTargetType::TrackGain, static_cast<uint32_t>(t + 1), 0, 0};
+                                bool is_bound = midi_learn.is_target_bound(tgt, &b_ch, &b_cc);
+                                if (is_bound) {
+                                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "MIDI Bound: CC %u (Ch %u)", b_cc, b_ch);
+                                    if (ImGui::MenuItem("Unbind MIDI CC")) {
+                                        midi_learn.unbind_target(tgt);
+                                    }
+                                } else {
+                                    if (ImGui::MenuItem("Learn MIDI CC")) {
+                                        std::string lbl = "Track " + std::to_string(t + 1) + " Gain";
+                                        midi_learn.arm_learn(tgt, 0.0f, 1.25f, lbl);
+                                    }
+                                }
+                                ImGui::EndPopup();
+                            }
+
                             ImGui::SameLine();
                             ImVec2 meter_pos = ImGui::GetCursorScreenPos();
                             ui::DrawDbMeter(ImGui::GetWindowDrawList(), meter_pos, ImVec2(24, 110),
@@ -2655,9 +2684,18 @@ int main(int argc, char** argv) {
                                             telemetry.track_meters[t].peak_l >= 1.0f);
                             ImGui::Dummy(ImVec2(26, 110));
 
-                            // Numerical dB read
+                            // Numerical dB read + MIDI CC Badge
                             float db = ui::linear_to_db(track_gains[t]);
                             ImGui::Text("%.1f dB", db);
+                            uint8_t b_ch = 0, b_cc = 0;
+                            midi::MidiLearnTarget tgt{midi::MidiLearnTargetType::TrackGain, static_cast<uint32_t>(t + 1), 0, 0};
+                            if (midi_learn.is_target_bound(tgt, &b_ch, &b_cc)) {
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.15f, 1.0f), "[CC%u]", b_cc);
+                            } else if (midi_learn.is_learning() && midi_learn.learn_target() == tgt) {
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[LRN]");
+                            }
                         }
                         ImGui::EndChild();
                         ImGui::SameLine();
@@ -2796,13 +2834,29 @@ int main(int argc, char** argv) {
                             mixer.post_command(cmd);
                         }
 
-                        ImGui::Spacing();
+                        master_gain = mixer.master_volume();
                         ImGui::VSliderFloat("##mfader", ImVec2(34, 110), &master_gain, 0.0f, 1.25f, "");
                         if (ImGui::IsItemEdited()) {
                             protocol::MixerCommand cmd{};
                             cmd.type = protocol::MixerCommandType::SetMasterGain;
                             cmd.value1 = master_gain;
                             mixer.post_command(cmd);
+                        }
+                        if (ImGui::BeginPopupContextItem("MasterMidiCtx")) {
+                            uint8_t b_ch = 0, b_cc = 0;
+                            midi::MidiLearnTarget tgt{midi::MidiLearnTargetType::MasterVolume, 0, 0, 0};
+                            bool is_bound = midi_learn.is_target_bound(tgt, &b_ch, &b_cc);
+                            if (is_bound) {
+                                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "MIDI Bound: CC %u (Ch %u)", b_cc, b_ch);
+                                if (ImGui::MenuItem("Unbind MIDI CC")) {
+                                    midi_learn.unbind_target(tgt);
+                                }
+                            } else {
+                                if (ImGui::MenuItem("Learn MIDI CC")) {
+                                    midi_learn.arm_learn(tgt, 0.0f, 1.25f, "Master Volume");
+                                }
+                            }
+                            ImGui::EndPopup();
                         }
                         ImGui::SameLine();
                         ImVec2 mpos = ImGui::GetCursorScreenPos();
@@ -2812,6 +2866,15 @@ int main(int argc, char** argv) {
                                         telemetry.master_meter.peak_l >= 1.0f);
                         ImGui::Dummy(ImVec2(26, 110));
                         ImGui::Text("%.1f dB", ui::linear_to_db(master_gain));
+                        uint8_t mb_ch = 0, mb_cc = 0;
+                        midi::MidiLearnTarget mtgt{midi::MidiLearnTargetType::MasterVolume, 0, 0, 0};
+                        if (midi_learn.is_target_bound(mtgt, &mb_ch, &mb_cc)) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.15f, 1.0f), "[CC%u]", mb_cc);
+                        } else if (midi_learn.is_learning() && midi_learn.learn_target() == mtgt) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[LRN]");
+                        }
                     }
                     ImGui::EndChild();
                     ImGui::PopID();
@@ -3983,6 +4046,33 @@ int main(int argc, char** argv) {
                                 }
                             }
 
+                            ImGui::Spacing();
+                            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.15f, 1.0f), "MSEG Spline Bridge:");
+                            ImGui::SameLine();
+                            if (ImGui::Button("[ ⤓ Stamp MSEG 1 (Voice Env) ]")) {
+                                routing::MsegAutomationBridge::bake_to_curve(
+                                    mod_matrix.mseg1(), active_curve, 0.0, 16.0, 4,
+                                    cur_pmin, cur_pmax, routing::MsegAutomationBridge::FitMode::FitDuration,
+                                    true, mixer.clock().bpm());
+                                if (selected_auto_lane < 4) auto_trk->set_automation_enabled(current_target, true);
+                                else auto_trk->set_slot_automation_enabled((selected_auto_lane - 4) / 4, (selected_auto_lane - 4) % 4, true);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("[ ⤓ Stamp MSEG 2 (Mod Env) ]")) {
+                                routing::MsegAutomationBridge::bake_to_curve(
+                                    mod_matrix.mseg2(), active_curve, 0.0, 16.0, 4,
+                                    cur_pmin, cur_pmax, routing::MsegAutomationBridge::FitMode::FitDuration,
+                                    true, mixer.clock().bpm());
+                                if (selected_auto_lane < 4) auto_trk->set_automation_enabled(current_target, true);
+                                else auto_trk->set_slot_automation_enabled((selected_auto_lane - 4) / 4, (selected_auto_lane - 4) % 4, true);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("[ ⤒ Extract Lane to MSEG 2 ]")) {
+                                routing::MsegAutomationBridge::extract_to_mseg(
+                                    active_curve, mod_matrix.mseg2(), 0.0, 16.0, modulation::MsegTimeMode::BeatSync,
+                                    cur_pmin, cur_pmax, mixer.clock().bpm());
+                            }
+
                             editor_curve = &active_curve;
                             editor_target = current_target;
                             editor_custom_min = cur_pmin;
@@ -4482,6 +4572,103 @@ int main(int argc, char** argv) {
                                 midi_rx.broadcast_seek_position(mixer.clock());
                             }
 
+                        }
+                    }
+
+                    // Dynamic MIDI Learn & Hardware CC Mapping Table
+                    {
+                        static bool show_midi_learn_table = true;
+                        ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.95f, 1.0f), "MIDI Learn & CC Mappings:");
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(show_midi_learn_table ? " [-] Hide Table " : " [+] Show Table ")) {
+                            show_midi_learn_table = !show_midi_learn_table;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" + Learn Master Vol ")) {
+                            midi_learn.arm_learn(midi::MidiLearnTargetType::MasterVolume, 0, 0, 0, 0.0f, 1.25f, "Master Volume");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" + Learn Trk 1 Gain ")) {
+                            midi_learn.arm_learn(midi::MidiLearnTargetType::TrackGain, 0, 0, 0, 0.0f, 1.25f, "Track 1 Gain");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" + Learn Trk 2 Pan ")) {
+                            midi_learn.arm_learn(midi::MidiLearnTargetType::TrackPan, 1, 0, 0, -1.0f, 1.0f, "Track 2 Pan");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" + Learn Synth Cutoff ")) {
+                            midi_learn.arm_learn(midi::MidiLearnTargetType::SynthParam, 0, 0, 0, 20.0f, 20000.0f, "PolySynth Cutoff");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(" Clear All ")) {
+                            midi_learn.clear_all_bindings();
+                        }
+
+                        if (midi_learn.is_learning()) {
+                            ImGui::SameLine();
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.50f, 0.10f, 1.0f));
+                            if (ImGui::SmallButton(" ⚠ CANCEL LEARN ")) {
+                                midi_learn.cancel_learn();
+                            }
+                            ImGui::PopStyleColor();
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.20f, 1.0f), "● Waiting for CC input...");
+                        }
+
+                        if (show_midi_learn_table) {
+                            auto bindings = midi_learn.get_bindings();
+                            if (bindings.empty()) {
+                                ImGui::TextDisabled("   (No active MIDI CC bindings. Click '+ Learn' or right-click any track fader)");
+                            } else {
+                                if (ImGui::BeginTable("MidiLearnBindingsTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                                    ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 35.0f);
+                                    ImGui::TableSetupColumn("Label / Parameter", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("Channel", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                                    ImGui::TableSetupColumn("CC #", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                                    ImGui::TableSetupColumn("Range [Min, Max]", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                                    ImGui::TableSetupColumn("Last Value", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                                    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                                    ImGui::TableHeadersRow();
+
+                                    for (const auto& b : bindings) {
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::Text("%u", b.id);
+
+                                        ImGui::TableSetColumnIndex(1);
+                                        if (!b.custom_label.empty()) {
+                                            ImGui::Text("%s", b.custom_label.c_str());
+                                        } else {
+                                            ImGui::Text("%s", midi::midi_learn_target_type_name(b.target.type));
+                                        }
+
+                                        ImGui::TableSetColumnIndex(2);
+                                        if (b.channel == midi::MidiLearnRouter::kOmniChannel) {
+                                            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Omni");
+                                        } else {
+                                            ImGui::Text("Ch %u", b.channel + 1);
+                                        }
+
+                                        ImGui::TableSetColumnIndex(3);
+                                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "CC %u", b.cc_number);
+
+                                        ImGui::TableSetColumnIndex(4);
+                                        ImGui::Text("[%.2f, %.2f]", b.min_val, b.max_val);
+
+                                        ImGui::TableSetColumnIndex(5);
+                                        ImGui::Text("%.2f", b.last_value);
+
+                                        ImGui::TableSetColumnIndex(6);
+                                        ImGui::PushID(static_cast<int>(b.id));
+                                        if (ImGui::SmallButton("Unbind")) {
+                                            midi_learn.unbind_by_id(b.id);
+                                        }
+                                        ImGui::PopID();
+                                    }
+                                    ImGui::EndTable();
+                                }
+                            }
                         }
                     }
                     ImGui::Separator();

@@ -354,6 +354,40 @@ public:
                          std::memory_order_release);
     }
 
+    MultiStageEnvelope(MultiStageEnvelope&& other) noexcept {
+        m_snapshot.store(other.m_snapshot.load(std::memory_order_acquire), std::memory_order_release);
+        m_base_time_scale.store(other.m_base_time_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_base_attack_scale.store(other.m_base_attack_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_base_decay_scale.store(other.m_base_decay_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_base_level_scale.store(other.m_base_level_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_base_tension_offset.store(other.m_base_tension_offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_mod_attack_scale.store(other.m_mod_attack_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_mod_decay_scale.store(other.m_mod_decay_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_mod_time_scale.store(other.m_mod_time_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_mod_level_scale.store(other.m_mod_level_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_mod_tension_offset.store(other.m_mod_tension_offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    MultiStageEnvelope& operator=(MultiStageEnvelope&& other) noexcept {
+        if (this != &other) {
+            m_snapshot.store(other.m_snapshot.load(std::memory_order_acquire), std::memory_order_release);
+            m_base_time_scale.store(other.m_base_time_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_base_attack_scale.store(other.m_base_attack_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_base_decay_scale.store(other.m_base_decay_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_base_level_scale.store(other.m_base_level_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_base_tension_offset.store(other.m_base_tension_offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_mod_attack_scale.store(other.m_mod_attack_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_mod_decay_scale.store(other.m_mod_decay_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_mod_time_scale.store(other.m_mod_time_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_mod_level_scale.store(other.m_mod_level_scale.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_mod_tension_offset.store(other.m_mod_tension_offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+    MultiStageEnvelope(const MultiStageEnvelope&) = delete;
+    MultiStageEnvelope& operator=(const MultiStageEnvelope&) = delete;
+
     // Audio-thread lock-free RCU acquire
     [[nodiscard]] std::shared_ptr<const MsegSnapshot> snapshot() const noexcept {
         return m_snapshot.load(std::memory_order_acquire);

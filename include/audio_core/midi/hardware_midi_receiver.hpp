@@ -5,6 +5,8 @@
 #include "audio_core/modulation/polyphonic_synth.hpp"
 #include "audio_core/modulation/modulation_matrix.hpp"
 #include "audio_core/midi/midi_sync.hpp"
+#include "audio_core/midi/midi_learn_router.hpp"
+#include "audio_core/mixer_graph.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -789,6 +791,51 @@ public:
                 }
                 default:
                     break;
+            }
+            ++count;
+        }
+        return count;
+    }
+
+    size_t drain_to(MidiLearnRouter& router, MixerGraph& mixer, modulation::ModulationMatrix* matrix = nullptr) noexcept {
+        MidiEvent ev{};
+        size_t count = 0;
+        while (m_queue.try_pop(ev)) {
+            // 1. Dispatch CC to MidiLearnRouter (updates parameters or handles learn capture)
+            (void)router.process_midi_event(ev, mixer, matrix);
+
+            // 2. Dispatch performance and note events to modulation matrix / synth
+            if (matrix) {
+                switch (ev.type()) {
+                    case MidiStatus::NoteOn:
+                        if (ev.velocity() > 0) {
+                            matrix->poly_note_on(ev.note(), static_cast<float>(ev.velocity()) / 127.0f);
+                        } else {
+                            matrix->poly_note_off(ev.note());
+                        }
+                        break;
+                    case MidiStatus::NoteOff:
+                        matrix->poly_note_off(ev.note());
+                        break;
+                    case MidiStatus::ControlChange:
+                        if (ev.data1 == 1) { // Mod Wheel
+                            matrix->set_performance_controls(matrix->velocity(), matrix->key_track(), static_cast<float>(ev.data2) / 127.0f, matrix->pitch_bend());
+                        } else if (ev.data1 == 64) { // Sustain Pedal
+                            matrix->poly_synth().set_sustain_pedal(ev.data2 >= 64);
+                        } else if (ev.data1 == 120 || ev.data1 == 123) { // All sound / notes off
+                            matrix->poly_all_notes_off();
+                        }
+                        break;
+                    case MidiStatus::PitchBend: {
+                        int pb = (static_cast<int>(ev.data2) << 7) | static_cast<int>(ev.data1);
+                        float norm_pb = (static_cast<float>(pb) - 8192.0f) / 8192.0f;
+                        matrix->set_performance_controls(matrix->velocity(), matrix->key_track(), matrix->mod_wheel(), norm_pb);
+                        matrix->poly_synth().set_pitch_bend_norm(norm_pb);
+                        break;
+                    }
+                    default:
+                        break;
+                }
             }
             ++count;
         }
