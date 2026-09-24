@@ -263,6 +263,9 @@ public:
         m_running_status = 0;
         m_expected_bytes = 0;
         m_received_bytes = 0;
+        m_in_sysex = false;
+        m_sysex_len = 0;
+        m_clock_gen.reset();
     }
 
     [[nodiscard]] bool is_connected() const noexcept {
@@ -493,11 +496,42 @@ public:
     [[nodiscard]] MidiSyncTracker& sync_tracker() noexcept { return m_sync_tracker; }
     [[nodiscard]] const MidiSyncTracker& sync_tracker() const noexcept { return m_sync_tracker; }
 
+    [[nodiscard]] MidiClockGenerator& clock_generator() noexcept { return m_clock_gen; }
+    [[nodiscard]] const MidiClockGenerator& clock_generator() const noexcept { return m_clock_gen; }
+
     void sync_to_clock(clock::TimelineClock& clock) noexcept {
         m_sync_tracker.apply_to_timeline_clock(clock);
     }
 
-    bool send_midi_clock_tick() noexcept {
+    void process_master_clock(uint32_t frames, const clock::TimelineClock& clock) noexcept {
+        if (clock.authority() != clock::ClockAuthority::Master) {
+            return;
+        }
+        const uint64_t sr = std::max(1u, clock.sample_rate());
+        const uint64_t block_ts_ns = (clock.sample_position() * 1'000'000'000ULL) / sr;
+
+        m_clock_gen.process_block(
+            frames, clock,
+            [this, block_ts_ns](uint8_t byte) {
+                switch (byte) {
+                    case 0xF8: send_midi_clock_tick(block_ts_ns); break;
+                    case 0xFA: send_midi_start(); break;
+                    case 0xFB: send_midi_continue(); break;
+                    case 0xFC: send_midi_stop(); break;
+                    default: break;
+                }
+            },
+            [this](uint8_t qf_data) {
+                send_mtc_qframe(qf_data);
+            }
+        );
+    }
+
+    bool send_midi_clock_tick(uint64_t timestamp_ns = 0) noexcept {
+        if (m_fd >= 0) {
+            uint8_t b = 0xF8;
+            (void)::write(m_fd, &b, 1);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_CLOCK;
@@ -506,10 +540,17 @@ public:
         ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
         ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
         ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+        ev.flags = SNDRV_SEQ_TIME_STAMP_REAL;
+        ev.time.time.tv_sec = static_cast<unsigned int>(timestamp_ns / 1'000'000'000ULL);
+        ev.time.time.tv_nsec = static_cast<unsigned int>(timestamp_ns % 1'000'000'000ULL);
         return send_seq_event(ev);
     }
 
     bool send_midi_start() noexcept {
+        if (m_fd >= 0) {
+            uint8_t b = 0xFA;
+            (void)::write(m_fd, &b, 1);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_START;
@@ -522,6 +563,10 @@ public:
     }
 
     bool send_midi_continue() noexcept {
+        if (m_fd >= 0) {
+            uint8_t b = 0xFB;
+            (void)::write(m_fd, &b, 1);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_CONTINUE;
@@ -534,6 +579,10 @@ public:
     }
 
     bool send_midi_stop() noexcept {
+        if (m_fd >= 0) {
+            uint8_t b = 0xFC;
+            (void)::write(m_fd, &b, 1);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_STOP;
@@ -546,6 +595,10 @@ public:
     }
 
     bool send_midi_spp(uint16_t spp_sixteenths) noexcept {
+        if (m_fd >= 0) {
+            uint8_t raw[3] = { 0xF2, static_cast<uint8_t>(spp_sixteenths & 0x7F), static_cast<uint8_t>((spp_sixteenths >> 7) & 0x7F) };
+            (void)::write(m_fd, raw, 3);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_SONGPOS;
@@ -559,6 +612,10 @@ public:
     }
 
     bool send_mtc_qframe(uint8_t qframe_byte) noexcept {
+        if (m_fd >= 0) {
+            uint8_t raw[2] = { 0xF1, qframe_byte };
+            (void)::write(m_fd, raw, 2);
+        }
         if (m_seq_fd < 0 && !m_is_mock) return false;
         struct snd_seq_event ev{};
         ev.type = SNDRV_SEQ_EVENT_QFRAME;
@@ -569,6 +626,37 @@ public:
         ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
         ev.data.control.value = qframe_byte;
         return send_seq_event(ev);
+    }
+
+    bool send_mtc_full_frame(uint8_t hr, uint8_t mn, uint8_t sc, uint8_t fr, MtcFrameRate rate) noexcept {
+        auto full_frame = MidiClockGenerator::make_mtc_full_frame(hr, mn, sc, fr, rate);
+        if (m_is_mock) {
+            m_sync_tracker.on_mtc_full_frame(hr, mn, sc, fr, rate);
+            return true;
+        }
+        bool ok = false;
+        if (m_fd >= 0) {
+            ssize_t w = ::write(m_fd, full_frame.data(), full_frame.size());
+            if (w == static_cast<ssize_t>(full_frame.size())) ok = true;
+        }
+        if (m_seq_fd >= 0) {
+            struct snd_seq_event ev{};
+            ev.type = SNDRV_SEQ_EVENT_SYSEX;
+            ev.flags = SNDRV_SEQ_EVENT_LENGTH_VARIABLE;
+            ev.source.client = static_cast<unsigned char>(m_seq_client_id);
+            ev.source.port = static_cast<unsigned char>(m_seq_port_id);
+            ev.dest.client = SNDRV_SEQ_ADDRESS_SUBSCRIBERS;
+            ev.dest.port = SNDRV_SEQ_ADDRESS_UNKNOWN;
+            ev.queue = SNDRV_SEQ_QUEUE_DIRECT;
+            ev.data.ext.ptr = full_frame.data();
+            ev.data.ext.len = static_cast<unsigned int>(full_frame.size());
+            if (send_seq_event(ev)) ok = true;
+        }
+        return ok;
+    }
+
+    bool send_mtc_full_frame(const MtcTimecode& tc) noexcept {
+        return send_mtc_full_frame(tc.hours, tc.minutes, tc.seconds, tc.frames, tc.rate);
     }
 
     // ========================================================================
@@ -895,7 +983,8 @@ private:
                 }
                 // Realtime Sync Events (Beat Clock & MTC)
                 case SNDRV_SEQ_EVENT_CLOCK: { // 36
-                    m_sync_tracker.on_clock_tick();
+                    uint64_t ts = static_cast<uint64_t>(ev.time.time.tv_sec) * 1'000'000'000ULL + ev.time.time.tv_nsec;
+                    m_sync_tracker.on_clock_tick(ts);
                     break;
                 }
                 case SNDRV_SEQ_EVENT_START: { // 30
@@ -918,6 +1007,23 @@ private:
                 case SNDRV_SEQ_EVENT_QFRAME: { // 22
                     uint8_t qf = static_cast<uint8_t>(ev.data.control.value & 0xFF);
                     m_sync_tracker.on_mtc_quarter_frame(qf);
+                    break;
+                }
+                case SNDRV_SEQ_EVENT_SYSEX: { // 130
+                    const uint8_t* ptr = static_cast<const uint8_t*>(ev.data.ext.ptr);
+                    size_t len = ev.data.ext.len;
+                    if (ptr && len >= 10) {
+                        if (ptr[0] == 0xF0 && ptr[1] == 0x7F && ptr[2] == 0x7F &&
+                            ptr[3] == 0x01 && ptr[4] == 0x01 && ptr[9] == 0xF7) {
+                            uint8_t hr_rate = ptr[5];
+                            uint8_t mn = ptr[6];
+                            uint8_t sc = ptr[7];
+                            uint8_t fr = ptr[8];
+                            auto rate = static_cast<MtcFrameRate>((hr_rate >> 5) & 0x03);
+                            uint8_t hr = hr_rate & 0x1F;
+                            m_sync_tracker.on_mtc_full_frame(hr, mn, sc, fr, rate);
+                        }
+                    }
                     break;
                 }
                 // Dynamic hotplug & kernel announce events
@@ -1001,13 +1107,37 @@ private:
                 m_expected_bytes = 0;
                 m_received_bytes = 0;
 
-                if (byte == 0xF1) { // MTC Quarter Frame
+                if (byte == 0xF0) { // SysEx Begin
+                    m_in_sysex = true;
+                    m_sysex_len = 0;
+                    m_syscommon_status = 0xF0;
+                } else if (byte == 0xF7) { // SysEx End (EOX)
+                    if (m_in_sysex && m_sysex_len == 8) {
+                        // Check MTC Full Frame: 7F 7F 01 01 hr_rate mn sc fr
+                        if (m_sysex_buf[0] == 0x7F && m_sysex_buf[1] == 0x7F &&
+                            m_sysex_buf[2] == 0x01 && m_sysex_buf[3] == 0x01) {
+                            uint8_t hr_rate = m_sysex_buf[4];
+                            uint8_t mn = m_sysex_buf[5];
+                            uint8_t sc = m_sysex_buf[6];
+                            uint8_t fr = m_sysex_buf[7];
+                            auto rate = static_cast<MtcFrameRate>((hr_rate >> 5) & 0x03);
+                            uint8_t hr = hr_rate & 0x1F;
+                            m_sync_tracker.on_mtc_full_frame(hr, mn, sc, fr, rate);
+                        }
+                    }
+                    m_in_sysex = false;
+                    m_sysex_len = 0;
+                    m_syscommon_status = 0;
+                } else if (byte == 0xF1) { // MTC Quarter Frame
+                    m_in_sysex = false;
                     m_syscommon_status = 0xF1;
                     m_expected_bytes = 1;
                 } else if (byte == 0xF2) { // Song Position Pointer (SPP)
+                    m_in_sysex = false;
                     m_syscommon_status = 0xF2;
                     m_expected_bytes = 2;
                 } else {
+                    m_in_sysex = false;
                     m_syscommon_status = byte;
                     m_expected_bytes = (byte == 0xF3) ? 1 : 0;
                 }
@@ -1015,6 +1145,7 @@ private:
             }
 
             // Channel Voice Message (0x80..0xEF)
+            m_in_sysex = false;
             m_syscommon_status = 0;
             m_running_status = byte;
             m_received_bytes = 0;
@@ -1028,6 +1159,13 @@ private:
         }
 
         // 3. Data Byte (MSB == 0)
+        if (m_in_sysex) {
+            if (m_sysex_len < sizeof(m_sysex_buf)) {
+                m_sysex_buf[m_sysex_len++] = byte;
+            }
+            return;
+        }
+
         if (m_syscommon_status == 0xF1) {
             m_sync_tracker.on_mtc_quarter_frame(byte);
             m_syscommon_status = 0;
@@ -1121,8 +1259,14 @@ private:
     mutable std::recursive_mutex m_subs_mutex;
     std::vector<AlsaSeqSubscription> m_subscriptions;
 
-    // MIDI Clock & MTC Synchronization Tracker
+    // MIDI Clock & MTC Synchronization Tracker & Master Generator
     MidiSyncTracker m_sync_tracker;
+    MidiClockGenerator m_clock_gen;
+
+    // SysEx Parser State
+    bool m_in_sysex{false};
+    uint8_t m_sysex_buf[16]{};
+    size_t m_sysex_len{0};
 };
 
 } // namespace audio_core::midi

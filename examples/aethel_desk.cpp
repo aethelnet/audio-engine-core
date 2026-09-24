@@ -679,6 +679,14 @@ int main(int argc, char** argv) {
         }
         mod_matrix.process_synth_block(synth_sim_l, synth_sim_r, mod_sim_frames, bpm);
 
+        // Master Clock Transmission (24 PPQN Beat Clock & MTC SMPTE Timecode):
+        if (mixer.clock().authority() == clock::ClockAuthority::Master) {
+            mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
+            mixer.clock().set_playing(is_playing);
+            mixer.clock().set_bpm(bpm);
+            midi_rx.process_master_clock(is_playing ? mod_sim_frames : 0, mixer.clock());
+        }
+
         // Lock-free telemetry query
         mixer.capture_telemetry_snapshot(telemetry);
 
@@ -4402,6 +4410,38 @@ int main(int argc, char** argv) {
                         } else {
                             ImGui::TextDisabled("| [ MTC: Offline ]");
                         }
+
+                        // Master Clock Output Transmission Bar (Visible when Master authority is active)
+                        if (auth == clock::ClockAuthority::Master) {
+                            ImGui::Spacing();
+                            ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.45f, 1.0f), "Master Output TX:");
+                            ImGui::SameLine();
+                            bool tx_beat = midi_rx.clock_generator().is_beat_clock_enabled();
+                            if (ImGui::Checkbox("Beat Clock (24 PPQN)", &tx_beat)) {
+                                midi_rx.clock_generator().set_beat_clock_enabled(tx_beat);
+                            }
+                            ImGui::SameLine();
+                            bool tx_mtc = midi_rx.clock_generator().is_mtc_enabled();
+                            if (ImGui::Checkbox("MTC (SMPTE Timecode)", &tx_mtc)) {
+                                midi_rx.clock_generator().set_mtc_enabled(tx_mtc);
+                            }
+                            ImGui::SameLine();
+                            const char* fps_labels[] = { "24 fps (Film)", "25 fps (PAL)", "29.97 df (NTSC)", "30 fps (HD)" };
+                            int fps_idx = static_cast<int>(midi_rx.clock_generator().mtc_framerate());
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::Combo("##MtcFpsCombo", &fps_idx, fps_labels, 4)) {
+                                midi_rx.clock_generator().set_mtc_framerate(static_cast<midi::MtcFrameRate>(fps_idx));
+                            }
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("| Out: %llu Clocks | %llu QFrames",
+                                static_cast<unsigned long long>(midi_rx.clock_generator().tick_count()),
+                                static_cast<unsigned long long>(midi_rx.clock_generator().qframe_count()));
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton(" ⤓ Locate Full Frame SysEx ")) {
+                                auto cur_tc = midi_rx.clock_generator().current_mtc_timecode();
+                                midi_rx.send_mtc_full_frame(cur_tc);
+                            }
+                        }
                     }
                     ImGui::Separator();
 
@@ -4768,36 +4808,129 @@ int main(int argc, char** argv) {
                                                    "BREAKPOINT SPLINE EDITOR // %s (Drag Nodes, Drag Tension Dots, Double-Click Add, Right-Click Delete)",
                                                    (selected_modulator == 0) ? "MSEG 1 (PERCUSSIVE VOICE)" : "MSEG 2 (LEAD VOICE)");
 
-                                const float canvas_h = top_h - 68.0f;
+                                const float canvas_h = top_h - 78.0f;
                                 ui::DrawMsegCurveEditor("##MsegCanvas", cur_mseg, &cur_voice, ImVec2(0, canvas_h), &selected_mseg_node, true);
 
-                                // Node Inspector Footer
+                                // Enhanced Node Inspector Footer: Precision Numerical Controls & Shape Presets
                                 auto pts = cur_mseg.get_points();
                                 if (selected_mseg_node >= 0 && selected_mseg_node < static_cast<int>(pts.size())) {
-                                    const auto& pt = pts[selected_mseg_node];
-                                    ImGui::Text("Selected Node #%d: Time: %.2f %s | Value: %.2f | Tension: %+.2f | Mode: %s",
-                                                selected_mseg_node,
-                                                pt.time,
-                                                (cur_mseg.time_mode() == modulation::MsegTimeMode::BeatSync) ? "beats" : "ms",
-                                                pt.value,
-                                                pt.tension,
-                                                (pt.node_mode == routing::NodeMode::Smooth) ? "Smooth (Hermite)" :
-                                                ((pt.node_mode == routing::NodeMode::Corner) ? "Corner (Linear)" : "Hold (Step)"));
-                                    ImGui::SameLine(0, 20);
-                                    if (ImGui::Button("Toggle Node Mode")) {
-                                        auto mod_pts = pts;
-                                        if (mod_pts[selected_mseg_node].node_mode == routing::NodeMode::Smooth) {
-                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Corner;
-                                        } else if (mod_pts[selected_mseg_node].node_mode == routing::NodeMode::Corner) {
-                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Hold;
-                                        } else {
-                                            mod_pts[selected_mseg_node].node_mode = routing::NodeMode::Smooth;
+                                    auto pt = pts[selected_mseg_node];
+                                    bool pts_changed = false;
+                                    const bool is_sync = (cur_mseg.time_mode() == modulation::MsegTimeMode::BeatSync);
+                                    const char* unit_str = is_sync ? "beats" : "ms";
+
+                                    // Row 1: Node Identification & Numerical Parameter Drags
+                                    ImVec4 mode_col = (pt.node_mode == routing::NodeMode::Smooth) ? ImVec4(0.2f, 0.6f, 1.0f, 1.0f) :
+                                                      ((pt.node_mode == routing::NodeMode::Corner) ? ImVec4(1.0f, 0.65f, 0.2f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+                                    ImGui::TextColored(mode_col, "Node #%d [%s]", selected_mseg_node,
+                                                       (pt.node_mode == routing::NodeMode::Smooth) ? "Smooth" :
+                                                       ((pt.node_mode == routing::NodeMode::Corner) ? "Corner" : "Hold"));
+
+                                    if (cur_mseg.sustain_index() == selected_mseg_node) {
+                                        ImGui::SameLine();
+                                        ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "[SUSTAIN]");
+                                    }
+
+                                    ImGui::SameLine(0, 15);
+                                    ImGui::SetNextItemWidth(80);
+                                    float f_time = static_cast<float>(pt.time);
+                                    float t_min = (selected_mseg_node == 0) ? 0.0f : static_cast<float>(pts[selected_mseg_node - 1].time + (is_sync ? 0.02f : 0.5f));
+                                    float t_max = (selected_mseg_node == static_cast<int>(pts.size() - 1)) ? 10000.0f : static_cast<float>(pts[selected_mseg_node + 1].time - (is_sync ? 0.02f : 0.5f));
+                                    if (selected_mseg_node > 0) {
+                                        if (ImGui::DragFloat("##NodeTime", &f_time, is_sync ? 0.02f : 1.0f, t_min, t_max, "%.2f")) {
+                                            pt.time = std::clamp(static_cast<double>(f_time), static_cast<double>(t_min), static_cast<double>(t_max));
+                                            pts_changed = true;
                                         }
-                                        cur_mseg.set_points(mod_pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                        ImGui::SameLine(0, 3);
+                                        ImGui::TextDisabled("%s", unit_str);
+                                    } else {
+                                        ImGui::TextDisabled("Time: 0.00 %s", unit_str);
+                                    }
+
+                                    ImGui::SameLine(0, 12);
+                                    ImGui::SetNextItemWidth(75);
+                                    float f_val = pt.value;
+                                    if (ImGui::DragFloat("Val##NodeVal", &f_val, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                        pt.value = std::clamp(f_val, 0.0f, 1.0f);
+                                        pts_changed = true;
+                                    }
+
+                                    ImGui::SameLine(0, 12);
+                                    ImGui::SetNextItemWidth(75);
+                                    float f_tens = pt.tension;
+                                    if (ImGui::DragFloat("τ##NodeTens", &f_tens, 0.02f, -1.0f, 1.0f, "%+.2f")) {
+                                        pt.tension = std::clamp(f_tens, -1.0f, 1.0f);
+                                        pts_changed = true;
+                                    }
+
+                                    ImGui::SameLine(0, 12);
+                                    if (ImGui::SmallButton(" Mode ")) {
+                                        if (pt.node_mode == routing::NodeMode::Smooth) pt.node_mode = routing::NodeMode::Corner;
+                                        else if (pt.node_mode == routing::NodeMode::Corner) pt.node_mode = routing::NodeMode::Hold;
+                                        else pt.node_mode = routing::NodeMode::Smooth;
+                                        pts_changed = true;
+                                    }
+
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton(" Set Sustain ")) {
+                                        cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), selected_mseg_node);
+                                    }
+
+                                    // Row 2: Segment Shape Presets & Node Insertion/Deletion
+                                    ImGui::TextDisabled("Shape Presets:");
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton(" Linear ")) {
+                                        pt.tension = 0.0f;
+                                        pt.node_mode = routing::NodeMode::Corner;
+                                        pts_changed = true;
                                     }
                                     ImGui::SameLine();
-                                    if (ImGui::Button("Set as Sustain Node")) {
-                                        cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), selected_mseg_node);
+                                    if (ImGui::SmallButton(" Smooth S ")) {
+                                        pt.tension = 0.0f;
+                                        pt.node_mode = routing::NodeMode::Smooth;
+                                        pts_changed = true;
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton(" Exp (+) ")) {
+                                        pt.tension = 0.65f;
+                                        pts_changed = true;
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton(" Log (-) ")) {
+                                        pt.tension = -0.65f;
+                                        pts_changed = true;
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::SmallButton(" Step/Hold ")) {
+                                        pt.node_mode = routing::NodeMode::Hold;
+                                        pts_changed = true;
+                                    }
+
+                                    ImGui::SameLine(0, 15);
+                                    if (ImGui::SmallButton(" + Insert Node ")) {
+                                        double next_t = (selected_mseg_node + 1 < static_cast<int>(pts.size())) ?
+                                            0.5 * (pt.time + pts[selected_mseg_node + 1].time) : (pt.time + (is_sync ? 1.0 : 50.0));
+                                        float next_v = 0.5f * pt.value;
+                                        pts.insert(pts.begin() + selected_mseg_node + 1,
+                                                   modulation::MsegPoint{next_t, next_v, routing::NodeMode::Smooth, 0.0f});
+                                        cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                        selected_mseg_node++;
+                                        pts_changed = false;
+                                    }
+
+                                    if (selected_mseg_node > 0 && selected_mseg_node < static_cast<int>(pts.size() - 1)) {
+                                        ImGui::SameLine();
+                                        if (ImGui::SmallButton(" ✕ Delete Node ")) {
+                                            pts.erase(pts.begin() + selected_mseg_node);
+                                            cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), cur_mseg.sustain_index());
+                                            selected_mseg_node = std::min(selected_mseg_node, static_cast<int>(pts.size() - 1));
+                                            pts_changed = false;
+                                        }
+                                    }
+
+                                    if (pts_changed) {
+                                        pts[selected_mseg_node] = pt;
+                                        cur_mseg.set_points(pts, cur_mseg.time_mode(), cur_mseg.loop_mode(), cur_mseg.sustain_index());
                                     }
                                 }
                             } else if (selected_modulator == 2 || selected_modulator == 3) {

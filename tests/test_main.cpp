@@ -10639,6 +10639,224 @@ void test_midi_sync_beat_clock_spp_and_mtc_timecode() {
     std::cout << "  -> MIDI Synchronization (Beat Clock, SPP & MTC Timecode): ALL PASSED" << std::endl;
 }
 
+void test_master_clock_and_mtc_generator() {
+    std::cout << "[TEST 76] Running Master Clock Engine, MTC Generator & Linear Timecode Broadcast..." << std::endl;
+
+    using namespace audio_core::midi;
+    using namespace audio_core::clock;
+
+    // 1. MtcTimecode::from_seconds & Mathematical Roundtrip across all standard SMPTE framerates
+    {
+        // 24 fps Film standard
+        auto tc24 = MtcTimecode::from_seconds(10.5, MtcFrameRate::Fps24);
+        TEST_CHECK(tc24.hours == 0 && tc24.minutes == 0 && tc24.seconds == 10 && tc24.frames == 12);
+        TEST_CHECK(std::abs(tc24.total_seconds() - 10.5) < 1e-4);
+
+        // 25 fps PAL / European standard
+        auto tc25 = MtcTimecode::from_seconds(3661.08, MtcFrameRate::Fps25);
+        TEST_CHECK(tc25.hours == 1 && tc25.minutes == 1 && tc25.seconds == 1 && tc25.frames == 2);
+        TEST_CHECK(std::abs(tc25.total_seconds() - 3661.08) < 1e-4);
+
+        // 30 fps High-Speed / NTSC non-drop
+        auto tc30 = MtcTimecode::from_seconds(0.5, MtcFrameRate::Fps30);
+        TEST_CHECK(tc30.hours == 0 && tc30.minutes == 0 && tc30.seconds == 0 && tc30.frames == 15);
+        TEST_CHECK(std::abs(tc30.total_seconds() - 0.5) < 1e-4);
+
+        // 29.97 Drop-Frame standard
+        // At 60.06s (1800 frames), the 1st minute mark begins; frames 0 and 1 are dropped, so frame index is 2
+        auto tc29 = MtcTimecode::from_seconds(60.06, MtcFrameRate::Fps2997Drop);
+        TEST_CHECK(tc29.hours == 0 && tc29.minutes == 1 && tc29.seconds == 0);
+        TEST_CHECK(tc29.frames == 2);
+        TEST_CHECK(std::abs(tc29.total_seconds() - 60.06) < 1e-4);
+
+        std::cout << "  -> MtcTimecode::from_seconds SMPTE Frame Exactness (24, 25, 29.97df, 30 fps): PASSED" << std::endl;
+    }
+
+    // 2. MidiClockGenerator MTC Quarter-Frame Rate & Piece Sequencing
+    {
+        MidiClockGenerator gen;
+        gen.set_beat_clock_enabled(false);
+        gen.set_mtc_enabled(true);
+        gen.set_mtc_framerate(MtcFrameRate::Fps25);
+
+        TimelineClock clock(48000, 120.0);
+        clock.set_playing(true);
+
+        std::vector<uint8_t> qframes;
+        auto clock_cb = [](uint8_t) {};
+        auto mtc_cb = [&](uint8_t qf) { qframes.push_back(qf); };
+
+        // Process 48000 samples (1 second) in blocks of 128
+        for (int b = 0; b < 48000 / 128; ++b) {
+            clock.set_sample_position(static_cast<uint64_t>(b * 128));
+            gen.process_block(128, clock, clock_cb, mtc_cb);
+        }
+
+        // At 25 fps PAL, quarter-frames are sent at 8 * 25 = 200 Hz. In 1 second, exactly 200 QFrames!
+        TEST_CHECK(qframes.size() == 200);
+        TEST_CHECK(gen.qframe_count() == 200);
+
+        // Verify pieces cycle 0, 1, 2, 3, 4, 5, 6, 7 continuously (25 complete cycles)
+        for (size_t i = 0; i < qframes.size(); ++i) {
+            uint8_t piece = (qframes[i] >> 4) & 0x07;
+            TEST_CHECK(piece == (i % 8));
+        }
+
+        std::cout << "  -> MTC Quarter-Frame 200 Hz Transmission & Piece Sequence (25 fps PAL): PASSED" << std::endl;
+    }
+
+    // 3. Dual-Consumer Isolation: Independent Beat Clock (24 PPQN) & MTC Quarter-Frames
+    {
+        MidiClockGenerator gen;
+        gen.set_beat_clock_enabled(true);
+        gen.set_mtc_enabled(true);
+        gen.set_mtc_framerate(MtcFrameRate::Fps25);
+
+        TimelineClock clock(48000, 120.0);
+        clock.set_playing(true);
+
+        std::vector<uint8_t> clock_bytes;
+        std::vector<uint8_t> mtc_bytes;
+
+        // Process 1 second (48000 samples)
+        for (int b = 0; b < 48000 / 128; ++b) {
+            clock.set_sample_position(static_cast<uint64_t>(b * 128));
+            gen.process_block(128, clock,
+                [&](uint8_t b) { clock_bytes.push_back(b); },
+                [&](uint8_t qf) { mtc_bytes.push_back(qf); });
+        }
+
+        // At 120 BPM: 2 beats/sec * 24 clocks/beat = 48 clocks + 1 Start byte
+        TEST_CHECK(!clock_bytes.empty());
+        TEST_CHECK(clock_bytes.front() == 0xFA); // Start
+        size_t ticks = std::count(clock_bytes.begin(), clock_bytes.end(), 0xF8);
+        TEST_CHECK(ticks == 48);
+
+        // At 25 fps: exactly 200 quarter frames
+        TEST_CHECK(mtc_bytes.size() == 200);
+
+        std::cout << "  -> Dual-Consumer Isolation (Beat Clock vs MTC QFrames): PASSED" << std::endl;
+    }
+
+    // 4. MTC Full Frame SysEx Locator Packet Construction
+    {
+        MtcTimecode tc{};
+        tc.hours = 14;
+        tc.minutes = 22;
+        tc.seconds = 35;
+        tc.frames = 19;
+        tc.rate = MtcFrameRate::Fps25;
+
+        auto sysex = MidiClockGenerator::make_mtc_full_frame(tc);
+        TEST_CHECK(sysex.size() == 10);
+        TEST_CHECK(sysex[0] == 0xF0); // SysEx Start
+        TEST_CHECK(sysex[1] == 0x7F); // Realtime Universal
+        TEST_CHECK(sysex[2] == 0x7F); // Target ID Broadcast
+        TEST_CHECK(sysex[3] == 0x01); // Sub-ID 1: MTC
+        TEST_CHECK(sysex[4] == 0x01); // Sub-ID 2: Full Frame
+        TEST_CHECK(sysex[5] == ((1 << 5) | 14)); // (Rate << 5) | Hour
+        TEST_CHECK(sysex[6] == 22);  // Min
+        TEST_CHECK(sysex[7] == 35);  // Sec
+        TEST_CHECK(sysex[8] == 19);  // Fr
+        TEST_CHECK(sysex[9] == 0xF7); // EOX
+
+        std::cout << "  -> MTC Full Frame SysEx Construction: PASSED" << std::endl;
+    }
+
+    // 5. HardwareMidiReceiver Master Clock Process & Mock Loopback Lock
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false); // Virtual / Mock mode for headless testing
+        TEST_CHECK(rx.is_connected());
+
+        TimelineClock master_clock(48000, 120.0);
+        master_clock.set_authority(ClockAuthority::Master);
+        master_clock.set_playing(true);
+
+        // Process 1 second of audio via process_master_clock
+        for (int b = 0; b < 48000 / 128; ++b) {
+            master_clock.set_sample_position(static_cast<uint64_t>(b * 128));
+            rx.process_master_clock(128, master_clock);
+        }
+
+        // Loopback should have fed 48 clocks into sync_tracker
+        const auto& tracker = rx.sync_tracker();
+        TEST_CHECK(tracker.tick_count() == 48);
+        TEST_CHECK(tracker.is_locked());
+        TEST_CHECK(std::abs(tracker.estimated_bpm() - 120.0) < 0.5);
+
+        // MTC timecode should have locked and assembled
+        auto mtc = tracker.mtc_timecode();
+        TEST_CHECK(mtc.is_valid);
+        TEST_CHECK(mtc.rate == MtcFrameRate::Fps25);
+        TEST_CHECK(tracker.is_mtc_playing());
+
+        std::cout << "  -> HardwareMidiReceiver Master Clock Process & Loopback Lock: PASSED" << std::endl;
+    }
+
+    // 6. Master Authority Boundary Invariant: Slave or Follower Must Never Broadcast Master Clock
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false);
+
+        TimelineClock slave_clock(48000, 120.0);
+        slave_clock.set_authority(ClockAuthority::MidiClockSlave);
+        slave_clock.set_playing(true);
+
+        uint64_t initial_ticks = rx.clock_generator().tick_count();
+        uint64_t initial_qframes = rx.clock_generator().qframe_count();
+
+        // Calling process_master_clock with slave authority must do NOTHING!
+        rx.process_master_clock(512, slave_clock);
+
+        TEST_CHECK(rx.clock_generator().tick_count() == initial_ticks);
+        TEST_CHECK(rx.clock_generator().qframe_count() == initial_qframes);
+
+        std::cout << "  -> Master Sovereign Boundary Invariant (Slave/Follower rejection): PASSED" << std::endl;
+    }
+
+    // 7. Full Frame SysEx Ingestion (Direct send & Raw Byte Stream parser)
+    {
+        HardwareMidiReceiver rx;
+        rx.auto_connect(false);
+
+        // Direct Full Frame SysEx transmission
+        bool sent = rx.send_mtc_full_frame(11, 45, 30, 15, MtcFrameRate::Fps25);
+        TEST_CHECK(sent);
+
+        auto tc = rx.sync_tracker().mtc_timecode();
+        TEST_CHECK(tc.is_valid);
+        TEST_CHECK(tc.hours == 11);
+        TEST_CHECK(tc.minutes == 45);
+        TEST_CHECK(tc.seconds == 30);
+        TEST_CHECK(tc.frames == 15);
+        TEST_CHECK(tc.rate == MtcFrameRate::Fps25);
+
+        // Raw Byte Stream Parser: Inject 10-byte SysEx
+        // 0xF0, 0x7F, 0x7F, 0x01, 0x01, (rate << 5) | hr, mn, sc, fr, 0xF7
+        // 24 fps (rate 0), 03:14:08:22
+        uint8_t raw_sysex[10] = {
+            0xF0, 0x7F, 0x7F, 0x01, 0x01,
+            static_cast<uint8_t>((0 << 5) | 3), // Rate 0 (24fps), hr=3
+            14, 8, 22,
+            0xF7
+        };
+        rx.inject_raw_bytes(raw_sysex, 10);
+
+        auto tc_raw = rx.sync_tracker().mtc_timecode();
+        TEST_CHECK(tc_raw.is_valid);
+        TEST_CHECK(tc_raw.hours == 3);
+        TEST_CHECK(tc_raw.minutes == 14);
+        TEST_CHECK(tc_raw.seconds == 8);
+        TEST_CHECK(tc_raw.frames == 22);
+        TEST_CHECK(tc_raw.rate == MtcFrameRate::Fps24);
+
+        std::cout << "  -> Full Frame SysEx Ingestion (Direct & Raw Byte Parser): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Master Clock Engine, MTC Generator & Linear Timecode Broadcast: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -10719,6 +10937,7 @@ int main() {
     test_alsa_sequencer_and_modulation_session_serialization();
     test_alsa_sequencer_subscriptions_and_hotplug();
     test_midi_sync_beat_clock_spp_and_mtc_timecode();
+    test_master_clock_and_mtc_generator();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -58,11 +58,55 @@ struct MtcTimecode {
     }
 
     [[nodiscard]] double total_seconds() const noexcept {
+        if (rate == MtcFrameRate::Fps2997Drop) {
+            int64_t total_minutes = static_cast<int64_t>(hours) * 60 + minutes;
+            int64_t total_frames = (static_cast<int64_t>(hours) * 3600 + static_cast<int64_t>(minutes) * 60 + seconds) * 30 + frames;
+            int64_t dropped = 2 * (total_minutes - total_minutes / 10);
+            int64_t real_frames = total_frames - dropped;
+            return static_cast<double>(real_frames) * (1001.0 / 30000.0);
+        }
         const double fps = frames_per_second();
         return static_cast<double>(hours) * 3600.0 +
                static_cast<double>(minutes) * 60.0 +
                static_cast<double>(seconds) +
                static_cast<double>(frames) / fps;
+    }
+
+    static MtcTimecode from_seconds(double total_sec, MtcFrameRate rate = MtcFrameRate::Fps25) noexcept {
+        MtcTimecode tc{};
+        tc.rate = rate;
+        tc.is_valid = true;
+        if (total_sec < 0.0) total_sec = 0.0;
+
+        if (rate == MtcFrameRate::Fps2997Drop) {
+            // SMPTE 12M drop-frame conversion
+            const double nominal_fps = 30000.0 / 1001.0;
+            int64_t frame_num = static_cast<int64_t>(std::round(total_sec * nominal_fps));
+            const int64_t d = frame_num / 17982;
+            const int64_t m = frame_num % 17982;
+            if (m >= 2) {
+                frame_num += 18 * d + 2 * ((m - 2) / 1798);
+            } else {
+                frame_num += 18 * d;
+            }
+            tc.frames = static_cast<uint8_t>(frame_num % 30);
+            tc.seconds = static_cast<uint8_t>((frame_num / 30) % 60);
+            tc.minutes = static_cast<uint8_t>(((frame_num / 30) / 60) % 60);
+            tc.hours = static_cast<uint8_t>((((frame_num / 30) / 60) / 60) % 24);
+        } else {
+            double fps = 25.0;
+            if (rate == MtcFrameRate::Fps24) fps = 24.0;
+            else if (rate == MtcFrameRate::Fps30) fps = 30.0;
+            int64_t total_frames = static_cast<int64_t>(std::floor(total_sec * fps + 1e-6));
+            int64_t ifps = static_cast<int64_t>(std::round(fps));
+            tc.frames = static_cast<uint8_t>(total_frames % ifps);
+            int64_t total_s = total_frames / ifps;
+            tc.seconds = static_cast<uint8_t>(total_s % 60);
+            int64_t total_m = total_s / 60;
+            tc.minutes = static_cast<uint8_t>(total_m % 60);
+            tc.hours = static_cast<uint8_t>((total_m / 60) % 24);
+        }
+        return tc;
     }
 
     [[nodiscard]] constexpr uint64_t pack() const noexcept {
@@ -385,46 +429,154 @@ private:
 // - 0xF8 Timing Clock (24 PPQN) synchronized to TimelineClock
 // - 0xFA Start / 0xFB Continue / 0xFC Stop on transport transitions
 // - 0xF2 Song Position Pointer on transport seek
+// - 0xF1 MIDI Time Code (MTC) Quarter Frames (8 pieces/frame at 24/25/29.97/30 fps)
+// - Full Frame SysEx locator packets
 // ============================================================================
 class MidiClockGenerator {
 public:
     void reset() noexcept {
         m_clock_phase = 0.0;
+        m_mtc_phase = 0.0;
+        m_mtc_piece = 0;
         m_was_playing = false;
-        m_tick_count = 0;
+        m_tick_count.store(0, std::memory_order_relaxed);
+        m_qframe_count.store(0, std::memory_order_relaxed);
+        m_current_tc = MtcTimecode{};
     }
 
-    template <typename ByteConsumer>
-    void process_block(uint32_t frames, const clock::TimelineClock& clock, ByteConsumer&& consumer) noexcept {
-        const bool is_playing = clock.is_playing();
+    void set_beat_clock_enabled(bool enabled) noexcept {
+        m_beat_clock_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_beat_clock_enabled() const noexcept {
+        return m_beat_clock_enabled.load(std::memory_order_relaxed);
+    }
 
-        // 1. Transport State Transitions
-        if (is_playing && !m_was_playing) {
-            if (clock.sample_position() == 0) {
-                consumer(0xFA); // Start from beginning
-                m_tick_count = 0;
-                m_clock_phase = 0.0;
-            } else {
-                consumer(0xFB); // Continue from current position
+    void set_mtc_enabled(bool enabled) noexcept {
+        m_mtc_enabled.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_mtc_enabled() const noexcept {
+        return m_mtc_enabled.load(std::memory_order_relaxed);
+    }
+
+    void set_mtc_framerate(MtcFrameRate rate) noexcept {
+        m_mtc_framerate.store(rate, std::memory_order_relaxed);
+    }
+    [[nodiscard]] MtcFrameRate mtc_framerate() const noexcept {
+        return m_mtc_framerate.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint64_t tick_count() const noexcept {
+        return m_tick_count.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t qframe_count() const noexcept {
+        return m_qframe_count.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] MtcTimecode current_mtc_timecode() const noexcept {
+        return m_current_tc;
+    }
+
+    // Dual-Consumer process_block: separates Beat Clock bytes from MTC Quarter Frames
+    template <typename ClockByteConsumer, typename MtcByteConsumer>
+    void process_block(uint32_t frames, const clock::TimelineClock& clock,
+                       ClockByteConsumer&& clock_consumer, MtcByteConsumer&& mtc_consumer) noexcept {
+        const bool is_playing = clock.is_playing();
+        const bool beat_enabled = m_beat_clock_enabled.load(std::memory_order_relaxed);
+        const bool mtc_enabled = m_mtc_enabled.load(std::memory_order_relaxed);
+
+        // 1. Transport State Transitions (Start / Continue / Stop)
+        if (beat_enabled) {
+            if (is_playing && !m_was_playing) {
+                if (clock.sample_position() == 0) {
+                    clock_consumer(0xFA); // Start from beginning
+                    m_tick_count.store(0, std::memory_order_relaxed);
+                    m_clock_phase = 0.0;
+                } else {
+                    clock_consumer(0xFB); // Continue from current position
+                }
+            } else if (!is_playing && m_was_playing) {
+                clock_consumer(0xFC); // Stop
             }
-        } else if (!is_playing && m_was_playing) {
-            consumer(0xFC); // Stop
         }
-        m_was_playing = is_playing;
 
         // 2. Generate 24 PPQN Timing Clocks if playing
-        if (is_playing && frames > 0) {
+        if (beat_enabled && is_playing && frames > 0) {
             const double spb = clock.samples_per_beat();
             const double samples_per_clock = spb / 24.0;
             if (samples_per_clock > 0.0) {
                 m_clock_phase += static_cast<double>(frames);
                 while (m_clock_phase >= samples_per_clock) {
-                    consumer(0xF8); // Timing Clock
+                    clock_consumer(0xF8); // Timing Clock
                     m_clock_phase -= samples_per_clock;
-                    ++m_tick_count;
+                    m_tick_count.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
+
+        // 3. Generate MTC Quarter-Frames (8 pieces per frame) if playing
+        if (mtc_enabled && is_playing && frames > 0) {
+            const auto rate = m_mtc_framerate.load(std::memory_order_relaxed);
+            double fps = 25.0;
+            switch (rate) {
+                case MtcFrameRate::Fps24: fps = 24.0; break;
+                case MtcFrameRate::Fps25: fps = 25.0; break;
+                case MtcFrameRate::Fps2997Drop: fps = 29.97002997; break;
+                case MtcFrameRate::Fps30: fps = 30.0; break;
+            }
+            const double sr = static_cast<double>(clock.sample_rate());
+            const double samples_per_qframe = sr / (8.0 * fps);
+
+            if (samples_per_qframe > 0.0) {
+                m_mtc_phase += static_cast<double>(frames);
+                while (m_mtc_phase >= samples_per_qframe) {
+                    m_mtc_phase -= samples_per_qframe;
+
+                    // Snapshot timecode on piece 0 to guarantee consistency across 8 pieces
+                    if (m_mtc_piece == 0) {
+                        const double total_secs = static_cast<double>(clock.sample_position()) / sr;
+                        m_current_tc = MtcTimecode::from_seconds(total_secs, rate);
+                    }
+
+                    uint8_t nibble = 0;
+                    switch (m_mtc_piece) {
+                        case 0: nibble = m_current_tc.frames & 0x0F; break;
+                        case 1: nibble = (m_current_tc.frames >> 4) & 0x01; break;
+                        case 2: nibble = m_current_tc.seconds & 0x0F; break;
+                        case 3: nibble = (m_current_tc.seconds >> 4) & 0x03; break;
+                        case 4: nibble = m_current_tc.minutes & 0x0F; break;
+                        case 5: nibble = (m_current_tc.minutes >> 4) & 0x03; break;
+                        case 6: nibble = m_current_tc.hours & 0x0F; break;
+                        case 7: {
+                            uint8_t rate_code = static_cast<uint8_t>(rate) & 0x03;
+                            nibble = ((rate_code << 1) | ((m_current_tc.hours >> 4) & 0x01)) & 0x0F;
+                            break;
+                        }
+                        default: break;
+                    }
+
+                    uint8_t qf_data = (static_cast<uint8_t>(m_mtc_piece) << 4) | (nibble & 0x0F);
+                    mtc_consumer(qf_data);
+
+                    m_mtc_piece = (m_mtc_piece + 1) & 0x07;
+                    m_qframe_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        m_was_playing = is_playing;
+    }
+
+    // Backwards-compatible single-consumer overload:
+    // Emits Timing/Transport bytes directly, and prefixes MTC Quarter-Frames with 0xF1 status
+    template <typename ByteConsumer>
+    void process_block(uint32_t frames, const clock::TimelineClock& clock, ByteConsumer&& consumer) noexcept {
+        process_block(
+            frames, clock,
+            [&](uint8_t b) { consumer(b); },
+            [&](uint8_t qf) {
+                consumer(0xF1);
+                consumer(qf);
+            }
+        );
     }
 
     static std::array<uint8_t, 3> make_spp(uint16_t spp_units) noexcept {
@@ -434,12 +586,33 @@ public:
         return { 0xF2, lsb, msb };
     }
 
-    [[nodiscard]] uint64_t tick_count() const noexcept { return m_tick_count; }
+    static std::array<uint8_t, 10> make_mtc_full_frame(uint8_t hr, uint8_t mn, uint8_t sc, uint8_t fr, MtcFrameRate rate) noexcept {
+        uint8_t hr_byte = ((static_cast<uint8_t>(rate) & 0x03) << 5) | (hr & 0x1F);
+        return {
+            0xF0, 0x7F, 0x7F, 0x01, 0x01,
+            hr_byte,
+            static_cast<uint8_t>(mn & 0x3F),
+            static_cast<uint8_t>(sc & 0x3F),
+            static_cast<uint8_t>(fr & 0x1F),
+            0xF7
+        };
+    }
+
+    static std::array<uint8_t, 10> make_mtc_full_frame(const MtcTimecode& tc) noexcept {
+        return make_mtc_full_frame(tc.hours, tc.minutes, tc.seconds, tc.frames, tc.rate);
+    }
 
 private:
     double m_clock_phase{0.0};
+    double m_mtc_phase{0.0};
+    uint8_t m_mtc_piece{0};
     bool m_was_playing{false};
-    uint64_t m_tick_count{0};
+    std::atomic<bool> m_beat_clock_enabled{true};
+    std::atomic<bool> m_mtc_enabled{true};
+    std::atomic<MtcFrameRate> m_mtc_framerate{MtcFrameRate::Fps25};
+    std::atomic<uint64_t> m_tick_count{0};
+    std::atomic<uint64_t> m_qframe_count{0};
+    MtcTimecode m_current_tc{};
 };
 
 } // namespace audio_core::midi

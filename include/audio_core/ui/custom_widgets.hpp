@@ -1724,15 +1724,25 @@ inline bool DrawMsegCurveEditor(const char* str_id,
         float mid_v = snap ? snap->evaluate(mid_t) : 0.5f * (pts[i].value + pts[i + 1].value);
         ImVec2 t_pos(time_to_x(mid_t), val_to_y(mid_v));
 
-        const float hit_r = 7.0f;
+        const float hit_r = 8.0f;
         bool is_t_hover = is_hovered && (std::hypot(mouse.x - t_pos.x, mouse.y - t_pos.y) <= hit_r);
         bool is_t_drag = (state.active_tension_idx == static_cast<int>(i));
 
-        ImU32 t_col = (is_t_drag || is_t_hover) ? ImColor(217, 123, 13, 255) : ImColor(217, 123, 13, 180);
-        dl->AddCircleFilled(t_pos, is_t_hover ? 5.5f : 4.0f, t_col);
-        dl->AddCircle(t_pos, is_t_hover ? 7.0f : 5.0f, ImColor(26, 30, 40, 200), 0, 1.2f);
+        ImU32 t_col = (is_t_drag || is_t_hover) ? ImColor(217, 123, 13, 255) : ImColor(217, 123, 13, 190);
+        dl->AddCircleFilled(t_pos, is_t_hover ? 6.0f : 4.5f, t_col);
+        dl->AddCircle(t_pos, is_t_hover ? 7.5f : 5.5f, ImColor(26, 30, 40, 220), 0, 1.2f);
 
-        if (is_t_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (is_t_hover || is_t_drag) {
+            char t_tag[32];
+            std::snprintf(t_tag, sizeof(t_tag), "τ %+.2f", pts[i].tension);
+            dl->AddText(ImVec2(t_pos.x + 8.0f, t_pos.y - 12.0f), ImColor(217, 123, 13, 255), t_tag);
+        }
+
+        if (is_t_hover && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            pts[i].tension = 0.0f;
+            mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
+            modified = true;
+        } else if (is_t_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             state.active_tension_idx = static_cast<int>(i);
         }
     }
@@ -1758,6 +1768,20 @@ inline bool DrawMsegCurveEditor(const char* str_id,
 
         bool is_selected = (state.selected_idx == static_cast<int>(i));
         bool is_dragging = (state.active_node_idx == static_cast<int>(i));
+
+        // Hermite tangent vector handles when smooth node is selected/hovered
+        if ((is_selected || is_node_hover) && pts[i].node_mode == routing::NodeMode::Smooth) {
+            float handle_len = 18.0f;
+            dl->AddLine(ImVec2(n_pos.x - handle_len, n_pos.y), ImVec2(n_pos.x + handle_len, n_pos.y), ImColor(31, 97, 217, 160), 1.0f);
+            dl->AddCircleFilled(ImVec2(n_pos.x - handle_len, n_pos.y), 2.5f, ImColor(31, 97, 217, 200));
+            dl->AddCircleFilled(ImVec2(n_pos.x + handle_len, n_pos.y), 2.5f, ImColor(31, 97, 217, 200));
+        }
+
+        // Sustain loop badge "S"
+        if (static_cast<int32_t>(i) == sus_idx) {
+            dl->AddRectFilled(ImVec2(n_pos.x - 6.0f, plot_y0), ImVec2(n_pos.x + 6.0f, plot_y0 + 14.0f), ImColor(217, 123, 13, 230), 2.0f);
+            dl->AddText(ImVec2(n_pos.x - 3.5f, plot_y0), ImColor(255, 255, 255, 255), "S");
+        }
 
         ImU32 n_fill = (is_selected || is_dragging) ? ImColor(31, 97, 217, 255) : ImColor(252, 253, 254, 255);
         ImU32 n_border = (is_selected || is_dragging) ? ImColor(26, 30, 40, 255) : ImColor(31, 97, 217, 255);
@@ -1789,15 +1813,26 @@ inline bool DrawMsegCurveEditor(const char* str_id,
             double new_t = x_to_time(mouse.x);
             float new_v = y_to_val(mouse.y);
 
+            // Shift / Ctrl snapping
+            if (io.KeyShift || io.KeyCtrl) {
+                new_v = std::round(new_v * 8.0f) / 8.0f; // 1/8th value snapping
+                if (is_beat_sync) {
+                    new_t = std::round(new_t * 4.0) / 4.0; // 1/16th beat (0.25 beat)
+                } else {
+                    new_t = std::round(new_t / 5.0) * 5.0; // 5ms step
+                }
+            }
+
+            const double min_dt = is_beat_sync ? 0.02 : 0.5;
             size_t idx = static_cast<size_t>(state.active_node_idx);
             if (idx == 0) {
                 pts[0].time = 0.0;
                 pts[0].value = new_v;
             } else if (idx == pts.size() - 1) {
-                pts[idx].time = std::max(pts[idx - 1].time + 0.1, new_t);
+                pts[idx].time = std::max(pts[idx - 1].time + min_dt, new_t);
                 pts[idx].value = new_v;
             } else {
-                pts[idx].time = std::clamp(new_t, pts[idx - 1].time + 0.1, pts[idx + 1].time - 0.1);
+                pts[idx].time = std::clamp(new_t, pts[idx - 1].time + min_dt, pts[idx + 1].time - min_dt);
                 pts[idx].value = new_v;
             }
             mseg.set_points(pts, mseg.time_mode(), mseg.loop_mode(), mseg.sustain_index());
