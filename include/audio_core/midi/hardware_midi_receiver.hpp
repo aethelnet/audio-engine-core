@@ -404,9 +404,13 @@ public:
         subs.dest.client = static_cast<unsigned char>(m_seq_client_id);
         subs.dest.port = static_cast<unsigned char>(m_seq_port_id);
 
-        (void)ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT, &subs);
+        int res = ioctl(m_seq_fd, SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT, &subs);
+        if (res < 0) {
+            std::cerr << "UNSUBSCRIBE FAILED: errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
+        }
         remove_subscription_record(client_id, port_id);
-        return true;
+        return res >= 0;
+
     }
 
     size_t auto_subscribe_all(bool subscribe_system_announce = true) {
@@ -1055,6 +1059,8 @@ private:
                     dispatch_parsed_message(0x90 | ch, note, vel);
                     break;
                 }
+
+
                 case SNDRV_SEQ_EVENT_NOTEOFF: {
                     uint8_t ch = ev.data.note.channel & 0x0F;
                     uint8_t note = ev.data.note.note & 0x7F;
@@ -1167,8 +1173,7 @@ private:
                     break;
                 }
                 // Dynamic hotplug & kernel announce events
-                case SNDRV_SEQ_EVENT_PORT_START:
-                case SNDRV_SEQ_EVENT_PORT_CHANGE: {
+                case SNDRV_SEQ_EVENT_PORT_START: {
                     int client = static_cast<int>(ev.data.addr.client);
                     int port = static_cast<int>(ev.data.addr.port);
                     if (client != m_seq_client_id && client != 0) {
@@ -1183,6 +1188,11 @@ private:
                     }
                     break;
                 }
+                case SNDRV_SEQ_EVENT_PORT_CHANGE: {
+                    // Port attributes or connection count changed - do not force resubscribe
+                    break;
+                }
+
                 case SNDRV_SEQ_EVENT_PORT_EXIT: {
                     int client = static_cast<int>(ev.data.addr.client);
                     int port = static_cast<int>(ev.data.addr.port);
@@ -1195,13 +1205,34 @@ private:
                     break;
                 }
                 case SNDRV_SEQ_EVENT_PORT_SUBSCRIBED: {
+                    // Subscription established in kernel - record without triggering an ioctl loop
+                    int sender_client = static_cast<int>(ev.data.connect.sender.client);
+                    int sender_port = static_cast<int>(ev.data.connect.sender.port);
                     if (static_cast<int>(ev.data.connect.dest.client) == m_seq_client_id &&
-                        static_cast<int>(ev.data.connect.dest.port) == m_seq_port_id) {
-                        subscribe_to(static_cast<int>(ev.data.connect.sender.client),
-                                     static_cast<int>(ev.data.connect.sender.port));
+                        static_cast<int>(ev.data.connect.dest.port) == m_seq_port_id &&
+                        sender_client != m_seq_client_id && sender_client != 0) {
+                        try {
+                            std::lock_guard<std::recursive_mutex> lock(m_subs_mutex);
+                            bool exists = false;
+                            for (const auto& s : m_subscriptions) {
+                                if (s.client_id == sender_client && s.port_id == sender_port) {
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) {
+                                AlsaSeqSubscription sub;
+                                sub.client_id = sender_client;
+                                sub.port_id = sender_port;
+                                sub.is_system_announce = false;
+                                m_subscriptions.push_back(std::move(sub));
+                                update_device_path_string();
+                            }
+                        } catch (...) {}
                     }
                     break;
                 }
+
                 case SNDRV_SEQ_EVENT_PORT_UNSUBSCRIBED: {
                     if (static_cast<int>(ev.data.connect.dest.client) == m_seq_client_id &&
                         static_cast<int>(ev.data.connect.dest.port) == m_seq_port_id) {

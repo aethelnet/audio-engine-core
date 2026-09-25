@@ -26,6 +26,14 @@ cmake_install.cmake
 renders/
 *.wav
 
+# Audio Plugins & SDKs
+third_party/clap/
+third_party/vst3sdk/
+third_party/clap-wrapper/
+*.clap
+*.vst3
+
 Makefile
 CTestTestfile.cmake
 Testing/
+

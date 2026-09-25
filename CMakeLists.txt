@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 99)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 
 # Compiler warnings and optimizations
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -203,5 +205,19 @@ target_link_libraries(aethel_desk PRIVATE
     glfw
     OpenGL::GL
 )
+
+# ============================================================================
+# Standalone Audio Plugins (CLAP & VST3 for Renoise / Bitwig / Reaper)
+# ============================================================================
+option(BUILD_STANDALONE_PLUGINS "Build Standalone Audio Plugins (CLAP & VST3)" ON)
+if (BUILD_STANDALONE_PLUGINS)
+    set(CLAP_WRAPPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(CLAP_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/clap" CACHE PATH "" FORCE)
+    set(VST3_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vst3sdk" CACHE PATH "" FORCE)
+    set(CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES FALSE CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/clap-wrapper third_party/clap-wrapper-build EXCLUDE_FROM_ALL)
+    add_subdirectory(plugins/aethel_liquid_ode)
+endif()
+
 
 

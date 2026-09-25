@@ -10109,8 +10109,16 @@ void test_alsa_sequencer_subscriptions_and_hotplug() {
                 std::cout << "  -> Auto-discovered and subscribed Midi Through [14:0]" << std::endl;
             }
 
+            // Isolate hotplug test from external host DAWs (e.g. running Renoise or Midi Through)
+            for (const auto& s : rx.active_subscriptions()) {
+                if (!s.is_system_announce) {
+                    rx.unsubscribe_from(s.client_id, s.port_id);
+                }
+            }
+
             // 3. Simulate dynamic device hotplug via second ALSA client
             std::cout << "  -> Simulating dynamic hardware MIDI keyboard hotplug..." << std::endl;
+
             int hotplug_fd = ::open("/dev/snd/seq", O_RDWR | O_CLOEXEC);
             TEST_CHECK(hotplug_fd >= 0);
 
@@ -10199,13 +10207,19 @@ void test_alsa_sequencer_subscriptions_and_hotplug() {
             // 5. Explicit Unsubscribe & Resubscribe
             TEST_CHECK(rx.unsubscribe_from(hotplug_client, hotplug_port));
             TEST_CHECK(!rx.is_subscribed(hotplug_client, hotplug_port));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
             // Note sent now should NOT be received
             uint64_t count_after_unsub = rx.event_count();
+
             note_ev.data.note.note = 71; // B4
             (void)::write(hotplug_fd, &note_ev, sizeof(note_ev));
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             TEST_CHECK(rx.event_count() == count_after_unsub);
+
+
+
+
 
             // Resubscribe manually
             TEST_CHECK(rx.subscribe_to(hotplug_client, hotplug_port));
@@ -11206,14 +11220,21 @@ void test_alsa_hardware_loopback_stress_and_scrub_attenuation() {
             auto trk = mixer.add_track("Synth Track");
             trk->set_input_mode(TrackInputMode::PolySynth);
             trk->set_poly_synth(&matrix.poly_synth(), &matrix);
+            // Unsubscribe from external ports to avoid DAW echo multiplication during stress testing
+            for (const auto& s : rx.active_subscriptions()) {
+                if (!s.is_system_announce) {
+                    rx.unsubscribe_from(s.client_id, s.port_id);
+                }
+            }
 
-            // Connect destination: prefer 14:0 if subscribed, else direct
-            unsigned char dst_client = rx.is_subscribed(14, 0) ? 14 : static_cast<unsigned char>(rx.seq_client_id());
-            unsigned char dst_port = rx.is_subscribed(14, 0) ? 0 : static_cast<unsigned char>(rx.seq_port_id());
+            // Connect destination directly to rx
+            unsigned char dst_client = static_cast<unsigned char>(rx.seq_client_id());
+            unsigned char dst_port = static_cast<unsigned char>(rx.seq_port_id());
 
             constexpr uint32_t kStressEvents = 10000;
             constexpr uint32_t kBatchSize = 250;
             const uint32_t num_batches = kStressEvents / kBatchSize;
+
 
             std::atomic<bool> tx_done{false};
             std::atomic<uint32_t> total_sent{0};
@@ -11322,7 +11343,10 @@ void test_alsa_hardware_loopback_stress_and_scrub_attenuation() {
             tx_thread.join();
             total_drained += rx.drain_to(matrix);
 
+            std::cout << "TEST 78 rx.event_count()=" << rx.event_count() 
+                      << " vs kStressEvents=" << kStressEvents << std::endl;
             TEST_CHECK(rx.event_count() == kStressEvents);
+
             TEST_CHECK(rx.dropped_events() == 0);
             TEST_CHECK(total_drained > 0);
             TEST_CHECK(max_synth_rms > 0.01f);
