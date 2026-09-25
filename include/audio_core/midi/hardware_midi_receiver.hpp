@@ -747,21 +747,23 @@ public:
 
     // ========================================================================
     // Lock-Free SPSC Drain Methods (Audio Thread or Main Event Loop)
+    // Parameter max_events = 0 drains all available queued events.
+    // Specifying max_events > 0 limits the processing chunk to protect sub-ms audio deadlines.
     // ========================================================================
-    size_t drain_to(modulation::PolyphonicSynth& synth) noexcept {
+    size_t drain_to(modulation::PolyphonicSynth& synth, size_t max_events = 0) noexcept {
         MidiEvent ev{};
         size_t count = 0;
-        while (m_queue.try_pop(ev)) {
+        while ((max_events == 0 || count < max_events) && m_queue.try_pop(ev)) {
             synth.handle_midi_event(ev);
             ++count;
         }
         return count;
     }
 
-    size_t drain_to(modulation::ModulationMatrix& matrix) noexcept {
+    size_t drain_to(modulation::ModulationMatrix& matrix, size_t max_events = 0) noexcept {
         MidiEvent ev{};
         size_t count = 0;
-        while (m_queue.try_pop(ev)) {
+        while ((max_events == 0 || count < max_events) && m_queue.try_pop(ev)) {
             switch (ev.type()) {
                 case MidiStatus::NoteOn:
                     if (ev.velocity() > 0) {
@@ -797,10 +799,10 @@ public:
         return count;
     }
 
-    size_t drain_to(MidiLearnRouter& router, MixerGraph& mixer, modulation::ModulationMatrix* matrix = nullptr) noexcept {
+    size_t drain_to(MidiLearnRouter& router, MixerGraph& mixer, modulation::ModulationMatrix* matrix = nullptr, size_t max_events = 0) noexcept {
         MidiEvent ev{};
         size_t count = 0;
-        while (m_queue.try_pop(ev)) {
+        while ((max_events == 0 || count < max_events) && m_queue.try_pop(ev)) {
             // 1. Dispatch CC to MidiLearnRouter (updates parameters or handles learn capture)
             (void)router.process_midi_event(ev, mixer, matrix);
 
@@ -842,10 +844,10 @@ public:
         return count;
     }
 
-    size_t drain_to(std::vector<MidiEvent>& out_events) {
+    size_t drain_to(std::vector<MidiEvent>& out_events, size_t max_events = 0) {
         MidiEvent ev{};
         size_t count = 0;
-        while (m_queue.try_pop(ev)) {
+        while ((max_events == 0 || count < max_events) && m_queue.try_pop(ev)) {
             out_events.push_back(ev);
             ++count;
         }

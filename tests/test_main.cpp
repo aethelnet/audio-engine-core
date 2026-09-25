@@ -62,6 +62,8 @@
 #include "audio_core/dsp/linkwitz_riley_crossover.hpp"
 #include "audio_core/dsp/lookahead_dnl.hpp"
 #include "audio_core/dsp/processor_factory.hpp"
+#include "audio_core/threading/realtime_scheduler.hpp"
+#include "audio_core/threading/audio_worker_pool.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -11896,6 +11898,123 @@ void test_lookahead_delay_and_multiband_linkwitz_riley_dnl() {
     std::cout << "  -> Zero-Allocation Lookahead Delay Buffer & Multiband Linkwitz-Riley DNL: ALL PASSED" << std::endl;
 }
 
+void test_realtime_scheduler_and_bounded_event_budget() {
+    std::cout << "[TEST 81] Running RTKit Real-Time Scheduling Client & Bounded Event Budget Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::threading;
+    using namespace audio_core::midi;
+    using namespace audio_core::modulation;
+
+    // ========================================================================
+    // Part A: RealtimeScheduler Diagnostics & Policy Verification
+    // ========================================================================
+    {
+        auto initial_policy = RealtimeScheduler::current_policy();
+        std::cout << "  -> Initial thread policy: " << RealtimeScheduler::policy_to_string(initial_policy) << std::endl;
+
+        auto res1 = RealtimeScheduler::acquire_realtime_priority(20);
+        std::cout << "  -> Promotion Result: success=" << res1.success
+                  << ", method=" << RealtimeScheduler::method_to_string(res1.method)
+                  << ", policy=" << RealtimeScheduler::policy_to_string(res1.policy)
+                  << ", prio=" << res1.priority << " (" << res1.detail << ")" << std::endl;
+
+#if defined(__linux__)
+        TEST_CHECK(res1.success);
+        TEST_CHECK(res1.policy == SchedulingPolicy::Fifo || res1.policy == SchedulingPolicy::HighPriorityNice);
+        if (res1.policy == SchedulingPolicy::Fifo) {
+            TEST_CHECK(RealtimeScheduler::is_realtime());
+            TEST_CHECK(RealtimeScheduler::current_priority() >= 1);
+        }
+#endif
+
+        // Thread-Local Cache Invariant: Immediate O(1) return with zero syscalls
+        auto t_start = std::chrono::high_resolution_clock::now();
+        auto res2 = RealtimeScheduler::acquire_realtime_priority(20);
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double cache_dur_ns = std::chrono::duration<double, std::nano>(t_end - t_start).count();
+
+        TEST_CHECK(res2.success == res1.success);
+        TEST_CHECK(res2.method == res1.method);
+        TEST_CHECK(res2.policy == res1.policy);
+        TEST_CHECK(res2.priority == res1.priority);
+        std::cout << "  -> Part A (RealtimeScheduler Promotion & Thread-Local Cache " << cache_dur_ns << " ns): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: AudioWorkerPool Real-Time Scheduling Initialization
+    // ========================================================================
+    {
+        AudioWorkerPool pool(4, true); // Workers promote via RealtimeScheduler
+        TEST_CHECK(pool.num_workers() == 4);
+
+        std::atomic<uint32_t> jobs_done{0};
+        struct Context {
+            std::atomic<uint32_t>* counter;
+        } ctx{&jobs_done};
+
+        pool.parallel_for(16, &ctx, [](void* context, uint32_t /*job_idx*/) noexcept {
+            auto* c = static_cast<Context*>(context);
+            c->counter->fetch_add(1, std::memory_order_relaxed);
+        });
+
+        TEST_CHECK(jobs_done.load() == 16);
+        std::cout << "  -> Part B (AudioWorkerPool Real-Time Worker Pool Scaling): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: HardwareMidiReceiver Bounded Event Draining
+    // ========================================================================
+    {
+        HardwareMidiReceiver rx(1024);
+        rx.auto_connect(false); // Mock mode
+        TEST_CHECK(rx.is_mock());
+
+        // Push 100 mock Note-On events
+        for (int i = 0; i < 100; ++i) {
+            MidiEvent ev{0, static_cast<uint8_t>(MidiStatus::NoteOn), static_cast<uint8_t>(36 + (i % 24)), 90};
+            rx.inject_event(ev);
+        }
+        TEST_CHECK(rx.event_count() == 100);
+
+        PolyphonicSynth synth;
+        synth.init(48000.0f);
+
+        // 1. Drain with bounded limit 25
+        size_t d1 = rx.drain_to(synth, 25);
+        TEST_CHECK(d1 == 25);
+
+        // 2. Drain with bounded limit 40
+        size_t d2 = rx.drain_to(synth, 40);
+        TEST_CHECK(d2 == 40);
+
+        // 3. Drain remaining (max_events = 0 drains all remaining 35 events)
+        size_t d3 = rx.drain_to(synth, 0);
+        TEST_CHECK(d3 == 35);
+
+        // 4. Drain on empty queue returns 0
+        size_t d4 = rx.drain_to(synth, 10);
+        TEST_CHECK(d4 == 0);
+
+        // Test vector drain overload
+        for (int i = 0; i < 50; ++i) {
+            MidiEvent ev{0, static_cast<uint8_t>(MidiStatus::ControlChange), 1, static_cast<uint8_t>(i)};
+            rx.inject_event(ev);
+        }
+        std::vector<MidiEvent> out_events;
+        size_t d5 = rx.drain_to(out_events, 20);
+        TEST_CHECK(d5 == 20);
+        TEST_CHECK(out_events.size() == 20);
+
+        size_t d6 = rx.drain_to(out_events, 0);
+        TEST_CHECK(d6 == 30);
+        TEST_CHECK(out_events.size() == 50);
+
+        std::cout << "  -> Part C (HardwareMidiReceiver Bounded Event Draining): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> RTKit Real-Time Scheduling Client & Bounded Event Budget: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -11981,6 +12100,7 @@ int main() {
     test_alsa_hardware_loopback_stress_and_scrub_attenuation();
     test_midi_learn_and_mseg_automation_bridge();
     test_lookahead_delay_and_multiband_linkwitz_riley_dnl();
+    test_realtime_scheduler_and_bounded_event_budget();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

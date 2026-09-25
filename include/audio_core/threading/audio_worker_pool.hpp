@@ -12,6 +12,8 @@
 #include <immintrin.h>
 #endif
 
+#include "audio_core/threading/realtime_scheduler.hpp"
+
 namespace audio_core::threading {
 
 // ============================================================================
@@ -19,6 +21,7 @@ namespace audio_core::threading {
 // - Pre-spawned worker threads with hardware FTZ/DAZ denormal protection
 // - Dynamic atomic work-stealing counter
 // - Sub-microsecond cache-aligned synchronization without mutexes
+// - Optional SCHED_FIFO real-time thread priority promotion
 // ============================================================================
 class AudioWorkerPool {
 public:
@@ -26,8 +29,8 @@ public:
 
     static constexpr uint32_t kAutoDetect = 0xFFFFFFFF;
 
-    explicit AudioWorkerPool(uint32_t num_threads = kAutoDetect) {
-        init(num_threads);
+    explicit AudioWorkerPool(uint32_t num_threads = kAutoDetect, bool enable_realtime = false) {
+        init(num_threads, enable_realtime);
     }
 
     ~AudioWorkerPool() {
@@ -39,9 +42,10 @@ public:
     AudioWorkerPool(AudioWorkerPool&&) = delete;
     AudioWorkerPool& operator=(AudioWorkerPool&&) = delete;
 
-    void init(uint32_t num_threads) {
+    void init(uint32_t num_threads, bool enable_realtime = false) {
         shutdown();
 
+        m_enable_realtime = enable_realtime;
         if (num_threads == kAutoDetect) {
             uint32_t hw = std::thread::hardware_concurrency();
             num_threads = (hw > 1) ? (hw - 1) : 0;
@@ -123,6 +127,10 @@ public:
 
 private:
     void worker_loop(uint32_t /*worker_idx*/) noexcept {
+        if (m_enable_realtime) {
+            (void)RealtimeScheduler::acquire_realtime_priority(20);
+        }
+
         // Enforce Flush-To-Zero and Denormals-Are-Zero on this worker core
         #if defined(__x86_64__) || defined(_M_X64)
         _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -167,6 +175,7 @@ private:
 
     std::vector<std::thread> m_workers;
     uint32_t m_num_workers{0};
+    bool m_enable_realtime{false};
     std::atomic<bool> m_running{false};
 
     alignas(64) std::atomic<uint32_t> m_cycle_id{0};

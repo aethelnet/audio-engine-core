@@ -7,6 +7,7 @@
 #include "audio_core/sampling/vari_speed_streamer.hpp"
 #include "audio_core/dsp/purest_drive.hpp"
 #include "audio_core/dsp/buttercomp2.hpp"
+#include "audio_core/threading/realtime_scheduler.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -201,13 +202,17 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------------
     std::atomic<bool> stress_running{true};
     AudioStats audio_stats;
+    threading::RealtimeResult rt_result;
     std::vector<double> block_times;
     block_times.reserve(10000);
 
     const double budget_us = 1e6 * cfg.buffer_frames / static_cast<double>(cfg.sample_rate);
 
-    // Audio thread: continuously renders 128-frame blocks while draining MIDI
+    // Audio thread: continuously renders audio blocks while draining MIDI
     std::thread audio_thread([&]() {
+        // Promote audio thread to hard real-time SCHED_FIFO priority 20 (Direct kernel or RTKit D-Bus fallback)
+        rt_result = threading::RealtimeScheduler::acquire_realtime_priority(20);
+
         AudioBuffer master_buf(2, cfg.buffer_frames);
         auto master_view = master_buf.view();
         uint64_t block_idx = 0;
@@ -216,7 +221,10 @@ int main(int argc, char* argv[]) {
             auto t_start = std::chrono::high_resolution_clock::now();
 
             // 1. Drain arriving ALSA MIDI events into ModulationMatrix & PolySynth lock-free
-            size_t drained = rx.drain_to(mod_matrix);
+            // At sub-millisecond buffer sizes (32 frames = 666.7 us deadline), bound per-block event processing
+            // to 1 event/sample (32 events/block = 48,000 events/sec sustained rate) to guarantee audio deadline compliance.
+            const size_t max_events_per_block = (cfg.buffer_frames <= 32) ? 32 : ((cfg.buffer_frames <= 64) ? 64 : 0);
+            size_t drained = rx.drain_to(mod_matrix, max_events_per_block);
             audio_stats.synth_events_drained += drained;
 
             // 2. Modulate scrub position & velocity to stress Granular Micro-Windowing & DC Blocker
@@ -396,6 +404,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[3] REAL-TIME AUDIO ENGINE STABILITY:\n";
     std::cout << "  - Real-Time Budget per Block:  " << std::fixed << std::setprecision(1) << budget_us << " us (" << cfg.buffer_frames << " frames @ " << cfg.sample_rate << " Hz)\n";
+    std::cout << "  - Real-Time Scheduling:        " << (rt_result.success ? "ACTIVE (PROMOTED)" : "STANDARD (CFS)")
+              << " [" << threading::RealtimeScheduler::method_to_string(rt_result.method) << "]\n";
+    std::cout << "  - Active Policy & Priority:    " << threading::RealtimeScheduler::policy_to_string(rt_result.policy)
+              << " (prio=" << rt_result.priority << ", nice=" << rt_result.nice_level << ")\n";
     std::cout << "  - Total Blocks Rendered:       " << audio_stats.total_blocks << " blocks\n";
     std::cout << "  - Min Render Time:             " << std::fixed << std::setprecision(1) << audio_stats.min_us << " us\n";
     std::cout << "  - Avg Render Time:             " << std::fixed << std::setprecision(1) << avg_us << " us\n";

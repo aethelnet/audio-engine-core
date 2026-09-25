@@ -12,6 +12,7 @@
 #endif
 
 #include "backends/desktop/desktop_backend.hpp"
+#include "audio_core/threading/realtime_scheduler.hpp"
 #include <iostream>
 
 namespace audio_core {
@@ -31,6 +32,9 @@ DesktopBackend::~DesktopBackend() {
 }
 
 void DesktopBackend::miniaudio_data_callback(ma_device* pDevice, void* pOutput, const void* /*pInput*/, uint32_t frameCount) {
+    // Zero-overhead cached promotion to SCHED_FIFO priority 20 (via direct kernel or RTKit D-Bus)
+    (void)threading::RealtimeScheduler::acquire_realtime_priority(20);
+
     auto* self = static_cast<DesktopBackend*>(pDevice->pUserData);
     if (!self || !self->m_callback) {
         return;

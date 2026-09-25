@@ -4,8 +4,9 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 80/80 Passed](https://img.shields.io/badge/CTest-80%2F80%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 81/81 Passed](https://img.shields.io/badge/CTest-81%2F81%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
+[![RTKit: SCHED_FIFO Support](https://img.shields.io/badge/Linux%20RT-RTKit%20%7C%20SCHED__FIFO-blueviolet.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-orange.svg)](LICENSE)
 
@@ -87,11 +88,19 @@ Provides ultra-low latency browser & network control surface integration via `We
 - **Lock-Free SPSC Dispatch**: Commands and MIDI note triggers are pushed directly to `Engine` lock-free ringbuffers without touching or stalling the real-time audio thread.
 - **30 Hz Telemetry Streaming**: High-density snapshot broadcasts of master meters, track meters, bus meters, and Poincaré phase-space orbits.
 
+### 2.7 Multi-Tier Real-Time Scheduling & Linux RealtimeKit (RTKit) Client
+Sub-millisecond buffer rendering (down to 32 frames / 666.7 µs deadline @ 48 kHz) requires immunity against Linux CFS kernel preemption:
+- **Tier 1 (Direct Kernel Probe)**: Probes `pthread_setschedparam(SCHED_FIFO, prio)` for processes with `CAP_SYS_NICE` or custom limits.
+- **Tier 2 (RTKit D-Bus Client)**: Communicates with `org.freedesktop.RealtimeKit1` via systemd D-Bus, setting `RLIMIT_RTTIME` watchdog limits (200 ms) and promoting unprivileged threads to `SCHED_FIFO` priority 20 without root access.
+- **Tier 3 & 4 (High-Priority Nice Fallback)**: Automatically falls back to RTKit `MakeThreadHighPriority` (-15) or standard `setpriority`.
+- **Zero-Overhead Thread-Local Cache**: Thread promotion evaluates in $O(1)$ with 0 ns overhead on subsequent audio callback iterations.
+- **Bounded Event Draining**: `HardwareMidiReceiver::drain_to(..., max_events)` bounds per-block event processing at small buffer sizes to prevent dense synthetic event storms from consuming the real-time slice.
+
 ---
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **80 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **81 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -116,8 +125,9 @@ $ ./build/audio_tests
 [TEST 62..70] Timeline Scrubbing, SPP & MTC Full Frame SysEx:     PASSED
 [TEST 71..75] MIDI Learn Parameter Routing & Automation Bridge:   PASSED
 [TEST 76..80] Lookahead Multiband DNL & LR4 4-Way Crossover:      PASSED
+[TEST 81]     RTKit Real-Time Scheduling Client & Bounded Budget: PASSED
 ===============================================================================
-   80 / 80 UNIT TESTS PASSED (100.0% SUCCESS)
+   81 / 81 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 

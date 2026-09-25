@@ -73,6 +73,26 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# RTKit / systemd D-Bus Integration for Linux Real-Time Scheduling
+if (UNIX AND NOT APPLE AND NOT ANDROID)
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(LIBSYSTEMD QUIET libsystemd)
+    endif()
+
+    if (LIBSYSTEMD_FOUND)
+        target_link_libraries(audio_core PUBLIC ${LIBSYSTEMD_LIBRARIES})
+        target_include_directories(audio_core PUBLIC ${LIBSYSTEMD_INCLUDE_DIRS})
+        target_compile_definitions(audio_core PUBLIC AUDIO_CORE_HAS_SYSTEMD=1)
+    else()
+        find_library(SYSTEMD_LIB systemd)
+        if (SYSTEMD_LIB)
+            target_link_libraries(audio_core PUBLIC ${SYSTEMD_LIB})
+            target_compile_definitions(audio_core PUBLIC AUDIO_CORE_HAS_SYSTEMD=1)
+        endif()
+    endif()
+endif()
+
 # Dependencies (threads, math, dl, wasm3, pipewire)
 target_link_libraries(audio_core PUBLIC
     wasm3_core
