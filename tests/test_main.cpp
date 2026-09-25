@@ -13210,6 +13210,237 @@ void test_multiband_transient_span_and_ghost_note_resolution() {
     std::cout << "  -> Multiband Transient Span & Ghost-Note Resolution: ALL PASSED" << std::endl;
 }
 
+// ============================================================================
+// TEST 88: Arranger Warp-Pins, Non-Linear Elastic Audio & Groove Quantization
+// ============================================================================
+void test_arranger_warp_pins_and_nonlinear_elastic_audio() {
+    std::cout << "[TEST 88] Running Arranger Warp-Pins, Non-Linear Elastic Audio & Groove Quantization..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+    using namespace audio_core::analysis;
+
+    constexpr uint32_t kSampleRate = 48000;
+    constexpr uint32_t kTotalFrames = 192000; // 4.0 seconds
+
+    // ------------------------------------------------------------------------
+    // Part A: Mathematical Piecewise Mapping & Monotonicity Invariants
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part A] Mathematical Piecewise Mapping & Monotonicity..." << std::endl;
+        auto clip = std::make_shared<AudioClip>("WarpMathClip", kSampleRate, 2, kTotalFrames);
+        ArrangerClipInstance c{
+            .id = 1,
+            .name = "WarpMathTest",
+            .clip = clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f,
+            .orig_len_bars = 4.0f
+        };
+
+        // 1. Without pins: linear identity
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(0.0, kTotalFrames) - 0.0) < 1e-4);
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(2.0, kTotalFrames) - 96000.0) < 1e-4);
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(4.0, kTotalFrames) - 192000.0) < 1e-4);
+
+        // 2. Add single pin at center (frame 96000 pinned to bar 2.0)
+        uint32_t p1 = c.add_warp_pin(96000, 2.0f);
+        TEST_CHECK(p1 > 0);
+        TEST_CHECK(c.warp_pins.size() == 1);
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(1.0, kTotalFrames) - 48000.0) < 1e-4);
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(2.0, kTotalFrames) - 96000.0) < 1e-4);
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(3.0, kTotalFrames) - 144000.0) < 1e-4);
+
+        // 3. Move pin to bar 3.0 (Time stretch first half 1.5x, compress second half 0.5x)
+        bool moved = c.move_warp_pin(p1, 3.0f);
+        TEST_CHECK(moved);
+        // Bar 1.5 is now halfway between 0.0 and 3.0 -> source frame 48000
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(1.5, kTotalFrames) - 48000.0) < 1e-4);
+        // Bar 3.0 is exactly at frame 96000
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(3.0, kTotalFrames) - 96000.0) < 1e-4);
+        // Bar 3.5 is halfway between 3.0 and 4.0 -> source frame 96000 + 0.5*(192000 - 96000) = 144000
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(3.5, kTotalFrames) - 144000.0) < 1e-4);
+
+        // 4. Monotonicity clamp invariant: Add pin p2 before p1
+        uint32_t p2 = c.add_warp_pin(48000, 1.0f);
+        TEST_CHECK(p2 > 0);
+        TEST_CHECK(c.warp_pins.size() == 2);
+        // p2 is at index 0 (source_frame 48000), p1 is at index 1 (source_frame 96000)
+        TEST_CHECK(c.warp_pins[0].id == p2);
+        TEST_CHECK(c.warp_pins[1].id == p1);
+
+        // Attempt to move p2 past p1 (e.g. to bar 3.5)
+        c.move_warp_pin(p2, 3.5f);
+        // Must be clamped strictly below p1.pinned_bar (3.0f)
+        const auto* pin2_ptr = c.find_warp_pin(p2);
+        TEST_CHECK(pin2_ptr != nullptr);
+        TEST_CHECK(pin2_ptr->pinned_bar < c.find_warp_pin(p1)->pinned_bar);
+
+        std::cout << "  -> Part A (Piecewise Mapping & Monotonicity): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part B: Reciprocal Frame-to-Bar Invariant
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part B] Reciprocal Frame-to-Bar Invariant..." << std::endl;
+        auto clip = std::make_shared<AudioClip>("WarpRecipClip", kSampleRate, 2, kTotalFrames);
+        ArrangerClipInstance c{
+            .id = 1,
+            .name = "RecipTest",
+            .clip = clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f,
+            .orig_len_bars = 4.0f
+        };
+
+        c.add_warp_pin(40000, 0.8f);
+        c.add_warp_pin(80000, 2.2f);
+        c.add_warp_pin(150000, 3.4f);
+        TEST_CHECK(c.warp_pins.size() == 3);
+
+        // Verify round-trip b -> frame -> b_recip across 100 timeline positions
+        for (int i = 0; i <= 100; ++i) {
+            double b = (static_cast<double>(i) / 100.0) * c.len_bars;
+            double f = c.evaluate_warped_frame(b, kTotalFrames);
+            uint32_t f_u = static_cast<uint32_t>(std::clamp(std::round(f), 0.0, static_cast<double>(kTotalFrames)));
+            double b_recip = c.frame_to_bar(f_u, kTotalFrames);
+            TEST_CHECK(std::abs(b_recip - b) < 0.02);
+        }
+
+        std::cout << "  -> Part B (Reciprocal Frame-to-Bar Invariant): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part C: Groove Quantization & Transient Snapping
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part C] Groove Quantization & Pin Removal..." << std::endl;
+        auto clip = std::make_shared<AudioClip>("GrooveClip", kSampleRate, 2, kTotalFrames);
+        float* l = clip->channel(0);
+        float* r = clip->channel(1);
+
+        // Synthesize 4 deliberate unquantized transient spikes (e.g. rushed/dragged drummer)
+        // at frames 22000, 49000, 94000, 142000
+        const uint32_t unquantized_onsets[4] = {22000, 49000, 94000, 142000};
+        for (uint32_t o : unquantized_onsets) {
+            for (uint32_t i = 0; i < 300; ++i) {
+                float env = std::exp(-static_cast<float>(i) / 40.0f);
+                float val = 0.9f * env * std::sin(2.0f * std::numbers::pi_v<float> * 250.0f * i / 48000.0f);
+                l[o + i] += val;
+                r[o + i] += val;
+            }
+        }
+
+        ArrangerClipInstance c{
+            .id = 1,
+            .name = "GrooveClipInst",
+            .clip = clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f,
+            .orig_len_bars = 4.0f
+        };
+
+        // Detect transients and quantize to 1/16th note grid (0.0625 bars)
+        c.detect_transients(0.4f);
+        TEST_CHECK(!c.detected_transients.empty());
+
+        c.quantize_transients_to_grid(0.0625f);
+        TEST_CHECK(!c.warp_pins.empty());
+
+        // Verify every generated warp pin sits strictly on a 1/16th note grid
+        for (const auto& pin : c.warp_pins) {
+            float grid_units = pin.pinned_bar / 0.0625f;
+            float diff = std::abs(grid_units - std::round(grid_units));
+            TEST_CHECK(diff < 1e-3f);
+        }
+
+        // Test pin removal and full clear
+        uint32_t first_pin_id = c.warp_pins[0].id;
+        size_t pins_before = c.warp_pins.size();
+        TEST_CHECK(c.remove_warp_pin(first_pin_id));
+        TEST_CHECK(c.warp_pins.size() == pins_before - 1);
+
+        c.clear_warp_pins();
+        TEST_CHECK(c.warp_pins.empty());
+        // Identity restored
+        TEST_CHECK(std::abs(c.evaluate_warped_frame(2.0, kTotalFrames) - 96000.0) < 1e-4);
+
+        std::cout << "  -> Part C (Groove Quantization & Pin Removal): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part D: ArrangerTrack Real-Time Rendering & Razor Split Invariant
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part D] ArrangerTrack Real-Time Rendering & Razor Split..." << std::endl;
+        auto clip = std::make_shared<AudioClip>("ArrangerRenderClip", kSampleRate, 2, kTotalFrames);
+        float* l = clip->channel(0);
+        float* r = clip->channel(1);
+        for (uint32_t i = 0; i < kTotalFrames; ++i) {
+            float s = 0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * static_cast<float>(i) / 48000.0f);
+            l[i] = s;
+            r[i] = s;
+        }
+
+        ArrangerTrack track;
+        ArrangerClipInstance c{
+            .id = 10,
+            .name = "RenderClip",
+            .clip = clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f,
+            .orig_len_bars = 4.0f
+        };
+        track.add_clip(c);
+
+        // Add warp pins via track API
+        TEST_CHECK(track.add_clip_warp_pin(10, 48000, 1.5f));
+        TEST_CHECK(track.add_clip_warp_pin(10, 120000, 2.8f));
+
+        const auto* clip_snap = track.find_clip(10);
+        TEST_CHECK(clip_snap != nullptr);
+        TEST_CHECK(clip_snap->warp_pins.size() == 2);
+
+        // Audio-thread render test across block boundaries
+        std::vector<float> out_l(512, 0.0f);
+        std::vector<float> out_r(512, 0.0f);
+        double cur_bar = 0.0;
+        double bar_inc = (512.0 / 48000.0) * (120.0 / 60.0) / 4.0; // @ 120 BPM: 0.005333 bars/block
+
+        for (int blk = 0; blk < 16; ++blk) {
+            std::fill(out_l.begin(), out_l.end(), 0.0f);
+            std::fill(out_r.begin(), out_r.end(), 0.0f);
+            track.render(out_l.data(), out_r.data(), 512, kSampleRate, 120.0, true, cur_bar);
+            for (uint32_t i = 0; i < 512; ++i) {
+                TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+                TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+            }
+            cur_bar += bar_inc;
+        }
+
+        // Razor Split at bar 2.0 with Warp Pins
+        auto split_ids = track.split_clip_at_bar(10, 2.0f);
+        TEST_CHECK(split_ids.first != 0 && split_ids.second != 0);
+        const auto& clips = track.clips();
+        TEST_CHECK(clips.size() == 2);
+
+        const auto* c1 = track.find_clip(split_ids.first);
+        const auto* c2 = track.find_clip(split_ids.second);
+        TEST_CHECK(c1 != nullptr && c2 != nullptr);
+        // Pin at bar 1.5 belongs to c1 (before bar 2.0)
+        TEST_CHECK(c1->warp_pins.size() == 1);
+        TEST_CHECK(std::abs(c1->warp_pins[0].pinned_bar - 1.5f) < 1e-4f);
+        // Pin at bar 2.8 belongs to c2, re-anchored to 2.8 - 2.0 = 0.8 bars!
+        TEST_CHECK(c2->warp_pins.size() == 1);
+        TEST_CHECK(std::abs(c2->warp_pins[0].pinned_bar - 0.8f) < 1e-4f);
+
+        std::cout << "  -> Part D (ArrangerTrack Real-Time Rendering & Razor Split): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Arranger Warp-Pins & Non-Linear Elastic Audio: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -13302,6 +13533,7 @@ int main() {
     test_arranger_time_stretching_and_wsola_edge_drag();
     test_transient_warp_wsola_and_drum_punch_preservation();
     test_multiband_transient_span_and_ghost_note_resolution();
+    test_arranger_warp_pins_and_nonlinear_elastic_audio();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

@@ -5,6 +5,7 @@
 #include "audio_core/sampling/audio_clip.hpp"
 #include "audio_core/dsp/resampler.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
+#include "audio_core/analysis/transient_detector.hpp"
 
 #include <vector>
 #include <memory>
@@ -21,6 +22,16 @@
 #endif
 
 namespace audio_core::sequencer {
+
+// ============================================================================
+// WarpPin: Non-Linear Elastic Time-Warping Anchor Point
+// Binds an exact source audio frame to a target musical timeline position.
+// ============================================================================
+struct WarpPin {
+    uint32_t id{0};
+    uint32_t source_frame{0};   // Frame index within pristine source asset
+    float pinned_bar{0.0f};      // Relative musical position (in bars) within clip [0.0, len_bars]
+};
 
 // ============================================================================
 // ArrangerClipInstance: Timeline Event Container
@@ -121,6 +132,188 @@ struct ArrangerClipInstance {
 
         return gain;
     }
+
+    // Warp Pins for Non-Linear Elastic Audio & Groove Quantization
+    std::vector<WarpPin> warp_pins{};
+    std::vector<analysis::TransientSpan> detected_transients{};
+
+    // Detect transients using the 3-band complementary filterbank
+    void detect_transients(float sensitivity = 0.5f) {
+        auto target = source_clip ? source_clip : clip;
+        if (!target || target->num_frames() == 0) return;
+        analysis::TransientDetector detector(target->sample_rate());
+        const float* ch0 = target->channel(0);
+        const float* ch1 = (target->num_channels() > 1) ? target->channel(1) : ch0;
+        auto res = detector.analyze(ch0, ch1, target->num_frames(), sensitivity);
+        detected_transients = std::move(res.transient_spans);
+    }
+
+    // Sort warp pins strictly by source_frame, secondary pinned_bar
+    void sort_warp_pins() noexcept {
+        std::sort(warp_pins.begin(), warp_pins.end(), [](const WarpPin& a, const WarpPin& b) {
+            if (a.source_frame != b.source_frame) {
+                return a.source_frame < b.source_frame;
+            }
+            return a.pinned_bar < b.pinned_bar;
+        });
+    }
+
+    // Add a new warp pin binding source_frame to pinned_bar
+    uint32_t add_warp_pin(uint32_t source_frame, float pinned_bar) {
+        pinned_bar = std::clamp(pinned_bar, 0.001f, std::max(0.002f, len_bars - 0.001f));
+        uint32_t new_id = 1;
+        for (const auto& p : warp_pins) {
+            if (p.id >= new_id) new_id = p.id + 1;
+        }
+        warp_pins.push_back(WarpPin{
+            .id = new_id,
+            .source_frame = source_frame,
+            .pinned_bar = pinned_bar
+        });
+        sort_warp_pins();
+        return new_id;
+    }
+
+    // Remove an existing warp pin by ID
+    bool remove_warp_pin(uint32_t pin_id) {
+        auto it = std::find_if(warp_pins.begin(), warp_pins.end(), [pin_id](const WarpPin& p) {
+            return p.id == pin_id;
+        });
+        if (it == warp_pins.end()) return false;
+        warp_pins.erase(it);
+        return true;
+    }
+
+    // Move a warp pin while preserving strict monotonicity with its neighbors
+    bool move_warp_pin(uint32_t pin_id, float new_pinned_bar) {
+        auto it = std::find_if(warp_pins.begin(), warp_pins.end(), [pin_id](const WarpPin& p) {
+            return p.id == pin_id;
+        });
+        if (it == warp_pins.end()) return false;
+
+        size_t idx = static_cast<size_t>(std::distance(warp_pins.begin(), it));
+        float min_bar = (idx > 0) ? (warp_pins[idx - 1].pinned_bar + 0.005f) : 0.005f;
+        float max_bar = (idx + 1 < warp_pins.size()) ? (warp_pins[idx + 1].pinned_bar - 0.005f) : (len_bars - 0.005f);
+
+        if (min_bar > max_bar) return false;
+        it->pinned_bar = std::clamp(new_pinned_bar, min_bar, max_bar);
+        return true;
+    }
+
+    void clear_warp_pins() noexcept {
+        warp_pins.clear();
+    }
+
+    [[nodiscard]] WarpPin* find_warp_pin(uint32_t pin_id) noexcept {
+        for (auto& p : warp_pins) {
+            if (p.id == pin_id) return &p;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] const WarpPin* find_warp_pin(uint32_t pin_id) const noexcept {
+        for (const auto& p : warp_pins) {
+            if (p.id == pin_id) return &p;
+        }
+        return nullptr;
+    }
+
+    // Real-Time Piecewise Time-Warping: Evaluates exact source frame at rel_bar
+    // Zero allocations, O(M) lookup, C0-continuous Hermite compatible.
+    [[nodiscard]] inline double evaluate_warped_frame(double rel_bar, uint32_t total_frames) const noexcept {
+        if (warp_pins.empty() || total_frames == 0) {
+            double base_dur = (orig_len_bars > 0.01f ? orig_len_bars : len_bars);
+            return static_cast<double>(start_offset_frames) + (rel_bar / base_dur) * static_cast<double>(total_frames);
+        }
+
+        double p0_bar = 0.0;
+        double p0_frame = static_cast<double>(start_offset_frames);
+        double p1_bar = static_cast<double>(len_bars);
+        double p1_frame = static_cast<double>(total_frames);
+
+        if (rel_bar <= static_cast<double>(warp_pins.front().pinned_bar)) {
+            p1_bar = static_cast<double>(warp_pins.front().pinned_bar);
+            p1_frame = static_cast<double>(warp_pins.front().source_frame);
+        } else if (rel_bar >= static_cast<double>(warp_pins.back().pinned_bar)) {
+            p0_bar = static_cast<double>(warp_pins.back().pinned_bar);
+            p0_frame = static_cast<double>(warp_pins.back().source_frame);
+        } else {
+            for (size_t k = 0; k + 1 < warp_pins.size(); ++k) {
+                if (rel_bar >= static_cast<double>(warp_pins[k].pinned_bar) &&
+                    rel_bar <= static_cast<double>(warp_pins[k + 1].pinned_bar)) {
+                    p0_bar = static_cast<double>(warp_pins[k].pinned_bar);
+                    p0_frame = static_cast<double>(warp_pins[k].source_frame);
+                    p1_bar = static_cast<double>(warp_pins[k + 1].pinned_bar);
+                    p1_frame = static_cast<double>(warp_pins[k + 1].source_frame);
+                    break;
+                }
+            }
+        }
+
+        double span_bar = p1_bar - p0_bar;
+        if (span_bar <= 1e-6) return p0_frame;
+        double u = (rel_bar - p0_bar) / span_bar;
+        u = std::clamp(u, 0.0, 1.0);
+        return p0_frame + u * (p1_frame - p0_frame);
+    }
+
+    // Reciprocal mapping: Maps source audio frame to current warped timeline bar
+    [[nodiscard]] inline double frame_to_bar(uint32_t frame, uint32_t total_frames) const noexcept {
+        if (warp_pins.empty() || total_frames == 0) {
+            double base_dur = (orig_len_bars > 0.01f ? orig_len_bars : len_bars);
+            return (static_cast<double>(frame) / static_cast<double>(total_frames)) * base_dur;
+        }
+
+        double p0_frame = 0.0;
+        double p0_bar = 0.0;
+        double p1_frame = static_cast<double>(total_frames);
+        double p1_bar = static_cast<double>(len_bars);
+
+        if (frame <= warp_pins.front().source_frame) {
+            p1_frame = static_cast<double>(warp_pins.front().source_frame);
+            p1_bar = static_cast<double>(warp_pins.front().pinned_bar);
+        } else if (frame >= warp_pins.back().source_frame) {
+            p0_frame = static_cast<double>(warp_pins.back().source_frame);
+            p0_bar = static_cast<double>(warp_pins.back().pinned_bar);
+        } else {
+            for (size_t k = 0; k + 1 < warp_pins.size(); ++k) {
+                if (frame >= warp_pins[k].source_frame && frame <= warp_pins[k + 1].source_frame) {
+                    p0_frame = static_cast<double>(warp_pins[k].source_frame);
+                    p0_bar = static_cast<double>(warp_pins[k].pinned_bar);
+                    p1_frame = static_cast<double>(warp_pins[k + 1].source_frame);
+                    p1_bar = static_cast<double>(warp_pins[k + 1].pinned_bar);
+                    break;
+                }
+            }
+        }
+
+        double span_f = p1_frame - p0_frame;
+        if (span_f <= 1e-6) return p0_bar;
+        double u = (static_cast<double>(frame) - p0_frame) / span_f;
+        u = std::clamp(u, 0.0, 1.0);
+        return p0_bar + u * (p1_bar - p0_bar);
+    }
+
+    // Groove Quantization: Automatically snaps detected transient peaks to nearest musical grid
+    void quantize_transients_to_grid(float grid_subdivision_bars = 0.0625f) {
+        if (detected_transients.empty()) {
+            detect_transients();
+        }
+        auto target = clip ? clip : source_clip;
+        if (detected_transients.empty() || !target || target->num_frames() == 0) return;
+
+        clear_warp_pins();
+        const uint32_t num_f = target->num_frames();
+        const float base_bars = (orig_len_bars > 0.01f ? orig_len_bars : len_bars);
+
+        for (const auto& span : detected_transients) {
+            if (span.peak_frame < 32 || span.peak_frame >= num_f - 32) continue;
+            float natural_bar = (static_cast<float>(span.peak_frame) / static_cast<float>(num_f)) * base_bars;
+            float quantized_bar = std::round(natural_bar / grid_subdivision_bars) * grid_subdivision_bars;
+            quantized_bar = std::clamp(quantized_bar, 0.02f, len_bars - 0.02f);
+            add_warp_pin(span.peak_frame, quantized_bar);
+        }
+    }
 };
 
 // ============================================================================
@@ -154,10 +347,63 @@ public:
             clip.stretch_ratio = 1.0f;
         }
 
+        if (clip.detected_transients.empty() && clip.clip) {
+            clip.detect_transients();
+        }
+
         m_clips.push_back(std::move(clip));
         update_auto_crossfades();
         publish_snapshot();
         return m_clips.back().id;
+    }
+
+    // Warp Pin & Groove Editing API
+    uint32_t add_clip_warp_pin(uint32_t clip_id, uint32_t source_frame, float pinned_bar) {
+        auto* c = find_clip(clip_id);
+        if (!c) return 0;
+        uint32_t pid = c->add_warp_pin(source_frame, pinned_bar);
+        publish_snapshot();
+        return pid;
+    }
+
+    bool move_clip_warp_pin(uint32_t clip_id, uint32_t pin_id, float new_pinned_bar) {
+        auto* c = find_clip(clip_id);
+        if (!c) return false;
+        bool res = c->move_warp_pin(pin_id, new_pinned_bar);
+        if (res) publish_snapshot();
+        return res;
+    }
+
+    bool remove_clip_warp_pin(uint32_t clip_id, uint32_t pin_id) {
+        auto* c = find_clip(clip_id);
+        if (!c) return false;
+        bool res = c->remove_warp_pin(pin_id);
+        if (res) publish_snapshot();
+        return res;
+    }
+
+    bool clear_clip_warp_pins(uint32_t clip_id) {
+        auto* c = find_clip(clip_id);
+        if (!c) return false;
+        c->clear_warp_pins();
+        publish_snapshot();
+        return true;
+    }
+
+    bool quantize_clip_transients(uint32_t clip_id, float grid = 0.0625f) {
+        auto* c = find_clip(clip_id);
+        if (!c) return false;
+        c->quantize_transients_to_grid(grid);
+        publish_snapshot();
+        return true;
+    }
+
+    bool detect_clip_transients(uint32_t clip_id, float sensitivity = 0.5f) {
+        auto* c = find_clip(clip_id);
+        if (!c) return false;
+        c->detect_transients(sensitivity);
+        publish_snapshot();
+        return true;
     }
 
     bool remove_clip(uint32_t clip_id) {
@@ -330,6 +576,22 @@ public:
         c2.fade_out_shape = orig.fade_out_shape;
         c2.is_auto_crossfade_in = false;
         c2.is_auto_crossfade_out = orig.is_auto_crossfade_out;
+        // Distribute warp pins across split boundary
+        c1.warp_pins.clear();
+        c2.warp_pins.clear();
+        for (const auto& pin : orig.warp_pins) {
+            if (pin.pinned_bar < len1 - 0.005f) {
+                c1.warp_pins.push_back(pin);
+            } else if (pin.pinned_bar > len1 + 0.005f) {
+                WarpPin p2 = pin;
+                p2.pinned_bar = pin.pinned_bar - len1;
+                c2.warp_pins.push_back(p2);
+            }
+        }
+        c1.sort_warp_pins();
+        c2.sort_warp_pins();
+        c1.detect_transients();
+        c2.detect_transients();
 
         *it = c1;
         m_clips.insert(it + 1, c2);
@@ -462,7 +724,9 @@ public:
                 if (cur_bar >= c.start_bar && cur_bar < c.end_bar()) {
                     double rel_bar = cur_bar - c.start_bar;
                     double playhead_f = 0.0;
-                    if (std::abs(c.stretch_ratio - 1.0f) < 1e-4f && std::abs(c.pitch_semitones) < 1e-4f) {
+                    if (!c.warp_pins.empty()) {
+                        playhead_f = c.evaluate_warped_frame(rel_bar, num_f);
+                    } else if (std::abs(c.stretch_ratio - 1.0f) < 1e-4f && std::abs(c.pitch_semitones) < 1e-4f) {
                         double rel_sec = (rel_bar * 4.0 / clip_bpm) * 60.0;
                         playhead_f = static_cast<double>(c.start_offset_frames) + rel_sec * clip_sr;
                     } else {

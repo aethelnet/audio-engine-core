@@ -447,7 +447,8 @@ int main(int argc, char** argv) {
         Select = 0,
         Razor = 1,
         Slip = 2,
-        Stretch = 3
+        Stretch = 3,
+        Warp = 4
     };
     static ArrangerTool g_arranger_tool = ArrangerTool::Select;
 
@@ -461,12 +462,15 @@ int main(int argc, char** argv) {
         SlipEdit,
         ScrubTimeline,
         StretchStart,
-        StretchEnd
+        StretchEnd,
+        WarpPinDrag
     };
     static ArrangerDragMode g_arranger_drag_mode = ArrangerDragMode::None;
     static int g_arranger_drag_track = -1;
     static int g_arranger_drag_clip_idx = -1;
     static int g_arranger_drag_hover_track = -1;
+    static uint32_t g_arranger_drag_warp_pin_id = 0;
+    static float g_arranger_drag_orig_pinned_bar = 0.0f;
     static float g_arranger_drag_start_mouse_x = 0.0f;
     static float g_arranger_drag_orig_start_bar = 0.0f;
     static float g_arranger_drag_orig_len_bars = 4.0f;
@@ -1053,6 +1057,9 @@ int main(int argc, char** argv) {
                 } else if (ImGui::IsKeyPressed(ImGuiKey_4)) {
                     g_arranger_tool = ArrangerTool::Stretch;
                     std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: TIME-STRETCH (WSOLA EDGE-DRAG)");
+                } else if (ImGui::IsKeyPressed(ImGuiKey_5)) {
+                    g_arranger_tool = ArrangerTool::Warp;
+                    std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: WARP-PINS & GROOVE (CLICK TRANSIENT TO PIN)");
                 }
 
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket) || ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
@@ -1447,6 +1454,18 @@ int main(int argc, char** argv) {
                     if (is_stretch_tool) ImGui::PopStyleColor(2);
 
                     ImGui::SameLine();
+                    bool is_warp_tool = (g_arranger_tool == ArrangerTool::Warp);
+                    if (is_warp_tool) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.65f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton("5: WARP")) {
+                        g_arranger_tool = ArrangerTool::Warp;
+                        std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: WARP-PINS & GROOVE (CLICK TRANSIENT TO PIN)");
+                    }
+                    if (is_warp_tool) ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
 
@@ -1633,10 +1652,20 @@ int main(int argc, char** argv) {
 
                                         for (int wb = 0; wb < num_bars_draw; ++wb) {
                                             float bx = clip_x1 + 4.0f + wb * 3.0f;
-                                            uint32_t rel_s = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * visible_window_f);
-                                            uint32_t rel_e = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * visible_window_f);
-                                            uint32_t f_start = (offset_f + rel_s) % total_f;
-                                            uint32_t f_end = (offset_f + rel_e) % total_f;
+                                            uint32_t f_start = 0, f_end = 0;
+                                            if (!c.warp_pins.empty()) {
+                                                float rel_b_s = (static_cast<float>(wb) / num_bars_draw) * c.len_bars;
+                                                float rel_b_e = (static_cast<float>(wb + 1) / num_bars_draw) * c.len_bars;
+                                                f_start = static_cast<uint32_t>(c.evaluate_warped_frame(rel_b_s, total_f));
+                                                f_end = static_cast<uint32_t>(c.evaluate_warped_frame(rel_b_e, total_f));
+                                                f_start %= total_f;
+                                                f_end %= total_f;
+                                            } else {
+                                                uint32_t rel_s = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * visible_window_f);
+                                                uint32_t rel_e = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * visible_window_f);
+                                                f_start = (offset_f + rel_s) % total_f;
+                                                f_end = (offset_f + rel_e) % total_f;
+                                            }
                                             if (f_end <= f_start) f_end = total_f;
 
                                             float peak_val = 0.0f;
@@ -1648,6 +1677,57 @@ int main(int argc, char** argv) {
                                             draw_list->AddLine(ImVec2(bx, wf_mid_y - h),
                                                                ImVec2(bx, wf_mid_y + h),
                                                                is_sel ? ImColor(31, 97, 217, 150) : ImColor(100, 130, 170, 120), 1.5f);
+                                        }
+
+                                        // Transient Markers (Unpinned ticks)
+                                        for (const auto& span : c.detected_transients) {
+                                            float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, total_f));
+                                            float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                            if (tx >= clip_x1 + 3.0f && tx <= clip_x2 - 3.0f) {
+                                                bool is_pinned = false;
+                                                for (const auto& pin : c.warp_pins) {
+                                                    if (pin.source_frame >= span.start_frame && pin.source_frame <= span.decay_end_frame) {
+                                                        is_pinned = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!is_pinned) {
+                                                    ImColor tick_col = (span.band == analysis::TransientBand::SubBass) ? ImColor(239, 68, 68, 160) :
+                                                                       ((span.band == analysis::TransientBand::MidPunch) ? ImColor(59, 130, 246, 170) :
+                                                                       ImColor(16, 185, 129, 170));
+                                                    draw_list->AddLine(ImVec2(tx, wf_mid_y - max_h * 0.75f),
+                                                                       ImVec2(tx, wf_mid_y + max_h * 0.75f),
+                                                                       tick_col, 1.0f);
+                                                    if (g_arranger_tool == ArrangerTool::Warp || is_sel) {
+                                                        draw_list->AddTriangleFilled(ImVec2(tx - 3.0f, ly + 2.0f),
+                                                                                     ImVec2(tx + 3.0f, ly + 2.0f),
+                                                                                     ImVec2(tx, ly + 6.0f),
+                                                                                     tick_col);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Pinned Warp-Pins (prominent amber diamond flags)
+                                        for (const auto& pin : c.warp_pins) {
+                                            float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                            if (px >= clip_x1 && px <= clip_x2) {
+                                                bool is_dragged = (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag &&
+                                                                   g_arranger_drag_warp_pin_id == pin.id);
+                                                ImColor pin_col = is_dragged ? ImColor(251, 191, 36, 255) : ImColor(245, 158, 11, 230);
+                                                draw_list->AddLine(ImVec2(px, ly + 2.0f), ImVec2(px, ly + lane_h - 2.0f),
+                                                                   pin_col, is_dragged ? 2.5f : 1.8f);
+                                                draw_list->AddQuadFilled(ImVec2(px, ly + 2.0f),
+                                                                         ImVec2(px + 4.5f, ly + 7.0f),
+                                                                         ImVec2(px, ly + 12.0f),
+                                                                         ImVec2(px - 4.5f, ly + 7.0f),
+                                                                         pin_col);
+                                                draw_list->AddQuad(ImVec2(px, ly + 2.0f),
+                                                                   ImVec2(px + 4.5f, ly + 7.0f),
+                                                                   ImVec2(px, ly + 12.0f),
+                                                                   ImVec2(px - 4.5f, ly + 7.0f),
+                                                                   ImColor(255, 255, 255, 230), 1.0f);
+                                            }
                                         }
                                     }
 
@@ -1847,6 +1927,22 @@ int main(int argc, char** argv) {
                             draw_list->AddText(ImVec2(b_x, b_y), ImColor(0, 0, 0, 255), badge_txt);
                         }
 
+                        // Live Warp Pin Preview Badge during Drag
+                        if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag &&
+                            g_arranger_drag_track >= 0 && g_arranger_drag_clip_idx >= 0 &&
+                            g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
+                            const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
+                            const auto* p = c.find_warp_pin(g_arranger_drag_warp_pin_id);
+                            if (p) {
+                                float px = canvas_pos.x + (c.start_bar + p->pinned_bar) * bar_w;
+                                float py = canvas_pos.y + 20.0f + g_arranger_drag_track * lane_h + lane_h * 0.5f - 8.0f;
+                                char badge_txt[64];
+                                std::snprintf(badge_txt, sizeof(badge_txt), "[WARP PIN: BAR %.2f]", c.start_bar + p->pinned_bar + 1.0f);
+                                draw_list->AddRectFilled(ImVec2(px - 3.0f, py - 2.0f), ImVec2(px + 145.0f, py + 16.0f), ImColor(245, 158, 11, 235), 3.0f);
+                                draw_list->AddText(ImVec2(px, py), ImColor(0, 0, 0, 255), badge_txt);
+                            }
+                        }
+
                         // Playhead Needle
                         float play_ratio = playhead_seconds / loop_length_seconds;
                         float playhead_x = canvas_pos.x + play_ratio * canvas_size.x;
@@ -1877,6 +1973,33 @@ int main(int argc, char** argv) {
                                         float hov_x1 = canvas_pos.x + c.start_bar * bar_w;
                                         float hov_x2 = canvas_pos.x + c.end_bar() * bar_w;
                                         if (m.x >= hov_x1 && m.x <= hov_x2) {
+                                            if (g_arranger_tool == ArrangerTool::Warp) {
+                                                bool on_pin = false;
+                                                for (const auto& pin : c.warp_pins) {
+                                                    float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                                    if (std::abs(m.x - px) < 8.0f) {
+                                                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                                        on_pin = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!on_pin) {
+                                                    uint32_t nf = c.clip ? c.clip->num_frames() : 0;
+                                                    if (nf > 0) {
+                                                        for (const auto& span : c.detected_transients) {
+                                                            float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, nf));
+                                                            float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                                            if (std::abs(m.x - tx) < 8.0f) {
+                                                                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                                                on_pin = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if (on_pin) break;
+                                            }
+
                                             if (g_arranger_tool == ArrangerTool::Razor) {
                                                 ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
                                                 float rly = canvas_pos.y + 20.0f + hov_t * lane_h;
@@ -1997,26 +2120,81 @@ int main(int argc, char** argv) {
                                         }
 
                                         if (!handled_shape_click) {
-                                            if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
-                                                g_arranger_drag_mode = ArrangerDragMode::FadeIn;
-                                            } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
-                                                g_arranger_drag_mode = ArrangerDragMode::FadeOut;
-                                            } else if (std::abs(m.x - cx1) < 8.0f) {
-                                                if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
-                                                    g_arranger_drag_mode = ArrangerDragMode::StretchStart;
-                                                } else {
-                                                    g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                            bool handled_warp_click = false;
+                                            Track* trk = (clicked_lane == 0) ? trk0 : ((clicked_lane == 1) ? trk1 : ((clicked_lane == 2) ? trk2 : trk3));
+
+                                            // 1. Existing Warp Pins
+                                            for (const auto& pin : c.warp_pins) {
+                                                float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                                if (std::abs(m.x - px) < 8.0f) {
+                                                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                                        if (trk) {
+                                                            trk->arranger().remove_clip_warp_pin(c.id, pin.id);
+                                                            track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                            std::snprintf(status_toast, sizeof(status_toast), "REMOVED WARP PIN #%u", pin.id);
+                                                        }
+                                                    } else {
+                                                        g_arranger_drag_mode = ArrangerDragMode::WarpPinDrag;
+                                                        g_arranger_drag_track = clicked_lane;
+                                                        g_arranger_drag_clip_idx = clicked_clip_idx;
+                                                        g_arranger_drag_warp_pin_id = pin.id;
+                                                        g_arranger_drag_orig_pinned_bar = pin.pinned_bar;
+                                                        g_arranger_drag_start_mouse_x = m.x;
+                                                        std::snprintf(status_toast, sizeof(status_toast), "DRAGGING WARP PIN #%u (HOLD SHIFT TO FREE FLOAT)", pin.id);
+                                                    }
+                                                    handled_warp_click = true;
+                                                    break;
                                                 }
-                                            } else if (std::abs(m.x - cx2) < 8.0f) {
-                                                if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
-                                                    g_arranger_drag_mode = ArrangerDragMode::StretchEnd;
-                                                } else {
-                                                    g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                            }
+
+                                            // 2. Unpinned Transients (if Warp tool active or double-clicked)
+                                            if (!handled_warp_click && (g_arranger_tool == ArrangerTool::Warp || ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
+                                                uint32_t num_f = c.clip ? c.clip->num_frames() : 0;
+                                                if (num_f > 0) {
+                                                    for (const auto& span : c.detected_transients) {
+                                                        float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, num_f));
+                                                        float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                                        if (std::abs(m.x - tx) < 8.0f) {
+                                                            if (trk) {
+                                                                uint32_t new_pid = trk->arranger().add_clip_warp_pin(c.id, span.peak_frame, rel_b);
+                                                                track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                                g_arranger_drag_mode = ArrangerDragMode::WarpPinDrag;
+                                                                g_arranger_drag_track = clicked_lane;
+                                                                g_arranger_drag_clip_idx = clicked_clip_idx;
+                                                                g_arranger_drag_warp_pin_id = new_pid;
+                                                                g_arranger_drag_orig_pinned_bar = rel_b;
+                                                                g_arranger_drag_start_mouse_x = m.x;
+                                                                std::snprintf(status_toast, sizeof(status_toast), "PINNED TRANSIENT TO WARP PIN #%u (DRAG TO WARP)", new_pid);
+                                                            }
+                                                            handled_warp_click = true;
+                                                            break;
+                                                        }
+                                                    }
                                                 }
-                                            } else if (ImGui::GetIO().KeyAlt || g_arranger_tool == ArrangerTool::Slip) {
-                                                g_arranger_drag_mode = ArrangerDragMode::SlipEdit;
-                                            } else {
-                                                g_arranger_drag_mode = ArrangerDragMode::MoveClip;
+                                            }
+
+                                            if (!handled_warp_click) {
+                                                if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
+                                                    g_arranger_drag_mode = ArrangerDragMode::FadeIn;
+                                                } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
+                                                    g_arranger_drag_mode = ArrangerDragMode::FadeOut;
+                                                } else if (std::abs(m.x - cx1) < 8.0f) {
+                                                    if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
+                                                        g_arranger_drag_mode = ArrangerDragMode::StretchStart;
+                                                    } else {
+                                                        g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                                    }
+                                                } else if (std::abs(m.x - cx2) < 8.0f) {
+                                                    if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
+                                                        g_arranger_drag_mode = ArrangerDragMode::StretchEnd;
+                                                    } else {
+                                                        g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                                    }
+                                                } else if (ImGui::GetIO().KeyAlt || g_arranger_tool == ArrangerTool::Slip) {
+                                                    g_arranger_drag_mode = ArrangerDragMode::SlipEdit;
+                                                } else {
+                                                    g_arranger_drag_mode = ArrangerDragMode::MoveClip;
+                                                }
                                             }
                                         }
                                     }
@@ -2121,6 +2299,17 @@ int main(int argc, char** argv) {
                                     float max_len = static_cast<float>(kTotalBars) - c.start_bar;
                                     new_len = std::clamp(new_len, 0.25f, max_len);
                                     c.len_bars = new_len;
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_bar = g_arranger_drag_orig_pinned_bar + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_bar = std::round(new_bar * 16.0f) / 16.0f; // 1/16th bar snap
+                                    }
+                                    Track* trk = (g_arranger_drag_track == 0) ? trk0 : ((g_arranger_drag_track == 1) ? trk1 : ((g_arranger_drag_track == 2) ? trk2 : trk3));
+                                    if (trk) {
+                                        trk->arranger().move_clip_warp_pin(c.id, g_arranger_drag_warp_pin_id, new_bar);
+                                        track_arranger_clips[g_arranger_drag_track] = trk->arranger().clips();
+                                    }
                                 }
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
@@ -2131,7 +2320,10 @@ int main(int argc, char** argv) {
                                 mixer.update_scrub(target_sample, static_cast<double>(vel));
                             }
                         } else if (is_deactivated) {
-                            if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
+                            if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag) {
+                                g_arranger_drag_mode = ArrangerDragMode::None;
+                                g_arranger_drag_warp_pin_id = 0;
+                            } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
                                 playhead_seconds = ratio * loop_length_seconds;
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
@@ -2238,6 +2430,30 @@ int main(int argc, char** argv) {
                                         trk->arranger().stretch_clip(c.id, c.base_len_bars, c.stretch_algo, c.pitch_semitones);
                                         track_arranger_clips[t] = trk->arranger().clips();
                                         std::snprintf(status_toast, sizeof(status_toast), "RESET STRETCH FOR '%s'", c.name.c_str());
+                                    }
+                                }
+
+                                ImGui::Separator();
+                                ImGui::TextDisabled("ELASTIC AUDIO / WARP PINS:");
+                                if (ImGui::MenuItem("Quantize Transients (16th Grid)")) {
+                                    if (trk) {
+                                        trk->arranger().quantize_clip_transients(c.id, 0.0625f);
+                                        track_arranger_clips[t] = trk->arranger().clips();
+                                        std::snprintf(status_toast, sizeof(status_toast), "QUANTIZED TRANSIENTS (16TH) ON '%s'", c.name.c_str());
+                                    }
+                                }
+                                if (ImGui::MenuItem("Re-Detect Multiband Transients")) {
+                                    if (trk) {
+                                        trk->arranger().detect_clip_transients(c.id, 0.5f);
+                                        track_arranger_clips[t] = trk->arranger().clips();
+                                        std::snprintf(status_toast, sizeof(status_toast), "DETECTED TRANSIENTS ON '%s'", c.name.c_str());
+                                    }
+                                }
+                                if (ImGui::MenuItem("Clear All Warp Pins")) {
+                                    if (trk) {
+                                        trk->arranger().clear_clip_warp_pins(c.id);
+                                        track_arranger_clips[t] = trk->arranger().clips();
+                                        std::snprintf(status_toast, sizeof(status_toast), "CLEARED WARP PINS ON '%s'", c.name.c_str());
                                     }
                                 }
                             }
