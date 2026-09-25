@@ -11910,10 +11910,30 @@ void test_realtime_scheduler_and_bounded_event_budget() {
     // Part A: RealtimeScheduler Diagnostics & Policy Verification
     // ========================================================================
     {
-        auto initial_policy = RealtimeScheduler::current_policy();
-        std::cout << "  -> Initial thread policy: " << RealtimeScheduler::policy_to_string(initial_policy) << std::endl;
+        // Execute promotion test on a dedicated worker thread so that the
+        // main test-runner thread remains SCHED_OTHER and unaffected by RLIMIT_RTTIME.
+        SchedulingPolicy initial_policy = SchedulingPolicy::Standard;
+        RealtimeResult res1{};
+        RealtimeResult res2{};
+        double cache_dur_ns = 0.0;
+        bool is_rt_in_thread = false;
+        int thread_prio = 0;
 
-        auto res1 = RealtimeScheduler::acquire_realtime_priority(20);
+        std::thread promo_thread([&]() {
+            initial_policy = RealtimeScheduler::current_policy();
+            res1 = RealtimeScheduler::acquire_realtime_priority(20);
+            is_rt_in_thread = RealtimeScheduler::is_realtime();
+            thread_prio = RealtimeScheduler::current_priority();
+
+            // Thread-Local Cache Invariant: Immediate O(1) return with zero syscalls
+            auto t_start = std::chrono::high_resolution_clock::now();
+            res2 = RealtimeScheduler::acquire_realtime_priority(20);
+            auto t_end = std::chrono::high_resolution_clock::now();
+            cache_dur_ns = std::chrono::duration<double, std::nano>(t_end - t_start).count();
+        });
+        promo_thread.join();
+
+        std::cout << "  -> Initial thread policy: " << RealtimeScheduler::policy_to_string(initial_policy) << std::endl;
         std::cout << "  -> Promotion Result: success=" << res1.success
                   << ", method=" << RealtimeScheduler::method_to_string(res1.method)
                   << ", policy=" << RealtimeScheduler::policy_to_string(res1.policy)
@@ -11923,22 +11943,20 @@ void test_realtime_scheduler_and_bounded_event_budget() {
         TEST_CHECK(res1.success);
         TEST_CHECK(res1.policy == SchedulingPolicy::Fifo || res1.policy == SchedulingPolicy::HighPriorityNice);
         if (res1.policy == SchedulingPolicy::Fifo) {
-            TEST_CHECK(RealtimeScheduler::is_realtime());
-            TEST_CHECK(RealtimeScheduler::current_priority() >= 1);
+            TEST_CHECK(is_rt_in_thread);
+            TEST_CHECK(thread_prio >= 1);
         }
 #endif
-
-        // Thread-Local Cache Invariant: Immediate O(1) return with zero syscalls
-        auto t_start = std::chrono::high_resolution_clock::now();
-        auto res2 = RealtimeScheduler::acquire_realtime_priority(20);
-        auto t_end = std::chrono::high_resolution_clock::now();
-        double cache_dur_ns = std::chrono::duration<double, std::nano>(t_end - t_start).count();
 
         TEST_CHECK(res2.success == res1.success);
         TEST_CHECK(res2.method == res1.method);
         TEST_CHECK(res2.policy == res1.policy);
         TEST_CHECK(res2.priority == res1.priority);
         std::cout << "  -> Part A (RealtimeScheduler Promotion & Thread-Local Cache " << cache_dur_ns << " ns): PASSED" << std::endl;
+
+        // Verify main thread is completely untouched and running standard CFS
+        TEST_CHECK(!RealtimeScheduler::is_realtime());
+        TEST_CHECK(RealtimeScheduler::current_policy() == SchedulingPolicy::Standard);
     }
 
     // ========================================================================
@@ -12838,6 +12856,207 @@ void test_arranger_time_stretching_and_wsola_edge_drag() {
     std::cout << "  -> Arranger Time-Stretching & WSOLA Edge-Drag: ALL PASSED" << std::endl;
 }
 
+void test_transient_warp_wsola_and_drum_punch_preservation() {
+    std::cout << "[TEST 86] Running Transient-Warp WSOLA Time-Stretching & Drum Punch Preservation..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+
+    constexpr uint32_t kSampleRate = 48000;
+    constexpr uint32_t kFrames = 48000; // 1-second synthetic drum loop
+
+    // Create synthetic stereo drum loop with sharp kick at t=0 and snare at t=24000
+    auto orig_clip = std::make_shared<AudioClip>("DrumLoop_PunchMaster", kSampleRate, 2, kFrames);
+    orig_clip->set_bpm(120.0);
+
+    float* l = orig_clip->channel(0);
+    float* r = orig_clip->channel(1);
+
+    // Kick at frame 0 (sharp initial transient, exponential decay)
+    for (uint32_t i = 0; i < 2000; ++i) {
+        float env = std::exp(-static_cast<float>(i) / 400.0f);
+        float kick_val = 0.95f * env * std::cos(2.0f * std::numbers::pi_v<float> * 55.0f * i / 48000.0f);
+        l[i] += kick_val;
+        r[i] += kick_val;
+    }
+
+    // Snare at frame 24000 (sharp initial transient, exponential decay)
+    for (uint32_t i = 0; i < 2000; ++i) {
+        float env = std::exp(-static_cast<float>(i) / 600.0f);
+        float snare_val = 0.85f * env * std::cos(2.0f * std::numbers::pi_v<float> * 220.0f * i / 48000.0f);
+        l[24000 + i] += snare_val;
+        r[24000 + i] += snare_val;
+    }
+
+    // Sustain tone (150 Hz resonance in sustain intervals)
+    for (uint32_t i = 2000; i < 23900; ++i) {
+        float s = 0.05f * std::sin(2.0f * std::numbers::pi_v<float> * 150.0f * (i - 2000) / 48000.0f);
+        l[i] += s;
+        r[i] += s;
+    }
+    for (uint32_t i = 26000; i < 47900; ++i) {
+        float s = 0.05f * std::sin(2.0f * std::numbers::pi_v<float> * 150.0f * (i - 26000) / 48000.0f);
+        l[i] += s;
+        r[i] += s;
+    }
+
+    // ========================================================================
+    // Part A: 2.0x Time-Stretch with TransientWarpWsola & Bit-Exact Attack Check
+    // ========================================================================
+    {
+        auto stretched = PitchTimeStretcher::process_transient_warp_wsola(*orig_clip, 0.0f, 2.0f);
+        TEST_CHECK(stretched != nullptr);
+        TEST_CHECK(stretched->num_frames() == 96000);
+        TEST_CHECK(stretched->num_channels() == 2);
+
+        // Verify first 100 samples of kick attack are 100% bit-exact (Delta < 1e-6)
+        float max_kick_diff_l = 0.0f;
+        float max_kick_diff_r = 0.0f;
+        for (uint32_t i = 0; i < 100; ++i) {
+            max_kick_diff_l = std::max(max_kick_diff_l, std::abs(stretched->channel(0)[i] - orig_clip->channel(0)[i]));
+            max_kick_diff_r = std::max(max_kick_diff_r, std::abs(stretched->channel(1)[i] - orig_clip->channel(1)[i]));
+        }
+        TEST_CHECK(max_kick_diff_l < 1e-6f);
+        TEST_CHECK(max_kick_diff_r < 1e-6f);
+
+        // Verify first 100 samples of snare attack (at stretched position 48000) are 100% bit-exact
+        float max_snare_diff_l = 0.0f;
+        float max_snare_diff_r = 0.0f;
+        for (uint32_t i = 0; i < 100; ++i) {
+            max_snare_diff_l = std::max(max_snare_diff_l, std::abs(stretched->channel(0)[48000 + i] - orig_clip->channel(0)[24000 + i]));
+            max_snare_diff_r = std::max(max_snare_diff_r, std::abs(stretched->channel(1)[48000 + i] - orig_clip->channel(1)[24000 + i]));
+        }
+        TEST_CHECK(max_snare_diff_l < 1e-6f);
+        TEST_CHECK(max_snare_diff_r < 1e-6f);
+
+        // Verify no NaNs or infinities throughout the 96000 frames
+        for (uint32_t i = 0; i < 96000; ++i) {
+            TEST_CHECK(!std::isnan(stretched->channel(0)[i]) && !std::isinf(stretched->channel(0)[i]));
+            TEST_CHECK(!std::isnan(stretched->channel(1)[i]) && !std::isinf(stretched->channel(1)[i]));
+        }
+
+        std::cout << "  -> Part A (2.0x Stretch & 1:1 Bit-Exact Kick/Snare Attack Punch): PASSED (Kick max err="
+                  << max_kick_diff_l << ", Snare max err=" << max_snare_diff_l << ")" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: 0.5x Time-Compression with Punch Preservation
+    // ========================================================================
+    {
+        auto compressed = PitchTimeStretcher::process_transient_warp_wsola(*orig_clip, 0.0f, 0.5f);
+        TEST_CHECK(compressed != nullptr);
+        TEST_CHECK(compressed->num_frames() == 24000);
+
+        // Verify first 100 samples of kick attack match bit-exact
+        for (uint32_t i = 0; i < 100; ++i) {
+            TEST_CHECK(std::abs(compressed->channel(0)[i] - orig_clip->channel(0)[i]) < 1e-6f);
+        }
+
+        // Verify first 100 samples of snare attack (at compressed position 12000) match bit-exact
+        for (uint32_t i = 0; i < 100; ++i) {
+            TEST_CHECK(std::abs(compressed->channel(0)[12000 + i] - orig_clip->channel(0)[24000 + i]) < 1e-6f);
+        }
+
+        std::cout << "  -> Part B (0.5x Compression with Zero Attack Flamming): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: Decoupled Pitch Shifting with Transient-Warp WSOLA
+    // ========================================================================
+    {
+        // Pitch shift +12 semitones (1 octave up, duration 2.0x)
+        auto pitched = PitchTimeStretcher::process(*orig_clip, PitchAlgorithm::TransientWarpWsola, 12.0f, 2.0f);
+        TEST_CHECK(pitched != nullptr);
+        // Resampled frame count: 96000 / 2.0 = 48000
+        TEST_CHECK(pitched->num_frames() == 48000);
+
+        for (uint32_t i = 0; i < pitched->num_frames(); ++i) {
+            TEST_CHECK(!std::isnan(pitched->channel(0)[i]) && !std::isinf(pitched->channel(0)[i]));
+        }
+
+        std::cout << "  -> Part C (Decoupled Pitch Shifting +12 st & Duration Dilation): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part D: ArrangerTrack Multi-Algorithm Switching & Zero Generational Loss
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t id = track.add_clip(ArrangerClipInstance{
+            .name = "DrumBreak",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+
+        // 1. Stretch to 8 bars with TransientWarpWsola
+        std::cout << "    [D.1] Stretch to 8 bars TransientWarpWsola..." << std::endl;
+        bool ok = track.stretch_clip(id, 8.0f, PitchAlgorithm::TransientWarpWsola);
+        TEST_CHECK(ok);
+        const auto* c = track.find_clip(id);
+        TEST_CHECK(c != nullptr);
+        TEST_CHECK(c->stretch_algo == PitchAlgorithm::TransientWarpWsola);
+        TEST_CHECK(std::abs(c->stretch_ratio - 2.0f) < 1e-4f);
+        TEST_CHECK(c->clip->num_frames() == 96000);
+
+        // Verify transient punch is preserved on arranger clip
+        for (uint32_t i = 0; i < 100; ++i) {
+            TEST_CHECK(std::abs(c->clip->channel(0)[i] - orig_clip->channel(0)[i]) < 1e-6f);
+            TEST_CHECK(std::abs(c->clip->channel(0)[48000 + i] - orig_clip->channel(0)[24000 + i]) < 1e-6f);
+        }
+
+        // 2. Switch algorithm to RubberbandWsola
+        std::cout << "    [D.2] Switch to RubberbandWsola..." << std::endl;
+        ok = track.set_clip_stretch_algo(id, PitchAlgorithm::RubberbandWsola);
+        TEST_CHECK(ok);
+        c = track.find_clip(id);
+        TEST_CHECK(c->stretch_algo == PitchAlgorithm::RubberbandWsola);
+        TEST_CHECK(c->clip->num_frames() == 96000);
+
+        // 3. Switch algorithm to SovereignOde
+        std::cout << "    [D.3] Switch to SovereignOde..." << std::endl;
+        ok = track.set_clip_stretch_algo(id, PitchAlgorithm::SovereignOde);
+        TEST_CHECK(ok);
+        c = track.find_clip(id);
+        TEST_CHECK(c->stretch_algo == PitchAlgorithm::SovereignOde);
+
+        // 4. Switch algorithm to VinylRepitch
+        std::cout << "    [D.4] Switch to VinylRepitch..." << std::endl;
+        ok = track.set_clip_stretch_algo(id, PitchAlgorithm::VinylRepitch);
+        TEST_CHECK(ok);
+        c = track.find_clip(id);
+        TEST_CHECK(c->stretch_algo == PitchAlgorithm::VinylRepitch);
+
+        // 5. Switch algorithm back to TransientWarpWsola
+        std::cout << "    [D.5] Switch back to TransientWarpWsola..." << std::endl;
+        ok = track.set_clip_stretch_algo(id, PitchAlgorithm::TransientWarpWsola);
+        TEST_CHECK(ok);
+        c = track.find_clip(id);
+        TEST_CHECK(c != nullptr);
+        TEST_CHECK(c->stretch_algo == PitchAlgorithm::TransientWarpWsola);
+
+        // Verify zero generational degradation: attacks are still bit-exact to orig_clip!
+        for (uint32_t i = 0; i < 100; ++i) {
+            TEST_CHECK(std::abs(c->clip->channel(0)[i] - orig_clip->channel(0)[i]) < 1e-6f);
+            TEST_CHECK(std::abs(c->clip->channel(0)[48000 + i] - orig_clip->channel(0)[24000 + i]) < 1e-6f);
+        }
+
+        // 6. Audio-Thread Real-Time Safe Render
+        std::vector<float> out_l(256, 0.0f);
+        std::vector<float> out_r(256, 0.0f);
+        track.render(out_l.data(), out_r.data(), 256, kSampleRate, 120.0, true, 0.0);
+        for (uint32_t i = 0; i < 256; ++i) {
+            TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+            TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+        }
+
+        std::cout << "  -> Part D (ArrangerTrack Multi-Engine Switch & Zero Generational Loss): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Transient-Warp WSOLA & Drum Punch Preservation: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -12928,6 +13147,7 @@ int main() {
     test_arranger_slip_editing_cross_track_and_fade_ramps();
     test_arranger_multi_clip_razor_split_and_auto_crossfades();
     test_arranger_time_stretching_and_wsola_edge_drag();
+    test_transient_warp_wsola_and_drum_punch_preservation();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

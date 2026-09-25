@@ -1747,8 +1747,11 @@ int main(int argc, char** argv) {
 
                                     char extra_meta[80] = "";
                                     if (std::abs(c.stretch_ratio - 1.0f) > 0.01f || std::abs(c.pitch_semitones) > 0.01f) {
-                                        const char* algo_str = (c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
-                                                               ((c.stretch_algo == dsp::PitchAlgorithm::VinylRepitch) ? "VINYL" : "ODE");
+                                        const char* algo_str = (c.stretch_algo == dsp::PitchAlgorithm::TransientWarpWsola) ? "T-WARP" :
+                                                               ((c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
+                                                               ((c.stretch_algo == dsp::PitchAlgorithm::SovereignOde) ? "ODE" :
+                                                               ((c.stretch_algo == dsp::PitchAlgorithm::VintageMpc) ? "MPC12" :
+                                                               ((c.stretch_algo == dsp::PitchAlgorithm::DeRezSampler) ? "DEREZ" : "VINYL"))));
                                         if (std::abs(c.pitch_semitones) > 0.01f) {
                                             std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s %+.1fst]", c.stretch_ratio, algo_str, c.pitch_semitones);
                                         } else {
@@ -1835,7 +1838,11 @@ int main(int argc, char** argv) {
                             float b_x = canvas_pos.x + c.start_bar * bar_w + 6.0f;
                             float b_y = canvas_pos.y + 20.0f + g_arranger_drag_track * lane_h + lane_h * 0.5f - 8.0f;
                             char badge_txt[64];
-                            std::snprintf(badge_txt, sizeof(badge_txt), "[STRETCH: %.2fx WSOLA]", ratio);
+                            const char* badge_algo = (c.stretch_algo == dsp::PitchAlgorithm::TransientWarpWsola) ? "T-WARP" :
+                                                     ((c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
+                                                     ((c.stretch_algo == dsp::PitchAlgorithm::SovereignOde) ? "ODE" :
+                                                     ((c.stretch_algo == dsp::PitchAlgorithm::VintageMpc) ? "MPC12" : "VINYL")));
+                            std::snprintf(badge_txt, sizeof(badge_txt), "[STRETCH: %.2fx %s]", ratio, badge_algo);
                             draw_list->AddRectFilled(ImVec2(b_x - 3.0f, b_y - 2.0f), ImVec2(b_x + 140.0f, b_y + 16.0f), ImColor(245, 158, 11, 230), 3.0f);
                             draw_list->AddText(ImVec2(b_x, b_y), ImColor(0, 0, 0, 255), badge_txt);
                         }
@@ -1982,6 +1989,9 @@ int main(int argc, char** argv) {
                                                 c.fade_out_shape = static_cast<sampling::FadeShape>((static_cast<int>(c.fade_out_shape) + 1) % 5);
                                                 sync_arranger_to_mixer(clicked_lane);
                                                 std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' FADE-OUT SHAPE: %d", c.name.c_str(), static_cast<int>(c.fade_out_shape));
+                                                handled_shape_click = true;
+                                            } else {
+                                                ImGui::OpenPopup("ArrangerClipContextMenu");
                                                 handled_shape_click = true;
                                             }
                                         }
@@ -2172,6 +2182,66 @@ int main(int argc, char** argv) {
                             g_arranger_drag_track = -1;
                             g_arranger_drag_clip_idx = -1;
                             g_arranger_drag_hover_track = -1;
+                        }
+
+                        // Right-Click Context Menu for Selected Arranger Clip
+                        if (ImGui::BeginPopup("ArrangerClipContextMenu")) {
+                            int t = selected_track;
+                            if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                                int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                                auto& c = track_arranger_clips[t][c_idx];
+                                Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "CLIP: %s (%.1f-%.1fb)", c.name.c_str(), c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                ImGui::Separator();
+
+                                ImGui::TextDisabled("STRETCH ALGORITHM:");
+                                auto algo_item = [&](dsp::PitchAlgorithm algo, const char* label) {
+                                    bool is_cur = (c.stretch_algo == algo);
+                                    if (ImGui::MenuItem(label, nullptr, is_cur)) {
+                                        if (trk) {
+                                            trk->arranger().set_clip_stretch_algo(c.id, algo);
+                                            track_arranger_clips[t] = trk->arranger().clips();
+                                            std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' ALGO: %s", c.name.c_str(), label);
+                                        }
+                                    }
+                                };
+
+                                algo_item(dsp::PitchAlgorithm::TransientWarpWsola, "Transient-Warp WSOLA (Punch Preserved)");
+                                algo_item(dsp::PitchAlgorithm::RubberbandWsola,    "Granular WSOLA (Rubberband)");
+                                algo_item(dsp::PitchAlgorithm::SovereignOde,       "Sovereign Kinetic ODE (Continuous)");
+                                algo_item(dsp::PitchAlgorithm::VinylRepitch,       "Vinyl / Tape Repitch (Variclock)");
+                                algo_item(dsp::PitchAlgorithm::VintageMpc,         "Vintage MPC 12-Bit (Multiplying DAC)");
+                                algo_item(dsp::PitchAlgorithm::DeRezSampler,       "Airwindows DeRez2 (SP-1200 / Mirage)");
+
+                                ImGui::Separator();
+                                ImGui::TextDisabled("DECOUPLED PITCH SHIFT:");
+                                auto pitch_item = [&](float st, const char* label) {
+                                    if (ImGui::MenuItem(label)) {
+                                        if (trk) {
+                                            trk->arranger().set_clip_pitch(c.id, st);
+                                            track_arranger_clips[t] = trk->arranger().clips();
+                                            std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' PITCH: %+.1f st", c.name.c_str(), st);
+                                        }
+                                    }
+                                };
+
+                                pitch_item(c.pitch_semitones - 12.0f, "-12 st (Octave Down)");
+                                pitch_item(c.pitch_semitones - 1.0f,  "-1 st (Semitone Down)");
+                                pitch_item(0.0f,                      "Reset Pitch (0 st)");
+                                pitch_item(c.pitch_semitones + 1.0f,  "+1 st (Semitone Up)");
+                                pitch_item(c.pitch_semitones + 12.0f, "+12 st (Octave Up)");
+
+                                ImGui::Separator();
+                                if (ImGui::MenuItem("Reset Length (1.00x)")) {
+                                    if (trk) {
+                                        trk->arranger().stretch_clip(c.id, c.base_len_bars, c.stretch_algo, c.pitch_semitones);
+                                        track_arranger_clips[t] = trk->arranger().clips();
+                                        std::snprintf(status_toast, sizeof(status_toast), "RESET STRETCH FOR '%s'", c.name.c_str());
+                                    }
+                                }
+                            }
+                            ImGui::EndPopup();
                         }
 
                     }

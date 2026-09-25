@@ -265,6 +265,12 @@ public:
         return stretch_clip(clip_id, c->len_bars, c->stretch_algo, semitones);
     }
 
+    bool set_clip_stretch_algo(uint32_t clip_id, dsp::PitchAlgorithm algo) {
+        const auto* c = find_clip(clip_id);
+        if (!c) return false;
+        return stretch_clip(clip_id, c->len_bars, algo, c->pitch_semitones);
+    }
+
     // Non-destructive Razor / Split Tool:
     // Splits a clip at split_bar into two independent clip instances with
     // continuous start_offset_frames and accurate bar boundaries.
