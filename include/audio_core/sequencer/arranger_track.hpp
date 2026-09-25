@@ -31,6 +31,8 @@ struct WarpPin {
     uint32_t id{0};
     uint32_t source_frame{0};   // Frame index within pristine source asset
     float pinned_bar{0.0f};      // Relative musical position (in bars) within clip [0.0, len_bars]
+
+    bool operator==(const WarpPin&) const = default;
 };
 
 // ============================================================================
@@ -313,6 +315,29 @@ struct ArrangerClipInstance {
             quantized_bar = std::clamp(quantized_bar, 0.02f, len_bars - 0.02f);
             add_warp_pin(span.peak_frame, quantized_bar);
         }
+    }
+
+    bool operator==(const ArrangerClipInstance& o) const noexcept {
+        return id == o.id &&
+               name == o.name &&
+               clip == o.clip &&
+               source_clip == o.source_clip &&
+               start_bar == o.start_bar &&
+               len_bars == o.len_bars &&
+               base_len_bars == o.base_len_bars &&
+               orig_len_bars == o.orig_len_bars &&
+               stretch_ratio == o.stretch_ratio &&
+               stretch_algo == o.stretch_algo &&
+               pitch_semitones == o.pitch_semitones &&
+               offset_bars == o.offset_bars &&
+               start_offset_frames == o.start_offset_frames &&
+               fade_in_bars == o.fade_in_bars &&
+               fade_out_bars == o.fade_out_bars &&
+               fade_in_shape == o.fade_in_shape &&
+               fade_out_shape == o.fade_out_shape &&
+               fade_in_tension == o.fade_in_tension &&
+               fade_out_tension == o.fade_out_tension &&
+               warp_pins == o.warp_pins;
     }
 };
 

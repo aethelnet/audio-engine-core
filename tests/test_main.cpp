@@ -66,6 +66,7 @@
 #include "audio_core/threading/realtime_scheduler.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/sampling/sample_asset_manager.hpp"
+#include "audio_core/undo/undo_manager.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -11239,6 +11240,8 @@ void test_alsa_hardware_loopback_stress_and_scrub_attenuation() {
             std::atomic<bool> tx_done{false};
             std::atomic<uint32_t> total_sent{0};
 
+            rx.reset_counters();
+
             // Spawn transmitter thread to blast 10,000 events
             std::thread tx_thread([&]() {
                 std::vector<struct snd_seq_event> batch(kBatchSize);
@@ -13726,6 +13729,277 @@ void test_realtime_transient_shaper_insert_processor() {
     std::cout << "  -> Sovereign Real-Time Transient Shaper: ALL PASSED" << std::endl;
 }
 
+void test_daw_unified_undo_redo_engine() {
+    std::cout << "[TEST 90] Running Unified DAW Undo / Redo Command History Engine Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::undo;
+
+    // ------------------------------------------------------------------------
+    // Part A: Arranger Clip Mutations (Razor Split, Delete, Restore)
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part A] Arranger Clip Mutations (Razor Split, Delete, Restore)..." << std::endl;
+        UndoManager undo_mgr(64);
+        TEST_CHECK(!undo_mgr.can_undo());
+        TEST_CHECK(!undo_mgr.can_redo());
+
+        Track track(1, "Guitar Track", 512);
+        auto src_clip = std::make_shared<sampling::AudioClip>("Guitar", 48000, 2, 48000 * 4); // 4 seconds
+        sequencer::ArrangerClipInstance initial_clip;
+        initial_clip.id = 101;
+        initial_clip.name = "Guitar Strum";
+        initial_clip.clip = src_clip;
+        initial_clip.start_bar = 0.0f;
+        initial_clip.len_bars = 4.0f;
+
+        track.arranger().add_clip(initial_clip);
+        TEST_CHECK(track.arranger().num_clips() == 1);
+
+        // Action 1: Split clip at bar 2.0
+        auto before_split = track.arranger().clips();
+        auto split_ids = track.arranger().split_clip_at_bar(101, 2.0f, 120.0, 48000);
+        TEST_CHECK(split_ids.first != 0 && split_ids.second != 0);
+        TEST_CHECK(track.arranger().num_clips() == 2);
+        auto after_split = track.arranger().clips();
+
+        undo_mgr.push_action(std::make_unique<ArrangerSingleTrackAction>(
+            &track, before_split, after_split, "Razor Split Clip at Bar 2.0"
+        ));
+        TEST_CHECK(undo_mgr.can_undo());
+        TEST_CHECK(!undo_mgr.can_redo());
+        TEST_CHECK(undo_mgr.undo_description() == "Razor Split Clip at Bar 2.0");
+
+        // Execute Undo -> Should restore 1 clip
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(track.arranger().num_clips() == 1);
+        TEST_CHECK(track.arranger().clips()[0].len_bars == 4.0f);
+        TEST_CHECK(!undo_mgr.can_undo());
+        TEST_CHECK(undo_mgr.can_redo());
+        TEST_CHECK(undo_mgr.redo_description() == "Razor Split Clip at Bar 2.0");
+
+        // Execute Redo -> Should restore 2 clips
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(track.arranger().num_clips() == 2);
+        TEST_CHECK(track.arranger().clips()[0].len_bars == 2.0f);
+        TEST_CHECK(track.arranger().clips()[1].len_bars == 2.0f);
+
+        // Action 2: Delete second split clip
+        auto before_del = track.arranger().clips();
+        uint32_t second_clip_id = track.arranger().clips()[1].id;
+        track.arranger().remove_clip(second_clip_id);
+        TEST_CHECK(track.arranger().num_clips() == 1);
+        auto after_del = track.arranger().clips();
+
+        undo_mgr.push_action(std::make_unique<ArrangerSingleTrackAction>(
+            &track, before_del, after_del, "Delete Second Clip"
+        ));
+
+        // Undo delete -> 2 clips again
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(track.arranger().num_clips() == 2);
+
+        // Undo split -> 1 initial clip again
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(track.arranger().num_clips() == 1);
+        TEST_CHECK(track.arranger().clips()[0].id == 101);
+
+        std::cout << "  -> Part A (Arranger Clip Mutations Undo/Redo): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part B: Track Routing & Bus Switching
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part B] Track Routing & Bus Switching..." << std::endl;
+        UndoManager undo_mgr;
+        MixerGraph mixer(512, false, 48000);
+        auto* trk = mixer.add_track("Drum Track");
+        auto* bus_a = mixer.allocate_submix_bus("Bus A");
+        auto* bus_b = mixer.allocate_submix_bus("Bus B");
+
+        trk->set_target_bus(bus_a->id());
+        TEST_CHECK(trk->target_bus() == static_cast<int32_t>(bus_a->id()));
+
+        // Switch to Bus B
+        int32_t old_bus = trk->target_bus();
+        trk->set_target_bus(bus_b->id());
+        undo_mgr.push_action(std::make_unique<TrackRoutingAction>(
+            trk, old_bus, bus_b->id(), trk->name(), bus_b->name()
+        ));
+
+        TEST_CHECK(trk->target_bus() == static_cast<int32_t>(bus_b->id()));
+
+        // Undo -> Back to Bus A
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(trk->target_bus() == static_cast<int32_t>(bus_a->id()));
+
+        // Redo -> To Bus B
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(trk->target_bus() == static_cast<int32_t>(bus_b->id()));
+
+        std::cout << "  -> Part B (Track Routing Undo/Redo): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part C: Track Gain & Pan Adjustments
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part C] Track Gain & Pan Adjustments..." << std::endl;
+        UndoManager undo_mgr;
+        Track trk(1, "Synth Track", 512);
+        trk.set_gain(1.0f);
+        trk.set_pan(0.0f);
+
+        // Adjust Gain: 1.0 -> 0.65
+        float old_gain = trk.gain();
+        trk.set_gain(0.65f);
+        undo_mgr.push_action(std::make_unique<TrackGainPanAction>(
+            &trk, TrackGainPanAction::TargetProperty::Gain, old_gain, 0.65f, trk.name()
+        ));
+
+        // Adjust Pan: 0.0 -> -0.45
+        float old_pan = trk.pan();
+        trk.set_pan(-0.45f);
+        undo_mgr.push_action(std::make_unique<TrackGainPanAction>(
+            &trk, TrackGainPanAction::TargetProperty::Pan, old_pan, -0.45f, trk.name()
+        ));
+
+        // Undo Pan
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(std::abs(trk.pan() - 0.0f) < 1e-4f);
+        TEST_CHECK(std::abs(trk.gain() - 0.65f) < 1e-4f);
+
+        // Undo Gain
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(std::abs(trk.gain() - 1.0f) < 1e-4f);
+
+        // Redo Gain
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(std::abs(trk.gain() - 0.65f) < 1e-4f);
+
+        // Redo Pan
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(std::abs(trk.pan() - (-0.45f)) < 1e-4f);
+
+        std::cout << "  -> Part C (Track Gain & Pan Undo/Redo): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part D: Processor Parameter Adjustments & Action Merging
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part D] Processor Parameter Adjustments & Action Merging..." << std::endl;
+        UndoManager undo_mgr;
+        auto comp = std::make_shared<dsp::ButterComp2>();
+        comp->init(48000);
+        comp->set_parameter(0, 0.2f); // Compress = 0.2
+
+        // Simulate continuous mouse drag: 0.2 -> 0.5 -> 0.8
+        auto act1 = std::make_unique<ProcessorParameterAction>(comp, 0, 0.2f, 0.5f, "ButterComp2", "Compress");
+        comp->set_parameter(0, 0.5f);
+        undo_mgr.push_action(std::move(act1));
+
+        auto act2 = std::make_unique<ProcessorParameterAction>(comp, 0, 0.5f, 0.8f, "ButterComp2", "Compress");
+        comp->set_parameter(0, 0.8f);
+        undo_mgr.push_action(std::move(act2)); // Should merge into act1!
+
+        TEST_CHECK(undo_mgr.undo_count() == 1); // Merged into 1 action!
+        TEST_CHECK(std::abs(comp->get_parameter(0) - 0.8f) < 1e-4f);
+
+        // Undo -> Should jump straight back to initial 0.2f (not intermediate 0.5f)
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(std::abs(comp->get_parameter(0) - 0.2f) < 1e-4f);
+
+        // Redo -> Jumps to final 0.8f
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(std::abs(comp->get_parameter(0) - 0.8f) < 1e-4f);
+
+        std::cout << "  -> Part D (Processor Parameter Merging & Undo/Redo): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part E: Insert Slot Hot-Swapping
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part E] Insert Slot Hot-Swapping..." << std::endl;
+        UndoManager undo_mgr;
+        InsertSlot slot;
+        slot.init(48000);
+
+        auto p1 = std::make_shared<dsp::ButterComp2>();
+        p1->init(48000);
+        auto p2 = std::make_shared<dsp::PurestDrive>();
+        p2->init(48000);
+
+        slot.set_processor(p1);
+        TEST_CHECK(slot.processor() == p1.get());
+
+        // Hot swap to PurestDrive
+        auto old_p = slot.shared_processor();
+        slot.set_processor(p2);
+        undo_mgr.push_action(std::make_unique<InsertSlotAction>(&slot, old_p, p2, "Load PurestDrive into Slot 1"));
+
+        TEST_CHECK(slot.processor() == p2.get());
+
+        // Undo -> Back to ButterComp2
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(slot.processor() == p1.get());
+
+        // Redo -> Back to PurestDrive
+        TEST_CHECK(undo_mgr.redo());
+        TEST_CHECK(slot.processor() == p2.get());
+
+        std::cout << "  -> Part E (Insert Slot Hot-Swapping Undo/Redo): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part F: Invariants (New Action Clears Redo Stack & Bounded History)
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part F] Invariants: Redo Invalidation & Bounded History..." << std::endl;
+        UndoManager undo_mgr(5); // Capacity 5
+
+        int val = 0;
+        auto push_val = [&](int new_val) {
+            int old_v = val;
+            val = new_val;
+            undo_mgr.push_action(std::make_unique<CustomLambdaAction>(
+                "Set val", [old_v, &val]() { val = old_v; }, [new_val, &val]() { val = new_val; }
+            ));
+        };
+
+        for (int i = 1; i <= 8; ++i) {
+            push_val(i);
+        }
+
+        // Capacity was 5 -> Stack size is exactly 5
+        TEST_CHECK(undo_mgr.undo_count() == 5);
+        TEST_CHECK(val == 8);
+
+        // Undo 2 steps: 8 -> 7 -> 6
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(val == 7);
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(val == 6);
+        TEST_CHECK(undo_mgr.redo_count() == 2);
+
+        // Perform a NEW action: 6 -> 99
+        push_val(99);
+        TEST_CHECK(val == 99);
+        // Performing a new action MUST invalidate the redo stack!
+        TEST_CHECK(!undo_mgr.can_redo());
+        TEST_CHECK(undo_mgr.redo_count() == 0);
+
+        // Undo back to 6
+        TEST_CHECK(undo_mgr.undo());
+        TEST_CHECK(val == 6);
+
+        std::cout << "  -> Part F (Invariants Verified): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Unified DAW Undo / Redo Command History: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -13820,6 +14094,7 @@ int main() {
     test_multiband_transient_span_and_ghost_note_resolution();
     test_arranger_warp_pins_and_nonlinear_elastic_audio();
     test_realtime_transient_shaper_insert_processor();
+    test_daw_unified_undo_redo_engine();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

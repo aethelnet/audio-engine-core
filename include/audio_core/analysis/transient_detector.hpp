@@ -22,6 +22,8 @@ struct TransientSpan {
     float crest_factor{0.0f};     // Peak / RMS ratio within the transient span
     TransientBand band{TransientBand::Broadband};
 
+    bool operator==(const TransientSpan&) const = default;
+
     [[nodiscard]] uint32_t length_frames() const noexcept {
         return (decay_end_frame > start_frame) ? (decay_end_frame - start_frame) : 0;
     }

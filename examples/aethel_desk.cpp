@@ -27,6 +27,7 @@
 #include "backends/desktop/desktop_backend.hpp"
 #include "audio_core/threading/realtime_scheduler.hpp"
 #include "audio_core/sampling/sample_asset_manager.hpp"
+#include "audio_core/undo/undo_manager.hpp"
 #include <mutex>
 
 
@@ -478,6 +479,8 @@ int main(int argc, char** argv) {
     static float g_arranger_drag_orig_offset_bars = 0.0f;
     static float g_arranger_drag_orig_fade_in = 0.0f;
     static float g_arranger_drag_orig_fade_out = 0.0f;
+    static undo::UndoManager g_undo_mgr(128);
+    static std::vector<sequencer::ArrangerClipInstance> g_pre_drag_clips[4];
 
     // Self-Contained Project Bundle & Sononym Library UI State
     bool open_save_bundle_modal = false;
@@ -975,6 +978,45 @@ int main(int argc, char** argv) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
+        auto sync_all_gui_track_state = [&]() {
+            Track* trks[4] = {trk0, trk1, trk2, trk3};
+            for (int i = 0; i < 4; ++i) {
+                if (trks[i]) {
+                    track_arranger_clips[i] = trks[i]->arranger().clips();
+                    track_gains[i] = trks[i]->gain();
+                    track_pans[i] = trks[i]->pan();
+                    track_mutes[i] = trks[i]->is_muted();
+                    track_solos[i] = trks[i]->is_solo();
+                    int32_t b = trks[i]->target_bus();
+                    if (bus_drums && b == static_cast<int32_t>(bus_drums->id())) track_target_buses[i] = 1;
+                    else if (bus_music && b == static_cast<int32_t>(bus_music->id())) track_target_buses[i] = 2;
+                    else track_target_buses[i] = 0;
+                }
+            }
+        };
+
+        auto perform_undo = [&]() {
+            if (g_undo_mgr.can_undo()) {
+                std::string desc = g_undo_mgr.undo_description();
+                g_undo_mgr.undo();
+                sync_all_gui_track_state();
+                std::snprintf(status_toast, sizeof(status_toast), "UNDO: %s", desc.c_str());
+            } else {
+                std::snprintf(status_toast, sizeof(status_toast), "NOTHING TO UNDO");
+            }
+        };
+
+        auto perform_redo = [&]() {
+            if (g_undo_mgr.can_redo()) {
+                std::string desc = g_undo_mgr.redo_description();
+                g_undo_mgr.redo();
+                sync_all_gui_track_state();
+                std::snprintf(status_toast, sizeof(status_toast), "REDO: %s", desc.c_str());
+            } else {
+                std::snprintf(status_toast, sizeof(status_toast), "NOTHING TO REDO");
+            }
+        };
+
         // ====================================================================
         // ZONE 1: TOP GLOBAL TRANSPORT & HUD BAR
         // ====================================================================
@@ -1062,7 +1104,23 @@ int main(int argc, char** argv) {
                     g_arranger_tool = ArrangerTool::Warp;
                     std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: WARP-PINS & GROOVE (CLICK TRANSIENT TO PIN)");
                 }
+            }
 
+            // Keyboard Shortcuts: Ctrl+Z (Undo / Redo) & Ctrl+Y (Redo)
+            if (!ImGui::GetIO().WantTextInput) {
+                if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
+                    if (ImGui::GetIO().KeyShift) {
+                        perform_redo();
+                    } else {
+                        perform_undo();
+                    }
+                } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+                    perform_redo();
+                }
+            }
+
+            // [ and ]: Semitone Pitch Shift
+            if (!ImGui::GetIO().WantTextInput) {
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket) || ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
                     float delta = ImGui::IsKeyPressed(ImGuiKey_RightBracket) ? +1.0f : -1.0f;
                     int t = selected_track;
@@ -1071,8 +1129,12 @@ int main(int argc, char** argv) {
                         auto& c = track_arranger_clips[t][c_idx];
                         Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                         if (trk) {
+                            auto before = trk->arranger().clips();
                             trk->arranger().set_clip_pitch(c.id, c.pitch_semitones + delta);
                             track_arranger_clips[t] = trk->arranger().clips();
+                            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                trk, before, track_arranger_clips[t], "Pitch Shift '" + c.name + "'"
+                            ));
                             const auto* sc = trk->arranger().find_clip(c.id);
                             if (sc) {
                                 std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' PITCH: %+.1f SEMITONES",
@@ -1094,8 +1156,12 @@ int main(int argc, char** argv) {
                     if (playhead_bar > c.start_bar + 0.05f && playhead_bar < c.end_bar() - 0.05f) {
                         Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                         if (trk) {
+                            auto before = trk->arranger().clips();
                             trk->arranger().split_clip_at_bar(c.id, playhead_bar, bpm, kSampleRate);
                             track_arranger_clips[t] = trk->arranger().clips();
+                            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                trk, before, track_arranger_clips[t], "Split Clip '" + c.name + "'"
+                            ));
                             std::snprintf(status_toast, sizeof(status_toast), "SPLIT CLIP '%s' AT BAR %.2f (CTRL+E)", c.name.c_str(), playhead_bar + 1.0f);
                         }
                     } else {
@@ -1111,11 +1177,16 @@ int main(int argc, char** argv) {
                 if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
                     int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
                     uint32_t cid = track_arranger_clips[t][c_idx].id;
+                    std::string cname = track_arranger_clips[t][c_idx].name;
                     Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                     if (trk) {
+                        auto before = trk->arranger().clips();
                         trk->arranger().remove_clip(cid);
                         track_arranger_clips[t] = trk->arranger().clips();
                         g_selected_clip_idx = std::max(0, c_idx - 1);
+                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                            trk, before, track_arranger_clips[t], "Delete Clip '" + cname + "'"
+                        ));
                         std::snprintf(status_toast, sizeof(status_toast), "DELETED CLIP (TRACK %d)", t + 1);
                     }
                 }
@@ -1132,9 +1203,13 @@ int main(int argc, char** argv) {
                     orig.name += " (Copy)";
                     Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                     if (trk) {
+                        auto before = trk->arranger().clips();
                         trk->arranger().add_clip(orig);
                         track_arranger_clips[t] = trk->arranger().clips();
                         g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                            trk, before, track_arranger_clips[t], "Duplicate Clip '" + orig.name + "'"
+                        ));
                         std::snprintf(status_toast, sizeof(status_toast), "DUPLICATED CLIP '%s' TO BAR %.1f", orig.name.c_str(), orig.start_bar + 1.0f);
                     }
                 }
@@ -1502,9 +1577,13 @@ int main(int argc, char** argv) {
                             orig.name += " (Copy)";
                             Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             if (trk) {
+                                auto before = trk->arranger().clips();
                                 trk->arranger().add_clip(orig);
                                 track_arranger_clips[t] = trk->arranger().clips();
                                 g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                                g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                    trk, before, track_arranger_clips[t], "Duplicate Clip '" + orig.name + "'"
+                                ));
                                 std::snprintf(status_toast, sizeof(status_toast), "DUPLICATED CLIP '%s' TO BAR %.1f", orig.name.c_str(), orig.start_bar + 1.0f);
                             }
                         }
@@ -1516,14 +1595,44 @@ int main(int argc, char** argv) {
                         if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
                             int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
                             uint32_t cid = track_arranger_clips[t][c_idx].id;
+                            std::string cname = track_arranger_clips[t][c_idx].name;
                             Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             if (trk) {
+                                auto before = trk->arranger().clips();
                                 trk->arranger().remove_clip(cid);
                                 track_arranger_clips[t] = trk->arranger().clips();
                                 g_selected_clip_idx = std::max(0, c_idx - 1);
+                                g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                    trk, before, track_arranger_clips[t], "Delete Clip '" + cname + "'"
+                                ));
                                 std::snprintf(status_toast, sizeof(status_toast), "DELETED CLIP (TRACK %d)", t + 1);
                             }
                         }
+                    }
+
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("|");
+                    ImGui::SameLine();
+
+                    bool can_u = g_undo_mgr.can_undo();
+                    if (!can_u) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton("UNDO (Ctrl+Z)")) {
+                        perform_undo();
+                    }
+                    if (!can_u) ImGui::EndDisabled();
+                    else if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Undo: %s", g_undo_mgr.undo_description().c_str());
+                    }
+
+                    ImGui::SameLine();
+                    bool can_r = g_undo_mgr.can_redo();
+                    if (!can_r) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton("REDO (Ctrl+Y)")) {
+                        perform_redo();
+                    }
+                    if (!can_r) ImGui::EndDisabled();
+                    else if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Redo: %s", g_undo_mgr.redo_description().c_str());
                     }
 
                     ImGui::SameLine();
@@ -2037,6 +2146,15 @@ int main(int argc, char** argv) {
                         }
 
                         if (is_activated) {
+                            Track* all_trks_snap[4] = { trk0, trk1, trk2, trk3 };
+                            for (int ti = 0; ti < 4; ++ti) {
+                                if (all_trks_snap[ti]) {
+                                    g_pre_drag_clips[ti] = all_trks_snap[ti]->arranger().clips();
+                                } else {
+                                    g_pre_drag_clips[ti] = track_arranger_clips[ti];
+                                }
+                            }
+
                             if (m.y < canvas_pos.y + 20.0f) {
                                 // Clicked on Timeline Ruler -> Scrub / Seek
                                 g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
@@ -2076,8 +2194,12 @@ int main(int argc, char** argv) {
                                         if (click_bar > c.start_bar + 0.05f && click_bar < c.end_bar() - 0.05f) {
                                             Track* trk = (clicked_lane == 0) ? trk0 : ((clicked_lane == 1) ? trk1 : ((clicked_lane == 2) ? trk2 : trk3));
                                             if (trk) {
+                                                auto before_clips = trk->arranger().clips();
                                                 trk->arranger().split_clip_at_bar(c.id, click_bar, bpm, kSampleRate);
                                                 track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                    trk, before_clips, track_arranger_clips[clicked_lane], "Razor Split '" + c.name + "'"
+                                                ));
                                                 std::snprintf(status_toast, sizeof(status_toast), "RAZOR SPLIT '%s' AT BAR %.2f", c.name.c_str(), click_bar + 1.0f);
                                             }
                                         } else {
@@ -2104,14 +2226,27 @@ int main(int argc, char** argv) {
                                         // Right-click on fade handle cycles fade curvature shape (0..4)
                                         bool handled_shape_click = false;
                                         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                                            Track* trk = (clicked_lane == 0) ? trk0 : ((clicked_lane == 1) ? trk1 : ((clicked_lane == 2) ? trk2 : trk3));
                                             if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
+                                                auto before_clips = trk ? trk->arranger().clips() : track_arranger_clips[clicked_lane];
                                                 c.fade_in_shape = static_cast<sampling::FadeShape>((static_cast<int>(c.fade_in_shape) + 1) % 5);
                                                 sync_arranger_to_mixer(clicked_lane);
+                                                if (trk) {
+                                                    g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                        trk, before_clips, trk->arranger().clips(), "Change Fade-In Shape"
+                                                    ));
+                                                }
                                                 std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' FADE-IN SHAPE: %d", c.name.c_str(), static_cast<int>(c.fade_in_shape));
                                                 handled_shape_click = true;
                                             } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
+                                                auto before_clips = trk ? trk->arranger().clips() : track_arranger_clips[clicked_lane];
                                                 c.fade_out_shape = static_cast<sampling::FadeShape>((static_cast<int>(c.fade_out_shape) + 1) % 5);
                                                 sync_arranger_to_mixer(clicked_lane);
+                                                if (trk) {
+                                                    g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                        trk, before_clips, trk->arranger().clips(), "Change Fade-Out Shape"
+                                                    ));
+                                                }
                                                 std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' FADE-OUT SHAPE: %d", c.name.c_str(), static_cast<int>(c.fade_out_shape));
                                                 handled_shape_click = true;
                                             } else {
@@ -2130,8 +2265,12 @@ int main(int argc, char** argv) {
                                                 if (std::abs(m.x - px) < 8.0f) {
                                                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                                                         if (trk) {
+                                                            auto before_clips = trk->arranger().clips();
                                                             trk->arranger().remove_clip_warp_pin(c.id, pin.id);
                                                             track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                                trk, before_clips, track_arranger_clips[clicked_lane], "Remove Warp Pin"
+                                                            ));
                                                             std::snprintf(status_toast, sizeof(status_toast), "REMOVED WARP PIN #%u", pin.id);
                                                         }
                                                     } else {
@@ -2157,8 +2296,12 @@ int main(int argc, char** argv) {
                                                         float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
                                                         if (std::abs(m.x - tx) < 8.0f) {
                                                             if (trk) {
+                                                                auto before_clips = trk->arranger().clips();
                                                                 uint32_t new_pid = trk->arranger().add_clip_warp_pin(c.id, span.peak_frame, rel_b);
                                                                 track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                                g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                                    trk, before_clips, track_arranger_clips[clicked_lane], "Add Warp Pin"
+                                                                ));
                                                                 g_arranger_drag_mode = ArrangerDragMode::WarpPinDrag;
                                                                 g_arranger_drag_track = clicked_lane;
                                                                 g_arranger_drag_clip_idx = clicked_clip_idx;
@@ -2321,6 +2464,8 @@ int main(int argc, char** argv) {
                                 mixer.update_scrub(target_sample, static_cast<double>(vel));
                             }
                         } else if (is_deactivated) {
+                            ArrangerDragMode finished_mode = g_arranger_drag_mode;
+
                             if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag) {
                                 g_arranger_drag_mode = ArrangerDragMode::None;
                                 g_arranger_drag_warp_pin_id = 0;
@@ -2371,6 +2516,37 @@ int main(int argc, char** argv) {
                                     }
                                 }
                             }
+
+                            if (finished_mode != ArrangerDragMode::None && finished_mode != ArrangerDragMode::ScrubTimeline) {
+                                Track* all_trks_post[4] = { trk0, trk1, trk2, trk3 };
+                                std::vector<undo::ArrangerMultiTrackAction::TrackState> diff_states;
+                                for (int ti = 0; ti < 4; ++ti) {
+                                    if (all_trks_post[ti]) {
+                                        auto current_clips = all_trks_post[ti]->arranger().clips();
+                                        if (!(current_clips == g_pre_drag_clips[ti])) {
+                                            diff_states.push_back({
+                                                .track = all_trks_post[ti],
+                                                .old_clips = g_pre_drag_clips[ti],
+                                                .new_clips = current_clips
+                                            });
+                                        }
+                                    }
+                                }
+                                if (!diff_states.empty()) {
+                                    const char* d_name = "Arranger Edit";
+                                    if (finished_mode == ArrangerDragMode::MoveClip) d_name = "Move Clip";
+                                    else if (finished_mode == ArrangerDragMode::TrimStart || finished_mode == ArrangerDragMode::TrimEnd) d_name = "Trim Clip";
+                                    else if (finished_mode == ArrangerDragMode::FadeIn || finished_mode == ArrangerDragMode::FadeOut) d_name = "Fade Clip";
+                                    else if (finished_mode == ArrangerDragMode::SlipEdit) d_name = "Slip Edit Clip";
+                                    else if (finished_mode == ArrangerDragMode::StretchStart || finished_mode == ArrangerDragMode::StretchEnd) d_name = "Stretch Clip";
+                                    else if (finished_mode == ArrangerDragMode::WarpPinDrag) d_name = "Warp Pin Edit";
+
+                                    g_undo_mgr.push_action(std::make_unique<undo::ArrangerMultiTrackAction>(
+                                        std::move(diff_states), d_name
+                                    ));
+                                }
+                            }
+
                             g_arranger_drag_mode = ArrangerDragMode::None;
                             g_arranger_drag_track = -1;
                             g_arranger_drag_clip_idx = -1;
@@ -2393,8 +2569,12 @@ int main(int argc, char** argv) {
                                     bool is_cur = (c.stretch_algo == algo);
                                     if (ImGui::MenuItem(label, nullptr, is_cur)) {
                                         if (trk) {
+                                            auto before_clips = trk->arranger().clips();
                                             trk->arranger().set_clip_stretch_algo(c.id, algo);
                                             track_arranger_clips[t] = trk->arranger().clips();
+                                            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                trk, before_clips, track_arranger_clips[t], std::string("Set Stretch Algo: ") + label
+                                            ));
                                             std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' ALGO: %s", c.name.c_str(), label);
                                         }
                                     }
@@ -2412,8 +2592,12 @@ int main(int argc, char** argv) {
                                 auto pitch_item = [&](float st, const char* label) {
                                     if (ImGui::MenuItem(label)) {
                                         if (trk) {
+                                            auto before_clips = trk->arranger().clips();
                                             trk->arranger().set_clip_pitch(c.id, st);
                                             track_arranger_clips[t] = trk->arranger().clips();
+                                            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                                trk, before_clips, track_arranger_clips[t], std::string("Pitch Shift: ") + label
+                                            ));
                                             std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' PITCH: %+.1f st", c.name.c_str(), st);
                                         }
                                     }
@@ -2428,8 +2612,12 @@ int main(int argc, char** argv) {
                                 ImGui::Separator();
                                 if (ImGui::MenuItem("Reset Length (1.00x)")) {
                                     if (trk) {
+                                        auto before_clips = trk->arranger().clips();
                                         trk->arranger().stretch_clip(c.id, c.base_len_bars, c.stretch_algo, c.pitch_semitones);
                                         track_arranger_clips[t] = trk->arranger().clips();
+                                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                            trk, before_clips, track_arranger_clips[t], "Reset Clip Length"
+                                        ));
                                         std::snprintf(status_toast, sizeof(status_toast), "RESET STRETCH FOR '%s'", c.name.c_str());
                                     }
                                 }
@@ -2438,22 +2626,34 @@ int main(int argc, char** argv) {
                                 ImGui::TextDisabled("ELASTIC AUDIO / WARP PINS:");
                                 if (ImGui::MenuItem("Quantize Transients (16th Grid)")) {
                                     if (trk) {
+                                        auto before_clips = trk->arranger().clips();
                                         trk->arranger().quantize_clip_transients(c.id, 0.0625f);
                                         track_arranger_clips[t] = trk->arranger().clips();
+                                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                            trk, before_clips, track_arranger_clips[t], "Quantize Transients (16th Grid)"
+                                        ));
                                         std::snprintf(status_toast, sizeof(status_toast), "QUANTIZED TRANSIENTS (16TH) ON '%s'", c.name.c_str());
                                     }
                                 }
                                 if (ImGui::MenuItem("Re-Detect Multiband Transients")) {
                                     if (trk) {
+                                        auto before_clips = trk->arranger().clips();
                                         trk->arranger().detect_clip_transients(c.id, 0.5f);
                                         track_arranger_clips[t] = trk->arranger().clips();
+                                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                            trk, before_clips, track_arranger_clips[t], "Re-Detect Transients"
+                                        ));
                                         std::snprintf(status_toast, sizeof(status_toast), "DETECTED TRANSIENTS ON '%s'", c.name.c_str());
                                     }
                                 }
                                 if (ImGui::MenuItem("Clear All Warp Pins")) {
                                     if (trk) {
+                                        auto before_clips = trk->arranger().clips();
                                         trk->arranger().clear_clip_warp_pins(c.id);
                                         track_arranger_clips[t] = trk->arranger().clips();
+                                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                            trk, before_clips, track_arranger_clips[t], "Clear Warp Pins"
+                                        ));
                                         std::snprintf(status_toast, sizeof(status_toast), "CLEARED WARP PINS ON '%s'", c.name.c_str());
                                     }
                                 }
@@ -3652,13 +3852,38 @@ int main(int argc, char** argv) {
                             bool to_bus_a = (track_target_buses[t] == 1);
                             bool to_bus_b = (track_target_buses[t] == 2);
 
-                            auto set_track_bus = [&](int bus_id) {
-                                track_target_buses[t] = bus_id;
+                            auto set_track_bus = [&](int new_bus_id) {
+                                int old_bus_id = track_target_buses[t];
+                                if (old_bus_id == new_bus_id) return;
+                                track_target_buses[t] = new_bus_id;
                                 protocol::MixerCommand cmd{};
                                 cmd.type = protocol::MixerCommandType::SetTrackTargetBus;
                                 cmd.target_id = t + 1; // 1-based track ID
-                                cmd.secondary_id = (bus_id == 1) ? bus_drums->id() : ((bus_id == 2) ? bus_music->id() : 0);
+                                cmd.secondary_id = (new_bus_id == 1) ? bus_drums->id() : ((new_bus_id == 2) ? bus_music->id() : 0);
                                 mixer.post_command(cmd);
+
+                                uint32_t bd_id = bus_drums ? bus_drums->id() : 0;
+                                uint32_t bm_id = bus_music ? bus_music->id() : 0;
+                                std::string bname = (new_bus_id == 1) ? "Bus A (Drums)" : ((new_bus_id == 2) ? "Bus B (Music)" : "Master Out");
+                                g_undo_mgr.push_action(std::make_unique<undo::CustomLambdaAction>(
+                                    "Route Track " + std::to_string(t + 1) + " -> " + bname,
+                                    [t, old_bus_id, bd_id, bm_id, &mixer, &track_target_buses]() {
+                                        track_target_buses[t] = old_bus_id;
+                                        protocol::MixerCommand c{};
+                                        c.type = protocol::MixerCommandType::SetTrackTargetBus;
+                                        c.target_id = t + 1;
+                                        c.secondary_id = (old_bus_id == 1) ? bd_id : ((old_bus_id == 2) ? bm_id : 0);
+                                        mixer.post_command(c);
+                                    },
+                                    [t, new_bus_id, bd_id, bm_id, &mixer, &track_target_buses]() {
+                                        track_target_buses[t] = new_bus_id;
+                                        protocol::MixerCommand c{};
+                                        c.type = protocol::MixerCommandType::SetTrackTargetBus;
+                                        c.target_id = t + 1;
+                                        c.secondary_id = (new_bus_id == 1) ? bd_id : ((new_bus_id == 2) ? bm_id : 0);
+                                        mixer.post_command(c);
+                                    }
+                                ));
                             };
 
                             if (to_mst) {
@@ -3758,29 +3983,39 @@ int main(int argc, char** argv) {
                                 if (ImGui::BeginPopup("InsertSelectMenu")) {
                                     ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "TRACK %d - INSERT SLOT %d", t + 1, s + 1);
                                     ImGui::Separator();
+
+                                    auto assign_slot_proc = [&](std::shared_ptr<IProcessor> new_p, const std::string& desc) {
+                                        if (!trk_ptr) return;
+                                        auto old_p = trk_ptr->slot(s).shared_processor();
+                                        trk_ptr->slot(s).set_processor(new_p);
+                                        g_undo_mgr.push_action(std::make_unique<undo::InsertSlotAction>(
+                                            &trk_ptr->slot(s), old_p, new_p, desc
+                                        ));
+                                    };
+
                                     if (ImGui::MenuItem("None / Clear Slot", nullptr, !has_proc)) {
-                                        if (trk_ptr) trk_ptr->slot(s).set_processor(nullptr);
+                                        assign_slot_proc(nullptr, "Clear Slot " + std::to_string(s + 1) + " (Track " + std::to_string(t + 1) + ")");
                                     }
                                     ImGui::Separator();
                                     if (ImGui::MenuItem("Airwindows Baxandall EQ")) {
                                         if (trk_ptr) {
                                             auto p = std::make_shared<dsp::Baxandall>();
                                             p->init(kSampleRate);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert Baxandall EQ (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Airwindows ButterComp2")) {
                                         if (trk_ptr) {
                                             auto p = std::make_shared<dsp::ButterComp2>();
                                             p->init(kSampleRate);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert ButterComp2 (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Airwindows PurestDrive")) {
                                         if (trk_ptr) {
                                             auto p = std::make_shared<dsp::PurestDrive>();
                                             p->init(kSampleRate);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert PurestDrive (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Airwindows DeRez2 Crunch")) {
@@ -3791,7 +4026,7 @@ int main(int argc, char** argv) {
                                             p->set_parameter(1, 0.80f);
                                             p->set_parameter(2, 0.0f); // mu-law
                                             p->set_parameter(3, 1.0f);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert DeRez2 Crunch (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     ImGui::Separator();
@@ -3804,7 +4039,7 @@ int main(int argc, char** argv) {
                                             p->set_parameter(2, 0.0f);  // OptoCompressor
                                             p->set_parameter(3, 0.75f); // Memory depth
                                             p->set_parameter(4, 0.50f); // HF Emphasis (R37)
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert Liquid Vactrol (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Buchla 292 LPG (Vactrol Low-Pass Gate)")) {
@@ -3815,21 +4050,21 @@ int main(int argc, char** argv) {
                                             p->set_parameter(1, 0.0f);
                                             p->set_parameter(2, 2.0f);  // BuchlaLPG
                                             p->set_parameter(6, 0.35f); // LPG Resonance
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert Buchla 292 LPG (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Sovereign MultiHead ODE Compressor")) {
                                         if (trk_ptr) {
                                             auto p = std::make_shared<dsp::MultiHeadOdeProcessor>(kSampleRate, 4);
                                             p->init(kSampleRate);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert MultiHead ODE (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     if (ImGui::MenuItem("Sovereign Real-Time Transient Shaper")) {
                                         if (trk_ptr) {
                                             auto p = std::make_shared<dsp::TransientShaper>();
                                             p->init(kSampleRate);
-                                            trk_ptr->slot(s).set_processor(p);
+                                            assign_slot_proc(p, "Insert Transient Shaper (Track " + std::to_string(t + 1) + ")");
                                         }
                                     }
                                     ImGui::EndPopup();
@@ -3839,6 +4074,13 @@ int main(int argc, char** argv) {
                                 if (ImGui::Checkbox("By", &is_by)) {
                                     if (trk_ptr) {
                                         trk_ptr->slot(s).set_bypass(is_by);
+                                        InsertSlot* slot_ptr = &trk_ptr->slot(s);
+                                        std::string s_desc = std::string(is_by ? "Bypass" : "Enable") + " Slot " + std::to_string(s + 1) + " (Track " + std::to_string(t + 1) + ")";
+                                        g_undo_mgr.push_action(std::make_unique<undo::CustomLambdaAction>(
+                                            s_desc,
+                                            [slot_ptr, is_by]() { slot_ptr->set_bypass(!is_by); },
+                                            [slot_ptr, is_by]() { slot_ptr->set_bypass(is_by); }
+                                        ));
                                     }
                                 }
                                 ImGui::PopID();
@@ -3848,12 +4090,26 @@ int main(int argc, char** argv) {
 
                             // Pan Rotary Dial
                             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 40.0f);
+                            static float s_pre_pan[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                             if (ui::DrawRotaryKnob("Pan", &track_pans[t], -1.0f, 1.0f, "", 18.0f)) {
                                 protocol::MixerCommand cmd{};
                                 cmd.type = protocol::MixerCommandType::SetTrackPan;
                                 cmd.target_id = t + 1;
                                 cmd.value1 = track_pans[t];
                                 mixer.post_command(cmd);
+                            }
+                            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                                float old_p = s_pre_pan[t];
+                                float new_p = track_pans[t];
+                                if (std::abs(old_p - new_p) > 1e-4f) {
+                                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                    g_undo_mgr.push_action(std::make_unique<undo::TrackGainPanAction>(
+                                        trk, undo::TrackGainPanAction::TargetProperty::Pan, old_p, new_p, track_names[t]
+                                    ));
+                                }
+                            }
+                            if (!ImGui::IsItemActive()) {
+                                s_pre_pan[t] = track_pans[t];
                             }
 
                             // Mute, Solo, Solo-Safe Buttons
@@ -3863,6 +4119,10 @@ int main(int argc, char** argv) {
                                 cmd.target_id = t + 1;
                                 cmd.flags = track_mutes[t] ? 1 : 0;
                                 mixer.post_command(cmd);
+                                Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                g_undo_mgr.push_action(std::make_unique<undo::TrackMuteSoloAction>(
+                                    trk, undo::TrackMuteSoloAction::TargetProperty::Mute, !track_mutes[t], track_mutes[t], track_names[t]
+                                ));
                             }
                             ImGui::SameLine();
                             if (ImGui::Checkbox("S", &track_solos[t])) {
@@ -3871,6 +4131,10 @@ int main(int argc, char** argv) {
                                 cmd.target_id = t + 1;
                                 cmd.flags = track_solos[t] ? 1 : 0;
                                 mixer.post_command(cmd);
+                                Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                g_undo_mgr.push_action(std::make_unique<undo::TrackMuteSoloAction>(
+                                    trk, undo::TrackMuteSoloAction::TargetProperty::Solo, !track_solos[t], track_solos[t], track_names[t]
+                                ));
                             }
                             ImGui::SameLine();
                             if (ImGui::Checkbox("SS", &track_solo_safes[t])) {
@@ -3882,7 +4146,8 @@ int main(int argc, char** argv) {
                             }
 
                             // Vertical Fader & Meter Bridge
-                            if (trk_ptr) {
+                            static float s_pre_gain[4] = { 0.85f, 0.70f, 0.80f, 0.90f };
+                            if (trk_ptr && !ImGui::IsItemActive()) {
                                 track_gains[t] = trk_ptr->gain();
                             }
                             ImGui::VSliderFloat("##fader", ImVec2(34, 110), &track_gains[t], 0.0f, 1.25f, "");
@@ -3893,6 +4158,19 @@ int main(int argc, char** argv) {
                                 cmd.target_id = t + 1;
                                 cmd.value1 = track_gains[t];
                                 mixer.post_command(cmd);
+                            }
+                            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                                float old_g = s_pre_gain[t];
+                                float new_g = track_gains[t];
+                                if (std::abs(old_g - new_g) > 1e-4f) {
+                                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                    g_undo_mgr.push_action(std::make_unique<undo::TrackGainPanAction>(
+                                        trk, undo::TrackGainPanAction::TargetProperty::Gain, old_g, new_g, track_names[t]
+                                    ));
+                                }
+                            }
+                            if (!ImGui::IsItemActive()) {
+                                s_pre_gain[t] = track_gains[t];
                             }
 
                             if (ImGui::BeginPopupContextItem("FaderMidiCtx")) {
