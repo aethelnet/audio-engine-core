@@ -446,7 +446,8 @@ int main(int argc, char** argv) {
     enum class ArrangerTool {
         Select = 0,
         Razor = 1,
-        Slip = 2
+        Slip = 2,
+        Stretch = 3
     };
     static ArrangerTool g_arranger_tool = ArrangerTool::Select;
 
@@ -458,7 +459,9 @@ int main(int argc, char** argv) {
         FadeIn,
         FadeOut,
         SlipEdit,
-        ScrubTimeline
+        ScrubTimeline,
+        StretchStart,
+        StretchEnd
     };
     static ArrangerDragMode g_arranger_drag_mode = ArrangerDragMode::None;
     static int g_arranger_drag_track = -1;
@@ -1036,7 +1039,7 @@ int main(int argc, char** argv) {
                 session_status_time = std::chrono::steady_clock::now();
             }
 
-            // Arranger Tool Shortcuts (1=Select, 2=Razor, 3=Slip)
+            // Arranger Tool Shortcuts (1=Select, 2=Razor, 3=Slip, 4=Stretch, [/]=Pitch)
             if (!ImGui::GetIO().WantTextInput) {
                 if (ImGui::IsKeyPressed(ImGuiKey_1)) {
                     g_arranger_tool = ArrangerTool::Select;
@@ -1047,6 +1050,28 @@ int main(int argc, char** argv) {
                 } else if (ImGui::IsKeyPressed(ImGuiKey_3)) {
                     g_arranger_tool = ArrangerTool::Slip;
                     std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: SLIP-EDIT (ALT+DRAG)");
+                } else if (ImGui::IsKeyPressed(ImGuiKey_4)) {
+                    g_arranger_tool = ArrangerTool::Stretch;
+                    std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: TIME-STRETCH (WSOLA EDGE-DRAG)");
+                }
+
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket) || ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+                    float delta = ImGui::IsKeyPressed(ImGuiKey_RightBracket) ? +1.0f : -1.0f;
+                    int t = selected_track;
+                    if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                        int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                        auto& c = track_arranger_clips[t][c_idx];
+                        Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                        if (trk) {
+                            trk->arranger().set_clip_pitch(c.id, c.pitch_semitones + delta);
+                            track_arranger_clips[t] = trk->arranger().clips();
+                            const auto* sc = trk->arranger().find_clip(c.id);
+                            if (sc) {
+                                std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' PITCH: %+.1f SEMITONES",
+                                              sc->name.c_str(), sc->pitch_semitones);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1410,6 +1435,18 @@ int main(int argc, char** argv) {
                     if (is_slip_tool) ImGui::PopStyleColor(2);
 
                     ImGui::SameLine();
+                    bool is_stretch_tool = (g_arranger_tool == ArrangerTool::Stretch);
+                    if (is_stretch_tool) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton("4: STRETCH")) {
+                        g_arranger_tool = ArrangerTool::Stretch;
+                        std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: TIME-STRETCH (DRAG EDGE TO STRETCH WSOLA)");
+                    }
+                    if (is_stretch_tool) ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
 
@@ -1708,8 +1745,16 @@ int main(int argc, char** argv) {
                                         clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
                                     const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
 
-                                    char extra_meta[64] = "";
-                                    if (c.offset_bars > 0.05f) {
+                                    char extra_meta[80] = "";
+                                    if (std::abs(c.stretch_ratio - 1.0f) > 0.01f || std::abs(c.pitch_semitones) > 0.01f) {
+                                        const char* algo_str = (c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
+                                                               ((c.stretch_algo == dsp::PitchAlgorithm::VinylRepitch) ? "VINYL" : "ODE");
+                                        if (std::abs(c.pitch_semitones) > 0.01f) {
+                                            std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s %+.1fst]", c.stretch_ratio, algo_str, c.pitch_semitones);
+                                        } else {
+                                            std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s]", c.stretch_ratio, algo_str);
+                                        }
+                                    } else if (c.offset_bars > 0.05f) {
                                         std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", c.offset_bars);
                                     }
 
@@ -1724,11 +1769,13 @@ int main(int argc, char** argv) {
                                                        is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
                                                        clip_label);
 
-                                    // Trim Handles visual indicators on edges
+                                    // Trim / Stretch Handles visual indicators on edges
+                                    ImColor edge_col = (g_arranger_tool == ArrangerTool::Stretch) ? ImColor(245, 158, 11, 230) :
+                                                       (is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160));
                                     draw_list->AddLine(ImVec2(clip_x1 + 4.0f, ly + 5.0f), ImVec2(clip_x1 + 4.0f, ly + lane_h - 5.0f),
-                                                       is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
+                                                       edge_col, 2.0f);
                                     draw_list->AddLine(ImVec2(clip_x2 - 4.0f, ly + 5.0f), ImVec2(clip_x2 - 4.0f, ly + lane_h - 5.0f),
-                                                       is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
+                                                       edge_col, 2.0f);
 
                                     // Auto-Crossfade Overlap Box with Adjacent Clip
                                     if (c_idx + 1 < track_arranger_clips[t].size()) {
@@ -1776,6 +1823,21 @@ int main(int argc, char** argv) {
                                           g_arranger_drag_hover_track + 1, track_names[g_arranger_drag_hover_track]);
                             draw_list->AddText(ImVec2(gh_x1 + 8.0f, gh_ly + 6.0f),
                                                ImColor(29, 78, 216, 255), gh_txt);
+                        }
+
+                        // Live Stretch Preview Badge during Edge Drag
+                        if ((g_arranger_drag_mode == ArrangerDragMode::StretchStart || g_arranger_drag_mode == ArrangerDragMode::StretchEnd) &&
+                            g_arranger_drag_track >= 0 && g_arranger_drag_clip_idx >= 0 &&
+                            g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
+                            const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
+                            float base_l = (c.base_len_bars > 0.01f) ? c.base_len_bars : g_arranger_drag_orig_len_bars;
+                            float ratio = c.len_bars / base_l;
+                            float b_x = canvas_pos.x + c.start_bar * bar_w + 6.0f;
+                            float b_y = canvas_pos.y + 20.0f + g_arranger_drag_track * lane_h + lane_h * 0.5f - 8.0f;
+                            char badge_txt[64];
+                            std::snprintf(badge_txt, sizeof(badge_txt), "[STRETCH: %.2fx WSOLA]", ratio);
+                            draw_list->AddRectFilled(ImVec2(b_x - 3.0f, b_y - 2.0f), ImVec2(b_x + 140.0f, b_y + 16.0f), ImColor(245, 158, 11, 230), 3.0f);
+                            draw_list->AddText(ImVec2(b_x, b_y), ImColor(0, 0, 0, 255), badge_txt);
                         }
 
                         // Playhead Needle
@@ -1930,9 +1992,17 @@ int main(int argc, char** argv) {
                                             } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
                                                 g_arranger_drag_mode = ArrangerDragMode::FadeOut;
                                             } else if (std::abs(m.x - cx1) < 8.0f) {
-                                                g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                                if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
+                                                    g_arranger_drag_mode = ArrangerDragMode::StretchStart;
+                                                } else {
+                                                    g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                                }
                                             } else if (std::abs(m.x - cx2) < 8.0f) {
-                                                g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                                if (g_arranger_tool == ArrangerTool::Stretch || (g_arranger_tool == ArrangerTool::Select && ImGui::GetIO().KeyShift)) {
+                                                    g_arranger_drag_mode = ArrangerDragMode::StretchEnd;
+                                                } else {
+                                                    g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                                }
                                             } else if (ImGui::GetIO().KeyAlt || g_arranger_tool == ArrangerTool::Slip) {
                                                 g_arranger_drag_mode = ArrangerDragMode::SlipEdit;
                                             } else {
@@ -2022,6 +2092,25 @@ int main(int argc, char** argv) {
                                     new_len = std::clamp(new_len, 0.25f, max_len);
                                     c.len_bars = new_len;
                                     sync_arranger_to_mixer(g_arranger_drag_track);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::StretchStart) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_start = g_arranger_drag_orig_start_bar + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_start = std::round(new_start * 4.0f) / 4.0f;
+                                    }
+                                    float clip_end_bar = g_arranger_drag_orig_start_bar + g_arranger_drag_orig_len_bars;
+                                    new_start = std::clamp(new_start, 0.0f, clip_end_bar - 0.25f);
+                                    c.start_bar = new_start;
+                                    c.len_bars = clip_end_bar - new_start;
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::StretchEnd) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_len = g_arranger_drag_orig_len_bars + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_len = std::round(new_len * 4.0f) / 4.0f;
+                                    }
+                                    float max_len = static_cast<float>(kTotalBars) - c.start_bar;
+                                    new_len = std::clamp(new_len, 0.25f, max_len);
+                                    c.len_bars = new_len;
                                 }
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
@@ -2060,6 +2149,22 @@ int main(int argc, char** argv) {
                                     Track* src_trk = (src_t == 0) ? trk0 : ((src_t == 1) ? trk1 : ((src_t == 2) ? trk2 : trk3));
                                     if (src_trk) {
                                         track_arranger_clips[src_t] = src_trk->arranger().clips();
+                                    }
+                                }
+                            } else if ((g_arranger_drag_mode == ArrangerDragMode::StretchStart || g_arranger_drag_mode == ArrangerDragMode::StretchEnd) && g_arranger_drag_track >= 0) {
+                                int src_t = g_arranger_drag_track;
+                                if (src_t >= 0 && g_arranger_drag_clip_idx >= 0 &&
+                                    g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[src_t].size())) {
+                                    Track* trk = (src_t == 0) ? trk0 : ((src_t == 1) ? trk1 : ((src_t == 2) ? trk2 : trk3));
+                                    if (trk) {
+                                        auto& c = track_arranger_clips[src_t][g_arranger_drag_clip_idx];
+                                        trk->arranger().stretch_clip(c.id, c.len_bars, c.stretch_algo, c.pitch_semitones);
+                                        track_arranger_clips[src_t] = trk->arranger().clips();
+                                        const auto* sc = trk->arranger().find_clip(c.id);
+                                        if (sc) {
+                                            std::snprintf(status_toast, sizeof(status_toast), "STRETCHED '%s' TO %.2fb (%.2fx WSOLA)",
+                                                          sc->name.c_str(), sc->len_bars, sc->stretch_ratio);
+                                        }
                                     }
                                 }
                             }

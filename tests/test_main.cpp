@@ -12621,6 +12621,223 @@ void test_arranger_multi_clip_razor_split_and_auto_crossfades() {
     std::cout << "  -> Arranger Multi-Clip Sequencing, Razor Split & Auto-Crossfades: ALL PASSED" << std::endl;
 }
 
+// ============================================================================
+// Test #85: Arranger Time-Stretching, WSOLA Edge-Drag & Decoupled Pitch Shifting
+// ============================================================================
+void test_arranger_time_stretching_and_wsola_edge_drag() {
+    std::cout << "[TEST 85] Running Arranger Time-Stretching & WSOLA Edge-Drag Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+    using namespace audio_core::sampling;
+
+    constexpr uint32_t kSampleRate = 48000;
+    constexpr double kSessionBpm = 120.0;
+
+    // Create a 4-bar pristine test loop at 120 BPM:
+    // 4 bars * 4 beats/bar = 16 beats. At 120 BPM = 8.0 seconds = 384,000 frames.
+    const uint32_t kLoopFrames = 384000;
+    auto orig_clip = std::make_shared<AudioClip>("orig_synth_loop.wav", kSampleRate, 2, kLoopFrames);
+    orig_clip->set_bpm(120.0);
+
+    // Fill with a synthetic 220Hz test wave + transient marker
+    for (uint32_t i = 0; i < kLoopFrames; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(kSampleRate);
+        float tone = 0.6f * std::sin(2.0f * std::numbers::pi_v<float> * 220.0f * t);
+        // Transient hit at frame 0..100
+        if (i < 100) {
+            tone = 0.95f * (1.0f - static_cast<float>(i) / 100.0f);
+        }
+        orig_clip->set_sample(0, i, tone);
+        orig_clip->set_sample(1, i, tone);
+    }
+
+    // ========================================================================
+    // Part A: WSOLA Time-Stretching to Bar Boundaries (2.0x & 0.5x)
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t clip_id = track.add_clip(ArrangerClipInstance{
+            .name = "StretchedSynth",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+        TEST_CHECK(clip_id != 0);
+
+        const auto* c0 = track.find_clip(clip_id);
+        TEST_CHECK(c0 != nullptr);
+        TEST_CHECK(c0->source_clip == orig_clip);
+        TEST_CHECK(std::abs(c0->base_len_bars - 4.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c0->stretch_ratio - 1.0f) < 1e-4f);
+
+        // Stretch clip from 4.0 bars to 8.0 bars (2.0x time stretch via WSOLA)
+        bool stretch_2x_ok = track.stretch_clip(clip_id, 8.0f, dsp::PitchAlgorithm::RubberbandWsola);
+        TEST_CHECK(stretch_2x_ok);
+
+        const auto* c_2x = track.find_clip(clip_id);
+        TEST_CHECK(c_2x != nullptr);
+        TEST_CHECK(std::abs(c_2x->len_bars - 8.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_2x->orig_len_bars - 8.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_2x->stretch_ratio - 2.0f) < 1e-3f);
+        TEST_CHECK(c_2x->source_clip == orig_clip); // Pristine master clip intact
+        TEST_CHECK(c_2x->clip != orig_clip);        // New stretched buffer allocated
+        TEST_CHECK(c_2x->clip->num_frames() >= 760000 && c_2x->clip->num_frames() <= 776000);
+
+        // Compress clip from 8.0 bars to 2.0 bars (0.5x time stretch via WSOLA)
+        bool compress_05x_ok = track.stretch_clip(clip_id, 2.0f, dsp::PitchAlgorithm::RubberbandWsola);
+        TEST_CHECK(compress_05x_ok);
+
+        const auto* c_05x = track.find_clip(clip_id);
+        TEST_CHECK(c_05x != nullptr);
+        TEST_CHECK(std::abs(c_05x->len_bars - 2.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_05x->orig_len_bars - 2.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_05x->stretch_ratio - 0.5f) < 1e-3f);
+        TEST_CHECK(c_05x->clip->num_frames() >= 190000 && c_05x->clip->num_frames() <= 194000);
+
+        std::cout << "  -> Part A (WSOLA Time-Stretching to Bar Boundaries 2.0x & 0.5x): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: Zero Generational Loss & Pristine Source Restoration
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t clip_id = track.add_clip(ArrangerClipInstance{
+            .name = "LosslessTest",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+
+        // Stretch 3 times sequentially to test generational loss:
+        // 4 bars -> 6 bars -> 3 bars -> 4 bars
+        track.stretch_clip(clip_id, 6.0f, dsp::PitchAlgorithm::RubberbandWsola);
+        track.stretch_clip(clip_id, 3.0f, dsp::PitchAlgorithm::RubberbandWsola);
+        track.stretch_clip(clip_id, 4.0f, dsp::PitchAlgorithm::RubberbandWsola);
+
+        const auto* c = track.find_clip(clip_id);
+        TEST_CHECK(c != nullptr);
+        TEST_CHECK(std::abs(c->len_bars - 4.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c->stretch_ratio - 1.0f) < 1e-4f);
+        // Zero generational loss: exactly restored to pointer-identical master source_clip
+        TEST_CHECK(c->clip == orig_clip);
+
+        std::cout << "  -> Part B (Zero Generational Loss & Source Restoration): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: Decoupled Pitch Shifting (+/- Semitones)
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t clip_id = track.add_clip(ArrangerClipInstance{
+            .name = "PitchedClip",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+
+        // Shift pitch up by +3 semitones while retaining 4.0 bars length
+        bool pitch_ok = track.set_clip_pitch(clip_id, +3.0f);
+        TEST_CHECK(pitch_ok);
+        const auto* c_p3 = track.find_clip(clip_id);
+        TEST_CHECK(c_p3 != nullptr);
+        TEST_CHECK(std::abs(c_p3->pitch_semitones - 3.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_p3->len_bars - 4.0f) < 1e-4f);
+
+        // Shift pitch down by -2 semitones
+        pitch_ok = track.set_clip_pitch(clip_id, -2.0f);
+        TEST_CHECK(pitch_ok);
+        const auto* c_m2 = track.find_clip(clip_id);
+        TEST_CHECK(c_m2 != nullptr);
+        TEST_CHECK(std::abs(c_m2->pitch_semitones - (-2.0f)) < 1e-4f);
+
+        std::cout << "  -> Part C (Decoupled Pitch Shifting +/- Semitones): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part D: Audio-Thread Real-Time Rendering of Stretched Clip (Zero Drift)
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t clip_id = track.add_clip(ArrangerClipInstance{
+            .name = "RenderStretched",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+
+        // Stretch from 4 bars to 6 bars
+        track.stretch_clip(clip_id, 6.0f, dsp::PitchAlgorithm::RubberbandWsola);
+
+        constexpr uint32_t kBlockFrames = 512;
+        std::vector<Sample> out_l(kBlockFrames, 0.0f);
+        std::vector<Sample> out_r(kBlockFrames, 0.0f);
+
+        // Render across multiple beats: beat 0.0 to beat 20.0 (spanning the stretched clip [0.0b, 6.0b] = [0.0, 24.0 beats])
+        for (int b = 0; b < 10; ++b) {
+            double beat = static_cast<double>(b) * 2.0; // 0, 2, 4, ...
+            track.render(out_l.data(), out_r.data(), kBlockFrames, kSampleRate, kSessionBpm, true, beat);
+            for (uint32_t i = 0; i < kBlockFrames; ++i) {
+                TEST_CHECK(!std::isnan(out_l[i]) && !std::isinf(out_l[i]));
+                TEST_CHECK(!std::isnan(out_r[i]) && !std::isinf(out_r[i]));
+            }
+        }
+
+        // Render past the end of the clip (bar 6.0 = beat 24.0; test at bar 7.0 = beat 28.0)
+        track.render(out_l.data(), out_r.data(), kBlockFrames, kSampleRate, kSessionBpm, true, 28.0);
+        for (uint32_t i = 0; i < kBlockFrames; ++i) {
+            TEST_CHECK(std::abs(out_l[i]) < 1e-6f);
+            TEST_CHECK(std::abs(out_r[i]) < 1e-6f);
+        }
+
+        std::cout << "  -> Part D (Audio-Thread Real-Time Rendering & Zero Drift): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part E: Auto-Crossfade Between Stretched Adjacent Clips
+    // ========================================================================
+    {
+        ArrangerTrack track;
+        uint32_t id1 = track.add_clip(ArrangerClipInstance{
+            .name = "Clip1",
+            .clip = orig_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f
+        });
+        uint32_t id2 = track.add_clip(ArrangerClipInstance{
+            .name = "Clip2",
+            .clip = orig_clip,
+            .start_bar = 3.0f,
+            .len_bars = 4.0f
+        });
+
+        // Stretch Clip 1 from 4 bars to 5 bars (now overlaps Clip 2 by 2 bars: [3.0, 5.0])
+        track.stretch_clip(id1, 5.0f, dsp::PitchAlgorithm::RubberbandWsola);
+
+        const auto* c1 = track.find_clip(id1);
+        const auto* c2 = track.find_clip(id2);
+        TEST_CHECK(c1 != nullptr && c2 != nullptr);
+        TEST_CHECK(c1->is_auto_crossfade_out);
+        TEST_CHECK(c2->is_auto_crossfade_in);
+        TEST_CHECK(std::abs(c1->fade_out_bars - 2.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c2->fade_in_bars - 2.0f) < 1e-4f);
+
+        // Verify Equal-Power invariant across the crossover
+        for (int s = 0; s <= 20; ++s) {
+            float b = 3.0f + static_cast<float>(s) * 0.1f;
+            float g1 = c1->evaluate_gain_at_bar(b);
+            float g2 = c2->evaluate_gain_at_bar(b);
+            float power = g1 * g1 + g2 * g2;
+            TEST_CHECK(std::abs(power - 1.0f) < 1e-5f);
+        }
+
+        std::cout << "  -> Part E (Auto-Crossfade Between Stretched Clips): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Arranger Time-Stretching & WSOLA Edge-Drag: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -12710,6 +12927,7 @@ int main() {
     test_sample_asset_management_and_project_bundle();
     test_arranger_slip_editing_cross_track_and_fade_ramps();
     test_arranger_multi_clip_razor_split_and_auto_crossfades();
+    test_arranger_time_stretching_and_wsola_edge_drag();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

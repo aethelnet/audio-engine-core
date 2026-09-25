@@ -4,7 +4,7 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 84/84 Passed](https://img.shields.io/badge/CTest-84%2F84%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 85/85 Passed](https://img.shields.io/badge/CTest-85%2F85%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![RTKit: SCHED_FIFO Support](https://img.shields.io/badge/Linux%20RT-RTKit%20%7C%20SCHED__FIFO-blueviolet.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
@@ -47,6 +47,8 @@ Designed for high-density digital audio workstations (DAWs), embedded installati
     │                                                       │                               │
     │                                                       ▼                               │
     │                                            Audio Output / AoIP Stream                 │
+    │                                            - Arranger Multi-Clip Sequencing           │
+    │                                            - WSOLA Granular Time-Stretching           │
     └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,11 +98,18 @@ Sub-millisecond buffer rendering (down to 32 frames / 666.7 µs deadline @ 48 kH
 - **Zero-Overhead Thread-Local Cache**: Thread promotion evaluates in $O(1)$ with 0 ns overhead on subsequent audio callback iterations.
 - **Bounded Event Draining**: `HardwareMidiReceiver::drain_to(..., max_events)` bounds per-block event processing at small buffer sizes to prevent dense synthetic event storms from consuming the real-time slice.
 
+### 2.8 Arranger Multi-Clip Sequencing, Time-Stretching & Auto-Crossfades
+Full multitrack timeline editing and dynamic sample arrangement:
+- **Non-Destructive Slip-Editing & Trimming**: Adjust clip start/end boundaries and internal waveform playback offsets with sub-bar precision.
+- **Granular WSOLA Time-Stretching & Edge-Drag**: Elastic audio dilation to arbitrary bar boundaries ($0.1\times$ to $10.0\times$) with zero pitch drift and **zero generational loss** (always derived from pristine source clips).
+- **Decoupled Pitch Shifting**: Continuous semitone repitching ($\pm 12$ st) with lock-free atomic snapshot publishing to the real-time audio thread.
+- **Equal-Power Auto-Crossfades**: Invariant-preserving energy crossover summation ($g_1^2 + g_2^2 \equiv 1.0$) across overlapping clip intervals.
+
 ---
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **84 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **85 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -129,8 +138,9 @@ $ ./build/audio_tests
 [TEST 82]     Sononym & Renoise Sample Asset Pool & .aethel Bundle: PASSED
 [TEST 83]     Arranger Slip-Editing, Cross-Track & Fade Ramps:     PASSED
 [TEST 84]     Arranger Multi-Clip Sequencing, Razor & Auto-Crossfades: PASSED
+[TEST 85]     Arranger WSOLA Time-Stretching, Edge-Drag & Pitch Shift: PASSED
 ===============================================================================
-   84 / 84 UNIT TESTS PASSED (100.0% SUCCESS)
+   85 / 85 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 

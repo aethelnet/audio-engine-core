@@ -4,6 +4,7 @@
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sampling/audio_clip.hpp"
 #include "audio_core/dsp/resampler.hpp"
+#include "audio_core/dsp/time_stretcher.hpp"
 
 #include <vector>
 #include <memory>
@@ -24,15 +25,22 @@ namespace audio_core::sequencer {
 // ============================================================================
 // ArrangerClipInstance: Timeline Event Container
 // Supports per-clip trimming, non-destructive slip-editing, 5 fade shapes,
-// and automatic equal-power crossfading across overlapping clip intervals.
+// automatic equal-power crossfading, and granular WSOLA time-stretching.
 // ============================================================================
 struct ArrangerClipInstance {
     uint32_t id{0};
     std::string name{""};
     std::shared_ptr<sampling::AudioClip> clip{nullptr};
+    std::shared_ptr<sampling::AudioClip> source_clip{nullptr}; // Pristine un-stretched master asset
 
     float start_bar{0.0f};           // Absolute timeline position in musical bars
     float len_bars{4.0f};            // Timeline duration in musical bars
+    float base_len_bars{4.0f};       // Base unstretched length of source_clip in bars
+    float orig_len_bars{4.0f};       // Current audio asset duration in musical bars
+    float stretch_ratio{1.0f};       // Time-stretch ratio (orig_len_bars / base_len_bars)
+    dsp::PitchAlgorithm stretch_algo{dsp::PitchAlgorithm::RubberbandWsola};
+    float pitch_semitones{0.0f};     // Decoupled pitch shift in semitones
+
     float offset_bars{0.0f};         // Non-destructive slip offset in bars
     uint32_t start_offset_frames{0}; // Start offset in frames inside underlying audio asset
 
@@ -139,6 +147,13 @@ public:
             m_next_clip_id = clip.id + 1;
         }
 
+        if (!clip.source_clip && clip.clip) {
+            clip.source_clip = clip.clip;
+            clip.base_len_bars = clip.len_bars;
+            clip.orig_len_bars = clip.len_bars;
+            clip.stretch_ratio = 1.0f;
+        }
+
         m_clips.push_back(std::move(clip));
         update_auto_crossfades();
         publish_snapshot();
@@ -187,6 +202,69 @@ public:
         return nullptr;
     }
 
+    // Time-Stretching & Pitch Shifting API:
+    // Stretches a clip to new_len_bars using WSOLA, Vinyl, or Sovereign ODE
+    // with zero generational loss (always derived from pristine source_clip).
+    bool stretch_clip(uint32_t clip_id, float new_len_bars,
+                      dsp::PitchAlgorithm algo,
+                      float semitones = 0.0f) {
+        auto it = std::find_if(m_clips.begin(), m_clips.end(), [clip_id](const ArrangerClipInstance& c) {
+            return c.id == clip_id;
+        });
+        if (it == m_clips.end() || !it->clip) return false;
+
+        if (!it->source_clip) {
+            it->source_clip = it->clip;
+            it->base_len_bars = it->len_bars;
+            it->orig_len_bars = it->len_bars;
+            it->stretch_ratio = 1.0f;
+        }
+
+        if (new_len_bars < 0.1f) new_len_bars = 0.1f;
+        float base_len = (it->base_len_bars > 0.01f) ? it->base_len_bars : it->len_bars;
+
+        float stretch_factor = new_len_bars / base_len;
+        stretch_factor = std::clamp(stretch_factor, 0.1f, 10.0f);
+        new_len_bars = base_len * stretch_factor;
+
+        std::shared_ptr<sampling::AudioClip> stretched = nullptr;
+        if (std::abs(stretch_factor - 1.0f) < 1e-4f && std::abs(semitones) < 1e-4f) {
+            stretched = it->source_clip;
+        } else {
+            stretched = dsp::PitchTimeStretcher::process(*it->source_clip, algo, semitones, stretch_factor);
+        }
+
+        if (!stretched) {
+            return false;
+        }
+
+        it->clip = stretched;
+        it->len_bars = new_len_bars;
+        it->orig_len_bars = new_len_bars;
+        it->stretch_ratio = stretch_factor;
+        it->stretch_algo = algo;
+        it->pitch_semitones = semitones;
+
+        it->fade_in_bars = std::min(it->fade_in_bars, it->len_bars);
+        it->fade_out_bars = std::min(it->fade_out_bars, it->len_bars);
+
+        update_auto_crossfades();
+        publish_snapshot();
+        return true;
+    }
+
+    bool stretch_clip(uint32_t clip_id, float new_len_bars) {
+        const auto* c = find_clip(clip_id);
+        if (!c) return false;
+        return stretch_clip(clip_id, new_len_bars, c->stretch_algo, c->pitch_semitones);
+    }
+
+    bool set_clip_pitch(uint32_t clip_id, float semitones) {
+        const auto* c = find_clip(clip_id);
+        if (!c) return false;
+        return stretch_clip(clip_id, c->len_bars, c->stretch_algo, semitones);
+    }
+
     // Non-destructive Razor / Split Tool:
     // Splits a clip at split_bar into two independent clip instances with
     // continuous start_offset_frames and accurate bar boundaries.
@@ -208,9 +286,15 @@ public:
 
         const double clip_bpm = (orig.clip && orig.clip->bpm() > 10.0) ? orig.clip->bpm() : session_bpm;
         const uint32_t clip_sr = (orig.clip && orig.clip->sample_rate() > 0) ? orig.clip->sample_rate() : sample_rate;
-        const double sec_len1 = (static_cast<double>(len1) * 4.0 / clip_bpm) * 60.0;
-        const uint32_t delta_frames = static_cast<uint32_t>(std::round(sec_len1 * static_cast<double>(clip_sr)));
         const uint32_t num_f = orig.clip ? orig.clip->num_frames() : 0;
+        uint32_t delta_frames = 0;
+        if (std::abs(orig.stretch_ratio - 1.0f) < 1e-4f && std::abs(orig.pitch_semitones) < 1e-4f) {
+            const double sec_len1 = (static_cast<double>(len1) * 4.0 / clip_bpm) * 60.0;
+            delta_frames = static_cast<uint32_t>(std::round(sec_len1 * static_cast<double>(clip_sr)));
+        } else {
+            const double base_dur = (orig.orig_len_bars > 0.01f ? orig.orig_len_bars : orig.len_bars);
+            delta_frames = static_cast<uint32_t>(std::round((static_cast<double>(len1) / base_dur) * static_cast<double>(num_f)));
+        }
         uint32_t new_offset_f = orig.start_offset_frames + delta_frames;
         if (num_f > 0) new_offset_f %= num_f;
 
@@ -224,8 +308,14 @@ public:
         c2.id = m_next_clip_id++;
         c2.name = orig.name + "_split";
         c2.clip = orig.clip;
+        c2.source_clip = orig.source_clip ? orig.source_clip : orig.clip;
         c2.start_bar = split_bar;
         c2.len_bars = len2;
+        c2.base_len_bars = orig.base_len_bars;
+        c2.orig_len_bars = orig.orig_len_bars;
+        c2.stretch_ratio = orig.stretch_ratio;
+        c2.stretch_algo = orig.stretch_algo;
+        c2.pitch_semitones = orig.pitch_semitones;
         c2.offset_bars = orig.offset_bars + len1;
         c2.start_offset_frames = new_offset_f;
         c2.fade_in_bars = 0.0f;
@@ -287,10 +377,16 @@ public:
         it->offset_bars = std::max(0.0f, it->offset_bars + delta_bars);
         const double clip_bpm = (it->clip && it->clip->bpm() > 10.0) ? it->clip->bpm() : session_bpm;
         const uint32_t clip_sr = it->clip ? it->clip->sample_rate() : 48000;
-        const double dur_sec = (static_cast<double>(it->offset_bars) * 4.0 / clip_bpm) * 60.0;
-        it->start_offset_frames = static_cast<uint32_t>(dur_sec * static_cast<double>(clip_sr));
-        if (it->clip && it->clip->num_frames() > 0) {
-            it->start_offset_frames %= it->clip->num_frames();
+        const uint32_t num_f = it->clip ? it->clip->num_frames() : 0;
+        if (std::abs(it->stretch_ratio - 1.0f) < 1e-4f && std::abs(it->pitch_semitones) < 1e-4f) {
+            const double dur_sec = (static_cast<double>(it->offset_bars) * 4.0 / clip_bpm) * 60.0;
+            it->start_offset_frames = static_cast<uint32_t>(dur_sec * static_cast<double>(clip_sr));
+        } else if (num_f > 0) {
+            const double base_dur = (it->orig_len_bars > 0.01f ? it->orig_len_bars : it->len_bars);
+            it->start_offset_frames = static_cast<uint32_t>(std::round((static_cast<double>(it->offset_bars) / base_dur) * static_cast<double>(num_f)));
+        }
+        if (num_f > 0) {
+            it->start_offset_frames %= num_f;
         }
         publish_snapshot();
         return true;
@@ -359,8 +455,14 @@ public:
                 double cur_bar = start_bar + bars_per_sample * static_cast<double>(i);
                 if (cur_bar >= c.start_bar && cur_bar < c.end_bar()) {
                     double rel_bar = cur_bar - c.start_bar;
-                    double rel_sec = (rel_bar * 4.0 / clip_bpm) * 60.0;
-                    double playhead_f = static_cast<double>(c.start_offset_frames) + rel_sec * clip_sr;
+                    double playhead_f = 0.0;
+                    if (std::abs(c.stretch_ratio - 1.0f) < 1e-4f && std::abs(c.pitch_semitones) < 1e-4f) {
+                        double rel_sec = (rel_bar * 4.0 / clip_bpm) * 60.0;
+                        playhead_f = static_cast<double>(c.start_offset_frames) + rel_sec * clip_sr;
+                    } else {
+                        double base_dur = (c.orig_len_bars > 0.01f ? c.orig_len_bars : c.len_bars);
+                        playhead_f = static_cast<double>(c.start_offset_frames) + (rel_bar / base_dur) * static_cast<double>(num_f);
+                    }
 
                     playhead_f = std::fmod(playhead_f, static_cast<double>(num_f));
                     if (playhead_f < 0.0) playhead_f += static_cast<double>(num_f);
