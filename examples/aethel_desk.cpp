@@ -25,6 +25,8 @@
 #include "backends/pipewire/pipewire_backend.hpp"
 #include "backends/desktop/desktop_backend.hpp"
 #include "audio_core/threading/realtime_scheduler.hpp"
+#include "audio_core/sampling/sample_asset_manager.hpp"
+#include <mutex>
 
 
 #include <GLFW/glfw3.h>
@@ -104,9 +106,10 @@ static std::vector<float> generate_synthetic_vocal_chops(size_t num_samples) {
     return buf;
 }
 
-// Static variables for GLFW Drag & Drop Audio Import
-static std::string g_dropped_wav_path = "";
-static bool g_has_dropped_wav = false;
+// Static thread-safe state for GLFW Drag & Drop (multi-file audio & .aethel project bundles)
+static std::vector<std::string> g_dropped_paths;
+static std::mutex g_drop_mutex;
+static bool g_has_dropped_files = false;
 
 int main(int argc, char** argv) {
     // 1. Initialize GLFW
@@ -130,11 +133,17 @@ int main(int argc, char** argv) {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable V-Sync (60/120 Hz refresh)
 
-    // Install GLFW Drag & Drop Callback for Audio Import (.wav)
+    // Install GLFW Drag & Drop Callback for Audio Import (.wav) & Project Bundles (.aethel / .json)
     glfwSetDropCallback(window, [](GLFWwindow*, int count, const char** paths) {
-        if (count > 0 && paths && paths[0]) {
-            g_dropped_wav_path = paths[0];
-            g_has_dropped_wav = true;
+        if (count > 0 && paths) {
+            std::lock_guard<std::mutex> lock(g_drop_mutex);
+            g_dropped_paths.clear();
+            for (int i = 0; i < count; ++i) {
+                if (paths[i]) {
+                    g_dropped_paths.emplace_back(paths[i]);
+                }
+            }
+            g_has_dropped_files = true;
         }
     });
 
@@ -422,6 +431,36 @@ int main(int argc, char** argv) {
     // Multi-Track Clip Pool & Original Backups
     std::shared_ptr<sampling::AudioClip> track_clips[4] = { drum_clip, acid_clip, vocal_clip, perc_clip };
     std::shared_ptr<sampling::AudioClip> track_clips_orig[4] = { drum_clip, acid_clip, vocal_clip, perc_clip };
+
+    // Register initial synthetic clips into Sononym SampleAssetPool
+    sampling::SampleAssetPool::instance().register_asset(drum_clip, "kick_808_sub.wav");
+    sampling::SampleAssetPool::instance().register_asset(acid_clip, "acid_303_lead.wav");
+    sampling::SampleAssetPool::instance().register_asset(vocal_clip, "vocal_chops.wav");
+    sampling::SampleAssetPool::instance().register_asset(perc_clip, "percussion_loop.wav");
+
+    // Arranger Timeline Clip Interactive State (Draggable & Trimmable)
+    static float arranger_clip_start_bar[4] = {0.0f, 2.0f, 4.0f, 6.0f};
+    static float arranger_clip_len_bars[4]   = {4.0f, 4.0f, 4.0f, 4.0f};
+
+    enum class ArrangerDragMode {
+        None,
+        MoveClip,
+        TrimStart,
+        TrimEnd,
+        ScrubTimeline
+    };
+    static ArrangerDragMode g_arranger_drag_mode = ArrangerDragMode::None;
+    static int g_arranger_drag_track = -1;
+    static float g_arranger_drag_start_mouse_x = 0.0f;
+    static float g_arranger_drag_orig_start_bar = 0.0f;
+    static float g_arranger_drag_orig_len_bars = 4.0f;
+
+    // Self-Contained Project Bundle & Sononym Library UI State
+    bool open_save_bundle_modal = false;
+    bool open_load_bundle_modal = false;
+    char bundle_dir_path[512] = "/tmp/aethel_session.aethel";
+    char asset_search_filter[128] = "";
+    int asset_cat_filter = 0; // 0=All, 1=Percussion, 2=Bass/Sub, 3=Melodic/Hook
 
     // Sample Editor, Pitch & Repair state
     int pitch_algo_mode = 0; // 0=Vinyl, 1=Vintage MPC, 2=WSOLA, 3=Sovereign ODE
@@ -778,21 +817,83 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Process any Drag & Drop Audio File Import from GLFW
-        if (g_has_dropped_wav) {
-            g_has_dropped_wav = false;
-            auto imported = std::make_shared<sampling::AudioClip>();
-            if (imported->load_from_wav(g_dropped_wav_path)) {
-                track_clips_orig[selected_track] = imported;
-                sync_track_clip(selected_track, imported);
-                std::snprintf(status_toast, sizeof(status_toast),
-                              "IMPORTED WAV: %s (%u Hz, %u ch, %.2fs)",
-                              imported->name().c_str(), imported->sample_rate(),
-                              imported->num_channels(),
-                              static_cast<float>(imported->num_frames()) / imported->sample_rate());
-            } else {
-                std::snprintf(status_toast, sizeof(status_toast),
-                              "ERROR: FAILED TO LOAD WAV: %s", g_dropped_wav_path.c_str());
+        // Process any Drag & Drop Audio File or Project Bundle Import from GLFW
+        if (g_has_dropped_files) {
+            std::vector<std::string> paths_to_process;
+            {
+                std::lock_guard<std::mutex> lock(g_drop_mutex);
+                paths_to_process = std::move(g_dropped_paths);
+                g_has_dropped_files = false;
+            }
+
+            int imported_audio_count = 0;
+            std::string last_sononym_toast;
+
+            for (size_t p_idx = 0; p_idx < paths_to_process.size(); ++p_idx) {
+                const auto& fpath = paths_to_process[p_idx];
+                namespace fs = std::filesystem;
+                std::error_code ec;
+
+                // Check if dropped item is an .aethel bundle directory or .json session file
+                bool is_dir = fs::is_directory(fpath, ec);
+                bool is_json = (fpath.size() >= 5 && fpath.substr(fpath.size() - 5) == ".json");
+                bool is_aethel = (fpath.size() >= 7 && fpath.substr(fpath.size() - 7) == ".aethel") ||
+                                 (is_dir && fs::exists(fs::path(fpath) / "project.json", ec));
+
+                if (is_aethel || (is_dir && !is_json)) {
+                    std::vector<std::shared_ptr<sampling::AudioClip>> loaded_bundle_clips;
+                    if (sampling::ProjectBundleManager::load_bundle(fpath, mixer, mixer.clock(), loaded_bundle_clips, &mod_matrix, &midi_learn)) {
+                        for (size_t t = 0; t < std::min<size_t>(4, loaded_bundle_clips.size()); ++t) {
+                            track_clips_orig[t] = loaded_bundle_clips[t];
+                            sync_track_clip(static_cast<int>(t), loaded_bundle_clips[t]);
+                        }
+                        sync_ui_from_mixer();
+                        std::snprintf(status_toast, sizeof(status_toast),
+                                      "[BUNDLE LOADED] %s | %zu Clips Linked | BPM: %.1f",
+                                      fs::path(fpath).filename().string().c_str(),
+                                      loaded_bundle_clips.size(), mixer.clock().bpm());
+                        break;
+                    }
+                } else if (is_json) {
+                    if (serialization::SessionSerializer::load_session_file(fpath, mixer, mixer.clock(), &mod_matrix, &midi_learn)) {
+                        sync_ui_from_mixer();
+                        std::snprintf(status_toast, sizeof(status_toast),
+                                      "[SESSION LOADED] %s | BPM: %.1f",
+                                      fs::path(fpath).filename().string().c_str(), mixer.clock().bpm());
+                        break;
+                    }
+                } else {
+                    // Audio file (.wav)
+                    auto imported = std::make_shared<sampling::AudioClip>();
+                    if (imported->load_from_wav(fpath)) {
+                        int target_track = (paths_to_process.size() == 1) ? selected_track : static_cast<int>((selected_track + imported_audio_count) % 4);
+                        track_clips_orig[target_track] = imported;
+                        sync_track_clip(target_track, imported);
+
+                        // Sononym Perceptual Analysis & Content Hashing
+                        auto desc = sampling::SampleAnalyzer::analyze(*imported, fs::path(fpath).filename().string());
+                        sampling::SampleAssetPool::instance().register_asset(imported, desc.file_name);
+
+                        char toast_buf[256];
+                        std::snprintf(toast_buf, sizeof(toast_buf),
+                                      "[SONONYM] #%d \"%s\" | Key: %s (%.1fHz) | %.1f BPM | RMS: %.1f dB | Peak: %.1f dB | Crest: %.1f dB | %s",
+                                      target_track + 1, desc.file_name.c_str(), desc.musical_key.c_str(),
+                                      desc.fundamental_hz, desc.estimated_bpm, desc.rms_db, desc.peak_db,
+                                      desc.crest_factor_db, desc.perceptual_category.c_str());
+                        last_sononym_toast = toast_buf;
+                        imported_audio_count++;
+                    }
+                }
+            }
+
+            if (!last_sononym_toast.empty()) {
+                if (imported_audio_count > 1) {
+                    std::snprintf(status_toast, sizeof(status_toast),
+                                  "[SONONYM MULTI-DROP] %d audio files registered into Asset Pool! Last: %s",
+                                  imported_audio_count, last_sononym_toast.c_str());
+                } else {
+                    std::snprintf(status_toast, sizeof(status_toast), "%s", last_sononym_toast.c_str());
+                }
             }
         }
 
@@ -890,10 +991,22 @@ int main(int argc, char** argv) {
                     open_load_session_modal = true;
                 }
                 ImGui::Separator();
+                if (ImGui::MenuItem("Save Self-Contained Bundle (.aethel)...")) {
+                    open_save_bundle_modal = true;
+                }
+                if (ImGui::MenuItem("Load Self-Contained Bundle (.aethel)...")) {
+                    open_load_bundle_modal = true;
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Export Master WAV (Offline Bounce)...")) {
                     open_bounce_modal = true;
                 }
                 ImGui::EndPopup();
+            }
+
+            ImGui::SameLine(0, 5);
+            if (ImGui::Button("[ BUNDLE ]", ImVec2(80, 32))) {
+                open_save_bundle_modal = true;
             }
 
             ImGui::SameLine(0, 5);
@@ -1213,18 +1326,76 @@ int main(int argc, char** argv) {
                                 draw_list->AddText(ImVec2(blk_x1 + 12.0f, ly + 6.0f),
                                                    ImColor(180, 83, 9, 255), act_txt);
                             } else {
-                                // Arranger blocks
-                                float clip_x1 = canvas_pos.x + (t * 2.0f) * bar_w;
-                                float clip_x2 = clip_x1 + (4.0f) * bar_w;
-                                draw_list->AddRectFilled(ImVec2(clip_x1 + 2.0f, ly + 4.0f),
-                                                         ImVec2(clip_x2 - 2.0f, ly + lane_h - 4.0f),
-                                                         (selected_track == t) ? ImColor(215, 230, 255, 240) : ImColor(235, 242, 255, 220),
-                                                         2.0f);
-                                draw_list->AddRect(ImVec2(clip_x1 + 2.0f, ly + 4.0f),
-                                                   ImVec2(clip_x2 - 2.0f, ly + lane_h - 4.0f),
-                                                   ImColor(31, 97, 217, 220), 2.0f);
-                                draw_list->AddText(ImVec2(clip_x1 + 8.0f, ly + 6.0f),
-                                                   ImColor(15, 30, 70, 255), track_names[t]);
+                                // Interactive Arranger Clip Block with Mini-Waveform & Sononym Meta
+                                float clip_x1 = canvas_pos.x + arranger_clip_start_bar[t] * bar_w;
+                                float clip_x2 = clip_x1 + arranger_clip_len_bars[t] * bar_w;
+                                bool is_sel = (selected_track == t);
+
+                                // Main Clip Body Box
+                                draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                         ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                         is_sel ? ImColor(220, 235, 255, 245) : ImColor(240, 245, 252, 230),
+                                                         3.0f);
+                                draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                   ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                   is_sel ? ImColor(31, 97, 217, 255) : ImColor(160, 180, 210, 200),
+                                                   3.0f, 0, is_sel ? 2.0f : 1.0f);
+
+                                // Mini Waveform preview inside clip
+                                auto clip_ptr = track_clips[t];
+                                if (clip_ptr && clip_ptr->num_frames() > 0 && clip_ptr->channel(0)) {
+                                    const float* ch0 = clip_ptr->channel(0);
+                                    const uint32_t total_f = clip_ptr->num_frames();
+                                    float wf_mid_y = ly + lane_h * 0.58f;
+                                    float max_h = (lane_h - 18.0f) * 0.42f;
+                                    float clip_content_w = clip_x2 - clip_x1 - 8.0f;
+                                    int num_bars_draw = static_cast<int>(clip_content_w / 3.0f);
+                                    num_bars_draw = std::clamp(num_bars_draw, 4, 250);
+
+                                    for (int wb = 0; wb < num_bars_draw; ++wb) {
+                                        float bx = clip_x1 + 4.0f + wb * 3.0f;
+                                        uint32_t f_start = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * total_f);
+                                        uint32_t f_end = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * total_f);
+                                        f_end = std::min(f_end, total_f);
+
+                                        float peak_val = 0.0f;
+                                        uint32_t stride = std::max(1u, (f_end - f_start) / 16u);
+                                        for (uint32_t fi = f_start; fi < f_end; fi += stride) {
+                                            peak_val = std::max(peak_val, std::abs(ch0[fi]));
+                                        }
+                                        float h = std::clamp(peak_val * max_h, 1.0f, max_h);
+                                        draw_list->AddLine(ImVec2(bx, wf_mid_y - h),
+                                                           ImVec2(bx, wf_mid_y + h),
+                                                           is_sel ? ImColor(31, 97, 217, 150) : ImColor(100, 130, 170, 120), 1.5f);
+                                    }
+                                }
+
+                                // Clip Title and Sononym Key
+                                char clip_label[128];
+                                auto desc = sampling::SampleAssetPool::instance().get_descriptor(
+                                    clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
+                                const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
+
+                                if (std::strlen(key_str) > 0) {
+                                    std::snprintf(clip_label, sizeof(clip_label), "%s [%s] (%.1f-%.1fb)",
+                                                  clip_ptr ? clip_ptr->name().c_str() : track_names[t],
+                                                  key_str, arranger_clip_start_bar[t] + 1.0f,
+                                                  arranger_clip_start_bar[t] + arranger_clip_len_bars[t] + 1.0f);
+                                } else {
+                                    std::snprintf(clip_label, sizeof(clip_label), "%s (%.1f-%.1fb)",
+                                                  clip_ptr ? clip_ptr->name().c_str() : track_names[t],
+                                                  arranger_clip_start_bar[t] + 1.0f,
+                                                  arranger_clip_start_bar[t] + arranger_clip_len_bars[t] + 1.0f);
+                                }
+                                draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
+                                                   is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
+                                                   clip_label);
+
+                                // Trim Handles visual indicators on edges
+                                draw_list->AddLine(ImVec2(clip_x1 + 4.0f, ly + 5.0f), ImVec2(clip_x1 + 4.0f, ly + lane_h - 5.0f),
+                                                   is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
+                                draw_list->AddLine(ImVec2(clip_x2 - 4.0f, ly + 5.0f), ImVec2(clip_x2 - 4.0f, ly + lane_h - 5.0f),
+                                                   is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
                             }
                         }
 
@@ -1239,28 +1410,118 @@ int main(int argc, char** argv) {
                                                      ImVec2(playhead_x, canvas_pos.y + 10.0f),
                                                      ImColor(20, 25, 35, 255));
 
-                        // Interactive scrubbing on ruler
-                        ImGui::InvisibleButton("ArrangerCanvasSeekBtn", canvas_size);
-                        if (ImGui::IsItemActivated()) {
-                            ImVec2 m = ImGui::GetIO().MousePos;
-                            float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                            playhead_seconds = ratio * loop_length_seconds;
-                            uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
-                            mixer.start_scrub(target_sample);
-                        } else if (ImGui::IsItemActive()) {
-                            ImVec2 m = ImGui::GetIO().MousePos;
-                            float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                            float prev_sec = playhead_seconds;
-                            playhead_seconds = ratio * loop_length_seconds;
-                            float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
-                            uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
-                            mixer.update_scrub(target_sample, static_cast<double>(vel));
-                        } else if (ImGui::IsItemDeactivated()) {
-                            ImVec2 m = ImGui::GetIO().MousePos;
-                            float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                            playhead_seconds = ratio * loop_length_seconds;
-                            uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
-                            mixer.end_scrub(target_sample);
+                        // Interactive Arranger Controls: Clip Drag, Trim, Selection & Playhead Scrubbing
+                        ImGui::SetCursorScreenPos(canvas_pos);
+                        ImGui::InvisibleButton("ArrangerCanvasInteractionBtn", canvas_size);
+                        const bool is_hovered = ImGui::IsItemHovered();
+                        const bool is_activated = ImGui::IsItemActivated();
+                        const bool is_active = ImGui::IsItemActive();
+                        const bool is_deactivated = ImGui::IsItemDeactivated();
+                        ImVec2 m = ImGui::GetIO().MousePos;
+
+                        // Cursor styling based on hover location
+                        if (is_hovered && g_arranger_drag_mode == ArrangerDragMode::None) {
+                            if (m.y >= canvas_pos.y + 20.0f) {
+                                int hov_t = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
+                                if (hov_t >= 0 && hov_t < 4) {
+                                    float hov_x1 = canvas_pos.x + arranger_clip_start_bar[hov_t] * bar_w;
+                                    float hov_x2 = hov_x1 + arranger_clip_len_bars[hov_t] * bar_w;
+                                    if (m.x >= hov_x1 && m.x <= hov_x2) {
+                                        if (std::abs(m.x - hov_x1) < 8.0f || std::abs(m.x - hov_x2) < 8.0f) {
+                                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                        } else {
+                                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (is_activated) {
+                            if (m.y < canvas_pos.y + 20.0f) {
+                                // Clicked on Timeline Ruler -> Scrub / Seek
+                                g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
+                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                                playhead_seconds = ratio * loop_length_seconds;
+                                uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                mixer.start_scrub(target_sample);
+                            } else {
+                                int clicked_lane = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
+                                clicked_lane = std::clamp(clicked_lane, 0, 3);
+                                selected_track = clicked_lane;
+                                sync_track_clip(selected_track, track_clips[selected_track]);
+
+                                float cx1 = canvas_pos.x + arranger_clip_start_bar[clicked_lane] * bar_w;
+                                float cx2 = cx1 + arranger_clip_len_bars[clicked_lane] * bar_w;
+
+                                if (m.x >= cx1 && m.x <= cx2) {
+                                    g_arranger_drag_track = clicked_lane;
+                                    g_arranger_drag_start_mouse_x = m.x;
+                                    g_arranger_drag_orig_start_bar = arranger_clip_start_bar[clicked_lane];
+                                    g_arranger_drag_orig_len_bars = arranger_clip_len_bars[clicked_lane];
+
+                                    if (std::abs(m.x - cx1) < 8.0f) {
+                                        g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                    } else if (std::abs(m.x - cx2) < 8.0f) {
+                                        g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                    } else {
+                                        g_arranger_drag_mode = ArrangerDragMode::MoveClip;
+                                    }
+                                } else {
+                                    // Clicked outside clip on lane -> Seek playhead
+                                    g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
+                                    float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                                    playhead_seconds = ratio * loop_length_seconds;
+                                    uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                    mixer.start_scrub(target_sample);
+                                }
+                            }
+                        } else if (is_active) {
+                            if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0) {
+                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                float new_start = g_arranger_drag_orig_start_bar + delta_bars;
+                                if (!ImGui::GetIO().KeyShift) {
+                                    new_start = std::round(new_start * 4.0f) / 4.0f; // 1 beat snap (1/4 bar)
+                                }
+                                float max_start = static_cast<float>(kTotalBars) - arranger_clip_len_bars[g_arranger_drag_track];
+                                new_start = std::clamp(new_start, 0.0f, max_start);
+                                arranger_clip_start_bar[g_arranger_drag_track] = new_start;
+                            } else if (g_arranger_drag_mode == ArrangerDragMode::TrimStart && g_arranger_drag_track >= 0) {
+                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                float new_start = g_arranger_drag_orig_start_bar + delta_bars;
+                                if (!ImGui::GetIO().KeyShift) {
+                                    new_start = std::round(new_start * 4.0f) / 4.0f;
+                                }
+                                float clip_end_bar = g_arranger_drag_orig_start_bar + g_arranger_drag_orig_len_bars;
+                                new_start = std::clamp(new_start, 0.0f, clip_end_bar - 0.25f);
+                                arranger_clip_start_bar[g_arranger_drag_track] = new_start;
+                                arranger_clip_len_bars[g_arranger_drag_track] = clip_end_bar - new_start;
+                            } else if (g_arranger_drag_mode == ArrangerDragMode::TrimEnd && g_arranger_drag_track >= 0) {
+                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                float new_len = g_arranger_drag_orig_len_bars + delta_bars;
+                                if (!ImGui::GetIO().KeyShift) {
+                                    new_len = std::round(new_len * 4.0f) / 4.0f;
+                                }
+                                float max_len = static_cast<float>(kTotalBars) - arranger_clip_start_bar[g_arranger_drag_track];
+                                new_len = std::clamp(new_len, 0.25f, max_len);
+                                arranger_clip_len_bars[g_arranger_drag_track] = new_len;
+                            } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
+                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                                float prev_sec = playhead_seconds;
+                                playhead_seconds = ratio * loop_length_seconds;
+                                float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
+                                uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                mixer.update_scrub(target_sample, static_cast<double>(vel));
+                            }
+                        } else if (is_deactivated) {
+                            if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
+                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                                playhead_seconds = ratio * loop_length_seconds;
+                                uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                mixer.end_scrub(target_sample);
+                            }
+                            g_arranger_drag_mode = ArrangerDragMode::None;
+                            g_arranger_drag_track = -1;
                         }
 
                     }
@@ -5412,6 +5673,229 @@ int main(int argc, char** argv) {
                     ImGui::EndTabItem();
                 }
 
+                // ============================================================
+                // TAB: SONONYM ASSET POOL & PROJECT BUNDLE MANAGER (.AETHEL)
+                // ============================================================
+                if (ImGui::BeginTabItem("  SONONYM ASSET POOL & BUNDLE (.AETHEL)  ")) {
+                    // TOP SECTION: Self-Contained Project Packaging (.aethel)
+                    ImGui::BeginChild("BundlePackagingPane", ImVec2(0, 160), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.90f, 1.0f),
+                                           "SELF-CONTAINED AETHEL PROJECT BUNDLE MANAGER (.AETHEL)");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("| Zero Broken Links & Bit-Exact Portability Across Machines");
+                        ImGui::Separator();
+
+                        ImGui::TextWrapped("Packages session routing, automation, plugins, and writes all active audio clips into "
+                                           "an 'assets/' folder named by deterministic FNV-1a 64-bit content hashes. "
+                                           "Drag & drop any .aethel folder directly onto the window to restore your entire session.");
+                        ImGui::Spacing();
+
+                        ImGui::SetNextItemWidth(450);
+                        ImGui::InputTextWithHint("##BundlePathInput", "Bundle directory path (e.g. /tmp/my_track.aethel)",
+                                                 bundle_dir_path, sizeof(bundle_dir_path));
+                        ImGui::SameLine();
+
+                        if (ImGui::Button("  SAVE .AETHEL BUNDLE  ", ImVec2(180, 26))) {
+                            std::vector<std::shared_ptr<sampling::AudioClip>> active_clips;
+                            for (int t = 0; t < 4; ++t) {
+                                if (track_clips[t]) active_clips.push_back(track_clips[t]);
+                            }
+                            if (sampling::ProjectBundleManager::save_bundle(bundle_dir_path, mixer, mixer.clock(),
+                                                                           active_clips, "Aethel Desk Session",
+                                                                           &mod_matrix, &midi_learn)) {
+                                session_status_msg = "Saved Bundle: " + std::string(bundle_dir_path);
+                                std::snprintf(status_toast, sizeof(status_toast),
+                                              "[BUNDLE SAVED] %s | %zu Clips Packaged",
+                                              bundle_dir_path, active_clips.size());
+                            } else {
+                                session_status_msg = "Error saving bundle to: " + std::string(bundle_dir_path);
+                            }
+                            session_status_time = std::chrono::steady_clock::now();
+                        }
+                        ImGui::SameLine();
+
+                        if (ImGui::Button("  LOAD .AETHEL BUNDLE  ", ImVec2(180, 26))) {
+                            std::vector<std::shared_ptr<sampling::AudioClip>> loaded_clips;
+                            if (sampling::ProjectBundleManager::load_bundle(bundle_dir_path, mixer, mixer.clock(),
+                                                                           loaded_clips, &mod_matrix, &midi_learn)) {
+                                for (size_t t = 0; t < std::min<size_t>(4, loaded_clips.size()); ++t) {
+                                    track_clips_orig[t] = loaded_clips[t];
+                                    sync_track_clip(static_cast<int>(t), loaded_clips[t]);
+                                }
+                                sync_ui_from_mixer();
+                                session_status_msg = "Loaded Bundle: " + std::string(bundle_dir_path);
+                                std::snprintf(status_toast, sizeof(status_toast),
+                                              "[BUNDLE LOADED] %s | %zu Clips Linked | BPM: %.1f",
+                                              bundle_dir_path, loaded_clips.size(), mixer.clock().bpm());
+                            } else {
+                                session_status_msg = "Error loading bundle from: " + std::string(bundle_dir_path);
+                            }
+                            session_status_time = std::chrono::steady_clock::now();
+                        }
+
+                        ImGui::SameLine();
+                        if (ImGui::Button("CLEAR POOL", ImVec2(100, 26))) {
+                            sampling::SampleAssetPool::instance().clear();
+                            // Re-register active tracks
+                            for (int t = 0; t < 4; ++t) {
+                                if (track_clips[t]) {
+                                    sampling::SampleAssetPool::instance().register_asset(track_clips[t], track_clips[t]->name());
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::Spacing();
+
+                    // BOTTOM SECTION: Sononym Perceptual Sample Asset Table
+                    ImGui::BeginChild("SononymAssetPoolPane", ImVec2(0, 0), true);
+                    {
+                        ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.05f, 1.0f),
+                                           "SONONYM PERCEPTUAL ASSET LIBRARY (%zu SAMPLES REGISTERED)",
+                                           sampling::SampleAssetPool::instance().size());
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("| FNV-1a Content-Addressable Fingerprints & Pitch/Dynamics Extraction");
+                        ImGui::Separator();
+
+                        // Search & Filter Bar
+                        ImGui::SetNextItemWidth(260);
+                        ImGui::InputTextWithHint("##AssetSearch", "Search by name, key, or tag...",
+                                                 asset_search_filter, sizeof(asset_search_filter));
+                        ImGui::SameLine();
+
+                        const char* cat_filters[] = { "All Categories", "Percussive / Drums", "Bass / Sub", "Melodic / Hooks", "Full Stems" };
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::Combo("##CatFilter", &asset_cat_filter, cat_filters, 5);
+
+                        ImGui::SameLine(0, 20);
+                        ImGui::TextColored(ImVec4(0.20f, 0.70f, 0.90f, 1.0f), "[DRAG & DROP READY]");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("Drop multiple .wav files anywhere to auto-analyze and register into this pool");
+
+                        // Asset Table
+                        static ImGuiTableFlags tbl_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                           ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+                        if (ImGui::BeginTable("SononymTable", 9, tbl_flags, ImVec2(0, -1))) {
+                            ImGui::TableSetupColumn("Asset ID (FNV-1a)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                            ImGui::TableSetupColumn("Sample Name", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+                            ImGui::TableSetupColumn("Key (F0 Pitch)", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                            ImGui::TableSetupColumn("Loop BPM", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                            ImGui::TableSetupColumn("RMS / Peak", ImGuiTableColumnFlags_WidthFixed, 115.0f);
+                            ImGui::TableSetupColumn("Crest Factor", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+                            ImGui::TableSetupColumn("Perceptual Category", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                            ImGui::TableSetupColumn("Route to Track", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                            ImGui::TableSetupColumn("Inspect", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                            ImGui::TableHeadersRow();
+
+                            auto descs = sampling::SampleAssetPool::instance().all_descriptors();
+                            for (size_t row = 0; row < descs.size(); ++row) {
+                                const auto& desc = descs[row];
+
+                                // Filtering
+                                if (std::strlen(asset_search_filter) > 0) {
+                                    std::string query = asset_search_filter;
+                                    std::string fname = desc.file_name;
+                                    std::string mkey = desc.musical_key;
+                                    std::string cat = desc.perceptual_category;
+                                    auto to_lower = [](std::string s) {
+                                        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+                                        return s;
+                                    };
+                                    query = to_lower(query);
+                                    if (to_lower(fname).find(query) == std::string::npos &&
+                                        to_lower(mkey).find(query) == std::string::npos &&
+                                        to_lower(cat).find(query) == std::string::npos) {
+                                        continue;
+                                    }
+                                }
+
+                                if (asset_cat_filter == 1 && desc.perceptual_category.find("Percussive") == std::string::npos && desc.perceptual_category.find("Snare") == std::string::npos) continue;
+                                if (asset_cat_filter == 2 && desc.perceptual_category.find("Bass") == std::string::npos && desc.perceptual_category.find("Sub") == std::string::npos && desc.perceptual_category.find("Kick") == std::string::npos) continue;
+                                if (asset_cat_filter == 3 && desc.perceptual_category.find("Melodic") == std::string::npos && desc.perceptual_category.find("Pad") == std::string::npos && desc.perceptual_category.find("Vocal") == std::string::npos) continue;
+                                if (asset_cat_filter == 4 && desc.perceptual_category.find("Stem") == std::string::npos) continue;
+
+                                ImGui::TableNextRow();
+                                ImGui::PushID(static_cast<int>(row));
+
+                                // Col 0: Asset ID preview (first 8 chars)
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "%.8s...", desc.asset_id.c_str());
+
+                                // Col 1: Sample Name
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextUnformatted(desc.file_name.c_str());
+
+                                // Col 2: Musical Key & F0
+                                ImGui::TableSetColumnIndex(2);
+                                if (!desc.musical_key.empty() && desc.musical_key != "--") {
+                                    ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.90f, 1.0f), "%s (%.1f Hz)",
+                                                       desc.musical_key.c_str(), desc.fundamental_hz);
+                                } else {
+                                    ImGui::TextDisabled("Percussive (--)");
+                                }
+
+                                // Col 3: BPM
+                                ImGui::TableSetColumnIndex(3);
+                                if (desc.estimated_bpm > 10.0f) {
+                                    ImGui::Text("%.1f", desc.estimated_bpm);
+                                } else {
+                                    ImGui::TextDisabled("--");
+                                }
+
+                                // Col 4: RMS / Peak dBFS
+                                ImGui::TableSetColumnIndex(4);
+                                ImGui::Text("%.1f / %.1f dB", desc.rms_db, desc.peak_db);
+
+                                // Col 5: Crest Factor
+                                ImGui::TableSetColumnIndex(5);
+                                ImGui::TextColored(desc.crest_factor_db > 12.0f ? ImVec4(0.85f, 0.45f, 0.05f, 1.0f) : ImVec4(0.35f, 0.40f, 0.50f, 1.0f),
+                                                   "%.1f dB", desc.crest_factor_db);
+
+                                // Col 6: Perceptual Category
+                                ImGui::TableSetColumnIndex(6);
+                                ImGui::TextUnformatted(desc.perceptual_category.c_str());
+
+                                // Col 7: Route to Track 1..4
+                                ImGui::TableSetColumnIndex(7);
+                                for (int tr = 0; tr < 4; ++tr) {
+                                    char btn_lbl[32];
+                                    std::snprintf(btn_lbl, sizeof(btn_lbl), "T%d##%zu_%d", tr + 1, row, tr);
+                                    if (ImGui::SmallButton(btn_lbl)) {
+                                        auto clip = sampling::SampleAssetPool::instance().find_by_id(desc.asset_id);
+                                        if (clip) {
+                                            track_clips_orig[tr] = clip;
+                                            sync_track_clip(tr, clip);
+                                            std::snprintf(status_toast, sizeof(status_toast),
+                                                          "[ROUTED] Assigned \"%s\" to Track %d",
+                                                          desc.file_name.c_str(), tr + 1);
+                                        }
+                                    }
+                                    if (tr < 3) ImGui::SameLine();
+                                }
+
+                                // Col 8: Inspect
+                                ImGui::TableSetColumnIndex(8);
+                                if (ImGui::SmallButton("View##insp")) {
+                                    auto clip = sampling::SampleAssetPool::instance().find_by_id(desc.asset_id);
+                                    if (clip) {
+                                        selected_track = 0;
+                                        track_clips_orig[0] = clip;
+                                        sync_track_clip(0, clip);
+                                    }
+                                }
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::EndTabItem();
+                }
+
                 ImGui::EndTabBar();
             }
         }
@@ -5466,6 +5950,76 @@ int main(int argc, char** argv) {
                     session_status_msg = "Loaded: " + std::string(session_file_path);
                 } else {
                     session_status_msg = "Error loading session!";
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(90, 30))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_save_bundle_modal) {
+            ImGui::OpenPopup("Save Self-Contained Project Bundle");
+            open_save_bundle_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Save Self-Contained Project Bundle", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.90f, 1.0f), "SAVE SELF-CONTAINED PROJECT BUNDLE (.AETHEL)");
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextWrapped("Packages session routing, automation, plugins, and writes all audio clips into 'assets/' with content-hashed filenames.");
+            ImGui::Spacing();
+            ImGui::InputText("Bundle Directory", bundle_dir_path, sizeof(bundle_dir_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("SAVE BUNDLE", ImVec2(130, 30))) {
+                std::vector<std::shared_ptr<sampling::AudioClip>> active_clips;
+                for (int t = 0; t < 4; ++t) {
+                    if (track_clips[t]) active_clips.push_back(track_clips[t]);
+                }
+                if (sampling::ProjectBundleManager::save_bundle(bundle_dir_path, mixer, mixer.clock(), active_clips, "Aethel Desk Session", &mod_matrix, &midi_learn)) {
+                    session_status_msg = "Saved Bundle: " + std::string(bundle_dir_path);
+                    std::snprintf(status_toast, sizeof(status_toast), "[BUNDLE SAVED] %s (%zu Clips)", bundle_dir_path, active_clips.size());
+                } else {
+                    session_status_msg = "Error saving bundle: " + std::string(bundle_dir_path);
+                }
+                session_status_time = std::chrono::steady_clock::now();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("CANCEL", ImVec2(90, 30))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open_load_bundle_modal) {
+            ImGui::OpenPopup("Load Self-Contained Project Bundle");
+            open_load_bundle_modal = false;
+        }
+        if (ImGui::BeginPopupModal("Load Self-Contained Project Bundle", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.90f, 1.0f), "LOAD SELF-CONTAINED PROJECT BUNDLE (.AETHEL)");
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextWrapped("Select an .aethel bundle directory to restore session topology, plugins, and re-link all WAV assets.");
+            ImGui::Spacing();
+            ImGui::InputText("Bundle Directory", bundle_dir_path, sizeof(bundle_dir_path));
+            ImGui::Spacing();
+
+            if (ImGui::Button("LOAD BUNDLE", ImVec2(130, 30))) {
+                std::vector<std::shared_ptr<sampling::AudioClip>> loaded_clips;
+                if (sampling::ProjectBundleManager::load_bundle(bundle_dir_path, mixer, mixer.clock(), loaded_clips, &mod_matrix, &midi_learn)) {
+                    for (size_t t = 0; t < std::min<size_t>(4, loaded_clips.size()); ++t) {
+                        track_clips_orig[t] = loaded_clips[t];
+                        sync_track_clip(static_cast<int>(t), loaded_clips[t]);
+                    }
+                    sync_ui_from_mixer();
+                    session_status_msg = "Loaded Bundle: " + std::string(bundle_dir_path);
+                    std::snprintf(status_toast, sizeof(status_toast), "[BUNDLE LOADED] %s (%zu Clips Linked)", bundle_dir_path, loaded_clips.size());
+                } else {
+                    session_status_msg = "Error loading bundle: " + std::string(bundle_dir_path);
                 }
                 session_status_time = std::chrono::steady_clock::now();
                 ImGui::CloseCurrentPopup();

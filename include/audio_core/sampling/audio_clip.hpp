@@ -129,6 +129,33 @@ public:
         return (ch < m_channels) ? m_data[ch].data() : nullptr;
     }
 
+    [[nodiscard]] std::span<const float> channel_data(uint32_t ch) const noexcept {
+        if (ch < m_channels) {
+            return std::span<const float>(m_data[ch].data(), m_frames);
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::span<float> channel_data(uint32_t ch) noexcept {
+        if (ch < m_channels) {
+            return std::span<float>(m_data[ch].data(), m_frames);
+        }
+        return {};
+    }
+
+    void set_sample(uint32_t ch, uint32_t frame, float val) noexcept {
+        if (ch < m_channels && frame < m_frames) {
+            m_data[ch][frame] = val;
+        }
+    }
+
+    [[nodiscard]] float sample(uint32_t ch, uint32_t frame) const noexcept {
+        if (ch < m_channels && frame < m_frames) {
+            return m_data[ch][frame];
+        }
+        return 0.0f;
+    }
+
     [[nodiscard]] const std::vector<AudioSlice>& slices() const noexcept { return m_slices; }
     [[nodiscard]] std::vector<AudioSlice>& slices() noexcept { return m_slices; }
 

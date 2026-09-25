@@ -64,6 +64,7 @@
 #include "audio_core/dsp/processor_factory.hpp"
 #include "audio_core/threading/realtime_scheduler.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
+#include "audio_core/sampling/sample_asset_manager.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -12015,6 +12016,132 @@ void test_realtime_scheduler_and_bounded_event_budget() {
     std::cout << "  -> RTKit Real-Time Scheduling Client & Bounded Event Budget: ALL PASSED" << std::endl;
 }
 
+void test_sample_asset_management_and_project_bundle() {
+    std::cout << "[TEST 82] Running Sononym & Renoise Inspired Sample Asset Management & Bundle Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    // ========================================================================
+    // Part A: SampleAnalyzer Perceptual Feature & Pitch Extraction
+    // ========================================================================
+    {
+        constexpr uint32_t kSR = 48000;
+        constexpr uint32_t kFrames = 48000; // 1.0 second
+        auto clip = std::make_shared<AudioClip>("synth_a4.wav", kSR, 2, kFrames);
+
+        // Generate pure 440 Hz A4 tone with 0.8 peak amplitude
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / kSR;
+            float val = 0.8f * std::sin(2.0f * std::numbers::pi_v<float> * 440.0f * t);
+            clip->set_sample(0, i, val);
+            clip->set_sample(1, i, val);
+        }
+
+        auto desc = SampleAnalyzer::analyze(*clip, "synth_a4.wav");
+        TEST_CHECK(!desc.asset_id.empty());
+        TEST_CHECK(desc.asset_id.length() == 16);
+        TEST_CHECK(desc.channels == 2);
+        TEST_CHECK(desc.sample_rate == 48000);
+        TEST_CHECK(desc.duration_sec >= 0.99 && desc.duration_sec <= 1.01);
+        TEST_CHECK(std::abs(desc.peak_db - (-1.938f)) < 0.2f); // 20*log10(0.8) ≈ -1.94 dBFS
+        TEST_CHECK(desc.rms_db < desc.peak_db);
+        TEST_CHECK(desc.fundamental_hz >= 430.0f && desc.fundamental_hz <= 450.0f);
+        TEST_CHECK(desc.musical_key == "A4");
+
+        // Verify JSON string serialization
+        std::string json_desc = desc.to_json();
+        TEST_CHECK(json_desc.find("\"musical_key\": \"A4\"") != std::string::npos);
+        TEST_CHECK(json_desc.find("\"asset_id\":") != std::string::npos);
+
+        std::cout << "  -> Part A (SampleAnalyzer Feature Extraction: Key=" << desc.musical_key 
+                  << ", F0=" << desc.fundamental_hz << " Hz, Peak=" << desc.peak_db << " dBFS): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: Content Hash Invariance & SampleAssetPool Library Matching
+    // ========================================================================
+    {
+        auto& pool = SampleAssetPool::instance();
+        pool.clear();
+        TEST_CHECK(pool.size() == 0);
+
+        constexpr uint32_t kSR = 48000;
+        constexpr uint32_t kFrames = 24000; // 0.5s
+        auto clip1 = std::make_shared<AudioClip>("kick_drum.wav", kSR, 2, kFrames);
+        auto clip2 = std::make_shared<AudioClip>("kick_copy_different_name.wav", kSR, 2, kFrames);
+
+        // Fill with identical transient drum hit
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float t = static_cast<float>(i) / kSR;
+            float val = std::exp(-t * 30.0f) * std::sin(2.0f * std::numbers::pi_v<float> * 60.0f * t);
+            clip1->set_sample(0, i, val);
+            clip1->set_sample(1, i, val);
+            clip2->set_sample(0, i, val);
+            clip2->set_sample(1, i, val);
+        }
+
+        auto desc1 = SampleAnalyzer::analyze(*clip1);
+        auto desc2 = SampleAnalyzer::analyze(*clip2);
+
+        // Invariant: Identical audio contents MUST generate bit-for-bit identical asset_id
+        TEST_CHECK(desc1.asset_id == desc2.asset_id);
+        TEST_CHECK(desc1.crest_factor_db > 10.0f); // High punchiness
+
+        pool.register_asset(clip1, "kick_drum.wav");
+        TEST_CHECK(pool.size() == 1);
+        TEST_CHECK(pool.find_by_id(desc1.asset_id) != nullptr);
+        TEST_CHECK(pool.find_by_name("kick_drum.wav") != nullptr);
+
+        std::cout << "  -> Part B (Content-Addressable FNV-1a Hashing & SampleAssetPool Matching): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: Self-Contained Project Bundle Packaging (.aethel)
+    // ========================================================================
+    {
+        const std::string bundle_test_dir = "/tmp/test_aethel_bundle_p293";
+        std::filesystem::remove_all(bundle_test_dir);
+
+        MixerGraph mixer(256);
+        mixer.add_track("Drum Stem");
+        clock::TimelineClock clk;
+        clk.set_bpm(128.0f);
+
+        auto stem_clip = std::make_shared<AudioClip>("stem.wav", 48000, 2, 9600);
+        for (uint32_t i = 0; i < 9600; ++i) {
+            stem_clip->set_sample(0, i, 0.5f);
+            stem_clip->set_sample(1, i, -0.5f);
+        }
+
+        std::vector<std::shared_ptr<AudioClip>> clips = { stem_clip };
+
+        // Save bundle
+        bool saved = ProjectBundleManager::save_bundle(bundle_test_dir, mixer, clk, clips, "Test Project Bundle");
+        TEST_CHECK(saved);
+        TEST_CHECK(std::filesystem::exists(bundle_test_dir + "/project.json"));
+        TEST_CHECK(std::filesystem::exists(bundle_test_dir + "/assets_manifest.json"));
+        TEST_CHECK(std::filesystem::exists(bundle_test_dir + "/assets"));
+
+        // Load bundle back
+        MixerGraph loaded_mixer(256);
+        clock::TimelineClock loaded_clk;
+        std::vector<std::shared_ptr<AudioClip>> loaded_clips;
+
+        bool loaded = ProjectBundleManager::load_bundle(bundle_test_dir, loaded_mixer, loaded_clk, loaded_clips);
+        TEST_CHECK(loaded);
+        TEST_CHECK(loaded_clk.bpm() == 128.0f);
+        TEST_CHECK(loaded_mixer.track_count() == 1);
+        TEST_CHECK(loaded_clips.size() == 1);
+        TEST_CHECK(loaded_clips[0]->num_frames() == 9600);
+        TEST_CHECK(std::abs(loaded_clips[0]->channel_data(0)[0] - 0.5f) < 0.001f);
+
+        std::filesystem::remove_all(bundle_test_dir);
+        std::cout << "  -> Part C (Self-Contained Project Bundle Packaging & Re-Linking): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Sononym & Renoise Inspired Sample Asset Management: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -12101,6 +12228,7 @@ int main() {
     test_midi_learn_and_mseg_automation_bridge();
     test_lookahead_delay_and_multiband_linkwitz_riley_dnl();
     test_realtime_scheduler_and_bounded_event_budget();
+    test_sample_asset_management_and_project_bundle();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
