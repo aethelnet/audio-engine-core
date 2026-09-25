@@ -23,6 +23,8 @@
 #include "audio_core/midi/midi_learn_router.hpp"
 #include "audio_core/routing/mseg_automation_bridge.hpp"
 #include "backends/pipewire/pipewire_backend.hpp"
+#include "backends/desktop/desktop_backend.hpp"
+#include "audio_core/threading/realtime_scheduler.hpp"
 
 
 #include <GLFW/glfw3.h>
@@ -377,7 +379,34 @@ int main(int argc, char** argv) {
     if (pw_online) {
         pw_online = pw.start();
         if (pw_online) {
-            std::cout << "[PipeWire] Audio stream successfully running!" << std::endl;
+            std::cout << "[AudioDriver] Primary driver active: Native PipeWire 0.3 stream running!" << std::endl;
+        }
+    }
+
+    // Resilient Fallback to DesktopBackend (Miniaudio + ALSA + RTKit SCHED_FIFO)
+    std::unique_ptr<DesktopBackend> desktop_backend;
+    bool desktop_online = false;
+    AudioBuffer desktop_render_buf(2, 2048);
+
+    if (!pw_online) {
+        std::cout << "[AudioDriver] PipeWire offline or unavailable. Initiating resilient fallback to DesktopBackend (ALSA + RTKit)..." << std::endl;
+        desktop_backend = std::make_unique<DesktopBackend>();
+        desktop_backend->set_callback([&mixer, &desktop_render_buf](Sample* output, uint32_t frames, uint32_t channels) {
+            uint32_t safe_frames = std::min(frames, desktop_render_buf.num_frames());
+            auto view = desktop_render_buf.view();
+            mixer.render(view);
+            for (uint32_t f = 0; f < safe_frames; ++f) {
+                for (uint32_t ch = 0; ch < channels; ++ch) {
+                    output[f * channels + ch] = (ch < 2) ? view.channel(ch)[f] : 0.0f;
+                }
+            }
+        });
+
+        if (desktop_backend->init(kSampleRate, 2, kBlockFrames) && desktop_backend->start()) {
+            desktop_online = true;
+            std::cout << "[AudioDriver] Resilient fallback SUCCESS: DesktopBackend active with RTKit (SCHED_FIFO Prio 20)!" << std::endl;
+        } else {
+            std::cerr << "[AudioDriver] CRITICAL WARNING: Neither PipeWire nor DesktopBackend could be started!" << std::endl;
         }
     }
 
@@ -889,7 +918,9 @@ int main(int argc, char** argv) {
                     open_hardware_io_modal = true;
                 }
                 ImGui::SameLine(0, 6);
-                ImGui::TextColored(ImVec4(0.12f, 0.55f, 0.95f, 1.0f), "[HW: %zu IN / %zu OUT]", sources.size(), sinks.size());
+                ImGui::TextColored(ImVec4(0.12f, 0.55f, 0.95f, 1.0f), "[PIPEWIRE: %zu IN / %zu OUT]", sources.size(), sinks.size());
+            } else if (desktop_online) {
+                ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.45f, 1.0f), "[DRIVER: ALSA / RTKit (SCHED_FIFO)]");
             } else {
                 if (ImGui::Button("[ HW: OFFLINE ]", ImVec2(115, 32))) {
                     open_hardware_io_modal = true;
