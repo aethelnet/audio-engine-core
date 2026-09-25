@@ -4,7 +4,7 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 88/88 Passed](https://img.shields.io/badge/CTest-88%2F88%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 89/89 Passed](https://img.shields.io/badge/CTest-89%2F89%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![RTKit: SCHED_FIFO Support](https://img.shields.io/badge/Linux%20RT-RTKit%20%7C%20SCHED__FIFO-blueviolet.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
@@ -112,7 +112,7 @@ Full multitrack timeline editing and dynamic sample arrangement:
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **88 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **89 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -145,8 +145,9 @@ $ ./build/audio_tests
 [TEST 86]     Transient-Warp WSOLA & Drum Punch Preservation:     PASSED
 [TEST 87]     Multiband Transient Span & Ghost-Note Resolution:   PASSED
 [TEST 88]     Arranger Warp-Pins, Elastic Audio & Groove Quant:   PASSED
+[TEST 89]     Sovereign Real-Time Transient Shaper Insert:        PASSED
 ===============================================================================
-   88 / 88 UNIT TESTS PASSED (100.0% SUCCESS)
+   89 / 89 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 
@@ -200,7 +201,7 @@ audio-engine-core/
 │   ├── mixer_graph.hpp       # Lock-Free Multi-Track Mixer Graph
 │   └── ring_buffer.hpp       # Lock-Free SPSC Wait-Free Ring Buffer
 ├── src/                      # Implementation sources
-├── tests/                    # 88 Automated Unit Test Suites
+├── tests/                    # 89 Automated Unit Test Suites
 ├── examples/
 │   ├── aethel_desk.cpp       # ImGui Audio Workstation GUI
 │   └── golden_master_tool.cpp# Bit-Exact Checksum Verification CLI

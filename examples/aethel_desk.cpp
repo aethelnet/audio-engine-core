@@ -15,6 +15,7 @@
 #include "audio_core/dsp/liquid_vactrol.hpp"
 #include "audio_core/dsp/multihead_ode_compressor.hpp"
 #include "audio_core/dsp/lookahead_dnl.hpp"
+#include "audio_core/dsp/transient_shaper.hpp"
 #include "audio_core/network/aoip_receiver.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
 #include "audio_core/engine.hpp"
@@ -3824,6 +3825,13 @@ int main(int argc, char** argv) {
                                             trk_ptr->slot(s).set_processor(p);
                                         }
                                     }
+                                    if (ImGui::MenuItem("Sovereign Real-Time Transient Shaper")) {
+                                        if (trk_ptr) {
+                                            auto p = std::make_shared<dsp::TransientShaper>();
+                                            p->init(kSampleRate);
+                                            trk_ptr->slot(s).set_processor(p);
+                                        }
+                                    }
                                     ImGui::EndPopup();
                                 }
 
@@ -4265,6 +4273,47 @@ int main(int argc, char** argv) {
                                         ImGui::ProgressBar(norm_gr, ImVec2(-1, 8), atten_txt);
                                         ImGui::PopStyleColor();
                                         ImGui::TextDisabled("4-Band LR4 Crossover + 32-Sample Lookahead Noise Gate");
+                                    } else if (pname.find("Transient") != std::string::npos || pname.find("Shaper") != std::string::npos) {
+                                        float att = proc->get_parameter(0);
+                                        float sus = proc->get_parameter(1);
+                                        float len = proc->get_parameter(2);
+                                        float trim = proc->get_parameter(3);
+
+                                        ImGui::SetNextItemWidth(75);
+                                        if (ImGui::SliderFloat("Attack##ts", &att, -15.0f, 15.0f, "%+.1fdB")) {
+                                            proc->set_parameter(0, att);
+                                        }
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::SetNextItemWidth(75);
+                                        if (ImGui::SliderFloat("Sustain##ts", &sus, -15.0f, 15.0f, "%+.1fdB")) {
+                                            proc->set_parameter(1, sus);
+                                        }
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::SetNextItemWidth(65);
+                                        if (ImGui::SliderFloat("Window##ts", &len, 1.0f, 25.0f, "%.0fms")) {
+                                            proc->set_parameter(2, len);
+                                        }
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::SetNextItemWidth(65);
+                                        if (ImGui::SliderFloat("Trim##ts", &trim, -15.0f, 15.0f, "%+.1fdB")) {
+                                            proc->set_parameter(3, trim);
+                                        }
+
+                                        auto* ts = dynamic_cast<dsp::TransientShaper*>(proc);
+                                        float t_int = ts ? ts->last_transient_intensity() : 0.0f;
+                                        float s_int = ts ? ts->last_sustain_intensity() : 0.0f;
+                                        ImGui::Text("Detection: Attack");
+                                        ImGui::SameLine();
+                                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.85f, 0.20f, 0.15f, 1.0f));
+                                        ImGui::ProgressBar(t_int, ImVec2(90, 6), "");
+                                        ImGui::PopStyleColor();
+                                        ImGui::SameLine(0, 10);
+                                        ImGui::Text("Sustain");
+                                        ImGui::SameLine();
+                                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.20f, 0.55f, 0.85f, 1.0f));
+                                        ImGui::ProgressBar(s_int, ImVec2(90, 6), "");
+                                        ImGui::PopStyleColor();
+                                        ImGui::TextDisabled("Dual-Envelope Differential Transient & Sustain Shaper (Zero Latency)");
                                     } else {
                                         float p0 = proc->get_parameter(0);
                                         float p1 = proc->get_parameter(1);
@@ -4344,6 +4393,11 @@ int main(int argc, char** argv) {
                                             p->set_parameter(1, 18.0f);
                                             p->set_parameter(2, 32.0f);
                                             p->set_parameter(3, 25.0f);
+                                            sel_trk->slot(s).set_processor(p);
+                                        }
+                                        if (ImGui::MenuItem("Sovereign Real-Time Transient Shaper")) {
+                                            auto p = std::make_shared<dsp::TransientShaper>();
+                                            p->init(kSampleRate);
                                             sel_trk->slot(s).set_processor(p);
                                         }
                                         ImGui::EndPopup();

@@ -62,6 +62,7 @@
 #include "audio_core/dsp/linkwitz_riley_crossover.hpp"
 #include "audio_core/dsp/lookahead_dnl.hpp"
 #include "audio_core/dsp/processor_factory.hpp"
+#include "audio_core/dsp/transient_shaper.hpp"
 #include "audio_core/threading/realtime_scheduler.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/sampling/sample_asset_manager.hpp"
@@ -13441,6 +13442,266 @@ void test_arranger_warp_pins_and_nonlinear_elastic_audio() {
     std::cout << "  -> Arranger Warp-Pins & Non-Linear Elastic Audio: ALL PASSED" << std::endl;
 }
 
+// ============================================================================
+// TEST 89: Sovereign Real-Time Transient Shaper Insert Processor
+// Dual-envelope differential onset and sustain shaping (zero latency, zero alloc)
+// ============================================================================
+void test_realtime_transient_shaper_insert_processor() {
+    std::cout << "[TEST 89] Running Real-Time Transient Shaper Insert Processor Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::dsp;
+
+    constexpr uint32_t kSampleRate = 48000;
+    constexpr uint32_t kFrames = 4800; // 100 ms
+
+    // Helper to generate a classic percussive test burst:
+    // - Samples 0..48 (1ms): fast attack spike (0.0 -> 0.8)
+    // - Samples 48..200 (3ms): rapid initial decay to sustain plateau (0.8 -> 0.15)
+    // - Samples 200..3000 (60ms): steady sustain ring (0.15 * sine 200Hz)
+    // - Samples 3000..4800: decay to silence
+    auto synthesize_drum_hit = [](std::vector<float>& l, std::vector<float>& r) {
+        l.assign(kFrames, 0.0f);
+        r.assign(kFrames, 0.0f);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float amp = 0.0f;
+            if (i < 48) {
+                amp = 0.8f * (static_cast<float>(i) / 48.0f);
+            } else if (i < 200) {
+                float u = static_cast<float>(i - 48) / (200.0f - 48.0f);
+                amp = 0.8f - u * (0.8f - 0.15f);
+            } else if (i < 3000) {
+                amp = 0.15f;
+            } else {
+                float u = static_cast<float>(i - 3000) / 1800.0f;
+                amp = 0.15f * (1.0f - u);
+            }
+            float osc = amp * std::sin(2.0f * std::numbers::pi_v<float> * 200.0f * static_cast<float>(i) / 48000.0f);
+            l[i] = osc;
+            r[i] = osc;
+        }
+    };
+
+    // ------------------------------------------------------------------------
+    // Part A: Attack Punch Enhancement & Decay Isolation
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part A] Attack Punch Enhancement (+6 dB)..." << std::endl;
+        TransientShaper shaper;
+        shaper.init(kSampleRate);
+        TEST_CHECK(std::string(shaper.name()) == "Sovereign Real-Time Transient Shaper");
+        TEST_CHECK(shaper.supports_sidechain());
+
+        std::vector<float> ref_l, ref_r;
+        synthesize_drum_hit(ref_l, ref_r);
+
+        // Baseline passthrough (Attack = 0 dB, Sustain = 0 dB)
+        std::vector<float> base_l = ref_l, base_r = ref_r;
+        shaper.process_stereo(base_l.data(), base_r.data(), kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            TEST_CHECK(std::abs(base_l[i] - ref_l[i]) < 0.01f);
+        }
+
+        // Boost Attack +6 dB (2.0x linear gain during transient attack)
+        shaper.reset();
+        shaper.set_parameter(0, +6.0f); // Attack +6 dB
+        shaper.set_parameter(1, 0.0f);  // Sustain 0 dB
+        shaper.set_parameter(2, 6.0f);  // Window 6 ms
+        shaper.set_parameter(4, 0.0f);  // Linear transparent soft clip for exact check
+
+        std::vector<float> boost_l = ref_l, boost_r = ref_r;
+        shaper.process_stereo(boost_l.data(), boost_r.data(), kFrames);
+
+        // Find peak in attack region (samples 20..100)
+        float max_base_att = 0.0f, max_boost_att = 0.0f;
+        for (uint32_t i = 20; i < 100; ++i) {
+            max_base_att = std::max(max_base_att, std::abs(ref_l[i]));
+            max_boost_att = std::max(max_boost_att, std::abs(boost_l[i]));
+        }
+        // Attack punch must be boosted significantly (> 1.4x)
+        TEST_CHECK(max_boost_att > max_base_att * 1.4f);
+
+        // In sustain region (samples 800..2000), gain must return to ~1.0 (< 1.15x)
+        float max_base_sus = 0.0f, max_boost_sus = 0.0f;
+        for (uint32_t i = 800; i < 2000; ++i) {
+            max_base_sus = std::max(max_base_sus, std::abs(ref_l[i]));
+            max_boost_sus = std::max(max_boost_sus, std::abs(boost_l[i]));
+        }
+        float sus_ratio = max_boost_sus / (max_base_sus + 1e-6f);
+        TEST_CHECK(sus_ratio < 1.15f);
+
+        std::cout << "  -> Part A (Attack +6dB: Attack boost=" << (max_boost_att / max_base_att)
+                  << "x | Sustain leakage=" << sus_ratio << "x): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part B: Attack Softening / Clamping (-12 dB)
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part B] Attack Clamping (-12 dB)..." << std::endl;
+        TransientShaper shaper;
+        shaper.init(kSampleRate);
+        shaper.set_parameter(0, -12.0f); // Attack -12 dB (0.25x)
+        shaper.set_parameter(1, 0.0f);   // Sustain 0 dB
+
+        std::vector<float> ref_l, ref_r;
+        synthesize_drum_hit(ref_l, ref_r);
+
+        std::vector<float> cut_l = ref_l, cut_r = ref_r;
+        shaper.process_stereo(cut_l.data(), cut_r.data(), kFrames);
+
+        float max_base_att = 0.0f, max_cut_att = 0.0f;
+        for (uint32_t i = 20; i < 100; ++i) {
+            max_base_att = std::max(max_base_att, std::abs(ref_l[i]));
+            max_cut_att = std::max(max_cut_att, std::abs(cut_l[i]));
+        }
+        // Attack peak must be significantly reduced (< 0.55x)
+        TEST_CHECK(max_cut_att < max_base_att * 0.55f);
+
+        // Sustain region must remain un-attenuated (> 0.85x)
+        float max_base_sus = 0.0f, max_cut_sus = 0.0f;
+        for (uint32_t i = 800; i < 2000; ++i) {
+            max_base_sus = std::max(max_base_sus, std::abs(ref_l[i]));
+            max_cut_sus = std::max(max_cut_sus, std::abs(cut_l[i]));
+        }
+        float sus_ratio = max_cut_sus / (max_base_sus + 1e-6f);
+        TEST_CHECK(sus_ratio > 0.85f);
+
+        std::cout << "  -> Part B (Attack -12dB: Attack attenuation=" << (max_cut_att / max_base_att)
+                  << "x | Sustain preserved=" << sus_ratio << "x): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part C: Sustain Tail Boost & Cut (+6 dB and -12 dB)
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part C] Sustain Tail Expansion (+6 dB) & Gating (-12 dB)..." << std::endl;
+        TransientShaper shaper;
+        shaper.init(kSampleRate);
+
+        std::vector<float> ref_l, ref_r;
+        synthesize_drum_hit(ref_l, ref_r);
+
+        // 1. Sustain Boost (+6 dB)
+        shaper.set_parameter(0, 0.0f);   // Attack 0 dB
+        shaper.set_parameter(1, +6.0f);  // Sustain +6 dB
+        std::vector<float> sus_boost_l = ref_l, sus_boost_r = ref_r;
+        shaper.process_stereo(sus_boost_l.data(), sus_boost_r.data(), kFrames);
+
+        float max_ref_att = 0.0f, max_sus_boost_att = 0.0f;
+        for (uint32_t i = 20; i < 80; ++i) {
+            max_ref_att = std::max(max_ref_att, std::abs(ref_l[i]));
+            max_sus_boost_att = std::max(max_sus_boost_att, std::abs(sus_boost_l[i]));
+        }
+        // Attack hit should NOT be boosted by sustain (< 1.15x)
+        TEST_CHECK(max_sus_boost_att < max_ref_att * 1.15f);
+
+        // Sustain tail (samples 800..2000) must be boosted (> 1.4x)
+        float max_ref_sus = 0.0f, max_sus_boost_tail = 0.0f;
+        for (uint32_t i = 1500; i < 2800; ++i) {
+            max_ref_sus = std::max(max_ref_sus, std::abs(ref_l[i]));
+            max_sus_boost_tail = std::max(max_sus_boost_tail, std::abs(sus_boost_l[i]));
+        }
+        TEST_CHECK(max_sus_boost_tail > max_ref_sus * 1.4f);
+
+        // 2. Sustain Cut (-12 dB, Room Gating)
+        shaper.reset();
+        shaper.set_parameter(0, 0.0f);
+        shaper.set_parameter(1, -12.0f);
+        std::vector<float> sus_cut_l = ref_l, sus_cut_r = ref_r;
+        shaper.process_stereo(sus_cut_l.data(), sus_cut_r.data(), kFrames);
+
+        float max_sus_cut_tail = 0.0f;
+        for (uint32_t i = 1500; i < 2800; ++i) {
+            max_sus_cut_tail = std::max(max_sus_cut_tail, std::abs(sus_cut_l[i]));
+        }
+        // Sustain tail must be clamped (< 0.5f)
+        TEST_CHECK(max_sus_cut_tail < max_ref_sus * 0.5f);
+
+        std::cout << "  -> Part C (Sustain +6dB boost=" << (max_sus_boost_tail / max_ref_sus)
+                  << "x | Sustain -12dB cut=" << (max_sus_cut_tail / max_ref_sus) << "x): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part D: External Sidechain-Keyed Transient Shaping
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part D] External Sidechain-Keyed Transient Shaping..." << std::endl;
+        TransientShaper shaper;
+        shaper.init(kSampleRate);
+        shaper.set_parameter(0, +6.0f); // Attack +6 dB
+        shaper.set_parameter(1, 0.0f);
+
+        // Main audio: continuous steady sine wave @ 400 Hz (amplitude 0.4, no inherent transients)
+        std::vector<float> main_l(kFrames), main_r(kFrames);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float s = 0.4f * std::sin(2.0f * std::numbers::pi_v<float> * 400.0f * static_cast<float>(i) / 48000.0f);
+            main_l[i] = s;
+            main_r[i] = s;
+        }
+
+        // Sidechain input: silence except a sharp kick transient spike at sample 1000..1050
+        std::vector<float> sc_l(kFrames, 0.0f), sc_r(kFrames, 0.0f);
+        for (uint32_t i = 1000; i < 1050; ++i) {
+            float kick = 0.9f * (1.0f - static_cast<float>(i - 1000) / 50.0f);
+            sc_l[i] = kick;
+            sc_r[i] = kick;
+        }
+
+        std::vector<float> out_l = main_l, out_r = main_r;
+        shaper.process_stereo_sidechain(out_l.data(), out_r.data(), sc_l.data(), sc_r.data(), kFrames);
+
+        // Before sidechain hit (samples 200..800): amplitude is normal ~0.4
+        float pre_hit_amp = 0.0f;
+        for (uint32_t i = 200; i < 800; ++i) {
+            pre_hit_amp = std::max(pre_hit_amp, std::abs(out_l[i]));
+        }
+        TEST_CHECK(std::abs(pre_hit_amp - 0.4f) < 0.05f);
+
+        // At sidechain hit (samples 1010..1060): main sine gets transient boosted by sidechain!
+        float hit_amp = 0.0f;
+        for (uint32_t i = 1010; i < 1060; ++i) {
+            hit_amp = std::max(hit_amp, std::abs(out_l[i]));
+        }
+        TEST_CHECK(hit_amp > pre_hit_amp * 1.35f);
+
+        std::cout << "  -> Part D (Sidechain Keying: Pre-hit amp=" << pre_hit_amp
+                  << " -> Keyed peak=" << hit_amp << "): PASSED" << std::endl;
+    }
+
+    // ------------------------------------------------------------------------
+    // Part E: InsertSlot Hardening & Factory Creation
+    // ------------------------------------------------------------------------
+    {
+        std::cout << "  [Part E] InsertSlot Hardening & Factory Creation..." << std::endl;
+        auto factory_shaper = create_processor_by_name("TransientShaper", kSampleRate);
+        TEST_CHECK(factory_shaper != nullptr);
+        TEST_CHECK(std::string(factory_shaper->name()) == "Sovereign Real-Time Transient Shaper");
+
+        InsertSlot slot;
+        slot.init(kSampleRate);
+        slot.set_processor(factory_shaper);
+
+        // Stress with 20 consecutive blocks of high-energy bursts and DC
+        std::vector<float> block_l(512), block_r(512);
+        for (int blk = 0; blk < 20; ++blk) {
+            for (uint32_t i = 0; i < 512; ++i) {
+                float s = (blk % 2 == 0) ? (0.95f * ((i % 64 == 0) ? 1.0f : 0.05f)) : 0.0f;
+                block_l[i] = s;
+                block_r[i] = s;
+            }
+            slot.process_stereo(block_l.data(), block_r.data(), 512);
+            for (uint32_t i = 0; i < 512; ++i) {
+                TEST_CHECK(!std::isnan(block_l[i]) && !std::isinf(block_l[i]));
+                TEST_CHECK(!std::isnan(block_r[i]) && !std::isinf(block_r[i]));
+            }
+        }
+
+        std::cout << "  -> Part E (InsertSlot Hardening & Factory Creation): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Sovereign Real-Time Transient Shaper: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -13534,6 +13795,7 @@ int main() {
     test_transient_warp_wsola_and_drum_punch_preservation();
     test_multiband_transient_span_and_ghost_note_resolution();
     test_arranger_warp_pins_and_nonlinear_elastic_audio();
+    test_realtime_transient_shaper_insert_processor();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
