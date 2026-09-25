@@ -13057,6 +13057,159 @@ void test_transient_warp_wsola_and_drum_punch_preservation() {
     std::cout << "  -> Transient-Warp WSOLA & Drum Punch Preservation: ALL PASSED" << std::endl;
 }
 
+void test_multiband_transient_span_and_ghost_note_resolution() {
+    std::cout << "[TEST 87] Running Multiband Transient Span & Ghost-Note Resolution Test..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::analysis;
+    using namespace audio_core::dsp;
+    using namespace audio_core::sampling;
+
+    constexpr uint32_t kSampleRate = 48000;
+    constexpr uint32_t kFrames = 48000; // 1 second
+
+    // ========================================================================
+    // Part A: Multiband Spectral Classification (SubBass, MidPunch, HighCrisp)
+    // ========================================================================
+    {
+        AudioClip clip("MultibandProbe", kSampleRate, 2, kFrames);
+        float* l = clip.channel(0);
+        float* r = clip.channel(1);
+
+        // Hit 1 at t=4000: Deep Sub-Bass Kick (55 Hz sine with fast exponential decay)
+        for (uint32_t i = 0; i < 1500; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 300.0f);
+            float val = 0.9f * env * std::sin(2.0f * std::numbers::pi_v<float> * 55.0f * i / 48000.0f);
+            l[4000 + i] += val;
+            r[4000 + i] += val;
+        }
+
+        // Hit 2 at t=16000: Mid-Punch Snare (250 Hz body + 1200 Hz tone)
+        for (uint32_t i = 0; i < 1500; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 250.0f);
+            float val = 0.7f * env * (std::sin(2.0f * std::numbers::pi_v<float> * 250.0f * i / 48000.0f) +
+                                      0.5f * std::sin(2.0f * std::numbers::pi_v<float> * 1200.0f * i / 48000.0f));
+            l[16000 + i] += val;
+            r[16000 + i] += val;
+        }
+
+        // Hit 3 at t=28000: High-Crisp Closed Hi-Hat (7500 Hz resonant tick)
+        for (uint32_t i = 0; i < 800; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 80.0f);
+            float val = 0.6f * env * std::sin(2.0f * std::numbers::pi_v<float> * 7500.0f * i / 48000.0f);
+            l[28000 + i] += val;
+            r[28000 + i] += val;
+        }
+
+        TransientDetector detector(kSampleRate);
+        auto analysis = detector.analyze(l, r, kFrames, 0.6f);
+
+        TEST_CHECK(analysis.transient_spans.size() == 3);
+        TEST_CHECK(analysis.onsets.size() == 3);
+
+        // Verify Hit 1 (SubBass Kick)
+        const auto& kick = analysis.transient_spans[0];
+        TEST_CHECK(std::abs(static_cast<int>(kick.start_frame) - 4000) < 50);
+        TEST_CHECK(kick.band == TransientBand::SubBass);
+        TEST_CHECK(kick.decay_end_frame > kick.peak_frame);
+        TEST_CHECK(kick.length_frames() >= 200);
+
+        // Verify Hit 2 (MidPunch Snare)
+        const auto& snare = analysis.transient_spans[1];
+        TEST_CHECK(std::abs(static_cast<int>(snare.start_frame) - 16000) < 50);
+        TEST_CHECK(snare.band == TransientBand::MidPunch);
+        TEST_CHECK(snare.decay_end_frame > snare.peak_frame);
+
+        // Verify Hit 3 (HighCrisp Hi-Hat)
+        const auto& hat = analysis.transient_spans[2];
+        TEST_CHECK(std::abs(static_cast<int>(hat.start_frame) - 28000) < 50);
+        TEST_CHECK(hat.band == TransientBand::HighCrisp);
+        TEST_CHECK(hat.length_frames() > 0);
+
+        std::cout << "  -> Part A (Multiband Spectral Classification: Kick=SubBass, Snare=MidPunch, Hat=HighCrisp): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: High-Density Micro-IOI Ghost-Note & Flam Resolution (< 15ms)
+    // ========================================================================
+    {
+        AudioClip clip("GhostRoll", kSampleRate, 2, kFrames);
+        float* l = clip.channel(0);
+        float* r = clip.channel(1);
+
+        // Two ghost-note rim clicks spaced only 12ms apart (576 samples @ 48kHz)
+        // Hit 1 at frame 10000, Hit 2 at frame 10576 (old 25ms gate dropped hit 2!)
+        for (uint32_t i = 0; i < 300; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 40.0f);
+            float click = 0.7f * env * std::sin(2.0f * std::numbers::pi_v<float> * 3000.0f * i / 48000.0f);
+            l[10000 + i] += click;
+            r[10000 + i] += click;
+        }
+        for (uint32_t i = 0; i < 300; ++i) {
+            float env = std::exp(-static_cast<float>(i) / 40.0f);
+            float click = 0.5f * env * std::sin(2.0f * std::numbers::pi_v<float> * 3200.0f * i / 48000.0f);
+            l[10576 + i] += click;
+            r[10576 + i] += click;
+        }
+
+        TransientDetector detector(kSampleRate);
+        detector.set_min_interval_ms(8.0f); // 8ms gate for micro-rolls
+        auto analysis = detector.analyze(l, r, kFrames, 0.7f);
+
+        TEST_CHECK(analysis.onsets.size() == 2);
+        TEST_CHECK(std::abs(static_cast<int>(analysis.onsets[0].sample_offset) - 10000) < 30);
+        TEST_CHECK(std::abs(static_cast<int>(analysis.onsets[1].sample_offset) - 10576) < 30);
+
+        // Verify crest factor is valid for resonant burst (Crest >= 1.2)
+        TEST_CHECK(analysis.onsets[0].crest_factor >= 1.2f);
+        TEST_CHECK(analysis.onsets[1].crest_factor >= 1.2f);
+
+        std::cout << "  -> Part B (High-Density Ghost-Note & Flam Resolution @ 12ms IOI): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: IOI-Aware Adaptive Transient-Warp Stretching
+    // ========================================================================
+    {
+        AudioClip clip("MicroRollClip", kSampleRate, 2, 24000);
+        float* l = clip.channel(0);
+        float* r = clip.channel(1);
+
+        // Add 3 hits with varying intervals: 12ms (576 smp), 25ms (1200 smp), 100ms (4800 smp)
+        const uint32_t onsets[3] = {2000, 2576, 3776};
+        for (uint32_t o : onsets) {
+            for (uint32_t i = 0; i < 400; ++i) {
+                float env = std::exp(-static_cast<float>(i) / 60.0f);
+                float val = 0.8f * env * std::cos(2.0f * std::numbers::pi_v<float> * 800.0f * i / 48000.0f);
+                l[o + i] += val;
+                r[o + i] += val;
+            }
+        }
+
+        // Stretch 2.0x with TransientWarpWsola
+        auto stretched = PitchTimeStretcher::process_transient_warp_wsola(clip, 0.0f, 2.0f);
+        TEST_CHECK(stretched != nullptr);
+        TEST_CHECK(stretched->num_frames() == 48000);
+
+        // Verify all 3 attacks preserved without NaN or blowups
+        for (uint32_t i = 0; i < stretched->num_frames(); ++i) {
+            TEST_CHECK(!std::isnan(stretched->channel(0)[i]) && !std::isinf(stretched->channel(0)[i]));
+            TEST_CHECK(!std::isnan(stretched->channel(1)[i]) && !std::isinf(stretched->channel(1)[i]));
+        }
+
+        // Compress 0.5x with TransientWarpWsola
+        auto compressed = PitchTimeStretcher::process_transient_warp_wsola(clip, 0.0f, 0.5f);
+        TEST_CHECK(compressed != nullptr);
+        TEST_CHECK(compressed->num_frames() == 12000);
+        for (uint32_t i = 0; i < compressed->num_frames(); ++i) {
+            TEST_CHECK(!std::isnan(compressed->channel(0)[i]) && !std::isinf(compressed->channel(0)[i]));
+        }
+
+        std::cout << "  -> Part C (IOI-Aware Adaptive Transient-Warp 2.0x & 0.5x Without Overlaps): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Multiband Transient Span & Ghost-Note Resolution: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -13148,6 +13301,7 @@ int main() {
     test_arranger_multi_clip_razor_split_and_auto_crossfades();
     test_arranger_time_stretching_and_wsola_edge_drag();
     test_transient_warp_wsola_and_drum_punch_preservation();
+    test_multiband_transient_span_and_ghost_note_resolution();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

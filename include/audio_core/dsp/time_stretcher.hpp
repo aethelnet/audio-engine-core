@@ -605,60 +605,78 @@ public:
 
         const uint32_t out_stretched_frames = static_cast<uint32_t>(std::max<double>(1.0, std::round(static_cast<double>(in_frames) * stretch_factor)));
 
-        // 1. Detect transient onsets
+        // 1. Detect transient onsets & spans
         analysis::TransientDetector detector(in_clip.sample_rate());
         const float* left = in_clip.channel(0);
         const float* right = (channels > 1) ? in_clip.channel(1) : left;
         auto analysis = detector.analyze(left, right, in_frames, sensitivity);
 
-        // Filter / collect onsets
-        std::vector<uint32_t> onsets;
-        onsets.reserve(analysis.onsets.size() + 2);
-
-        for (const auto& m : analysis.onsets) {
-            uint32_t off = m.sample_offset;
-            // Snap onsets very close to 0 to exact 0
-            if (off < 64) off = 0;
-            // If offset is right at zero-floor before a sharp attack, advance to attack start
-            if (off + 1 < in_frames && std::abs(left[off]) < 1e-4f && std::abs(left[off + 1]) > 1e-3f) {
-                off++;
-            }
-            if (onsets.empty() || off > onsets.back() + 128) {
-                onsets.push_back(off);
-            }
-        }
-
-        // If high energy at sample 0 and not detected, insert 0
-        if (onsets.empty() || onsets[0] > 64) {
-            float e0 = std::abs(left[0]) + std::abs(right[0]);
-            if (e0 > 0.05f) {
-                onsets.insert(onsets.begin(), 0);
-            }
-        }
-
         // Fallback to standard WSOLA if no transients detected
-        if (onsets.empty()) {
+        if (analysis.transient_spans.empty() && analysis.onsets.empty()) {
             return process_wsola(in_clip, semitones, stretch_factor);
         }
 
-        // 2. Define transient attack windows: length ~10ms (at least 480 samples @ 48kHz)
-        const uint32_t default_trans_w = std::max(480u, (in_clip.sample_rate() * 10) / 1000);
-
-        struct TransientSpan {
+        struct TransientSpanLayout {
             uint32_t in_start{0};
             uint32_t in_len{0};
             uint32_t out_start{0};
             uint32_t out_len{0};
         };
 
-        std::vector<TransientSpan> trans_spans;
-        trans_spans.reserve(onsets.size());
+        std::vector<analysis::TransientSpan> spans = analysis.transient_spans;
 
-        for (size_t k = 0; k < onsets.size(); ++k) {
-            uint32_t o_k = onsets[k];
-            uint32_t next_o = (k + 1 < onsets.size()) ? onsets[k + 1] : in_frames;
-            uint32_t dist_to_next = next_o > o_k ? (next_o - o_k) : 0;
-            uint32_t w = std::min(default_trans_w, dist_to_next);
+        // If sample 0 has high energy (>0.05) and no span near 0, insert span at 0
+        if (spans.empty() || spans[0].start_frame > 64) {
+            float e0 = std::abs(left[0]) + std::abs(right[0]);
+            if (e0 > 0.05f) {
+                analysis::TransientSpan s0{
+                    .start_frame = 0,
+                    .peak_frame = 0,
+                    .decay_end_frame = std::min(480u, in_frames),
+                    .strength = 1.0f,
+                    .crest_factor = 3.0f,
+                    .band = analysis::TransientBand::Broadband
+                };
+                spans.insert(spans.begin(), s0);
+            }
+        }
+
+        // Deduplicate spans that are too close (< 64 samples)
+        std::vector<analysis::TransientSpan> dedup_spans;
+        dedup_spans.reserve(spans.size());
+        for (const auto& sp : spans) {
+            if (dedup_spans.empty() || sp.start_frame >= dedup_spans.back().start_frame + 64) {
+                dedup_spans.push_back(sp);
+            }
+        }
+
+        if (dedup_spans.empty()) {
+            return process_wsola(in_clip, semitones, stretch_factor);
+        }
+
+        for (auto& sp : dedup_spans) {
+            uint32_t off = sp.start_frame;
+            if (off < 64) off = 0;
+            while (off < sp.peak_frame && std::abs(left[off]) < 1e-4f) {
+                off++;
+            }
+            sp.start_frame = off;
+        }
+
+        // 2. Compute IOI-aware dynamic transient attack/punch windows
+        std::vector<TransientSpanLayout> trans_spans;
+        trans_spans.reserve(dedup_spans.size());
+
+        for (size_t k = 0; k < dedup_spans.size(); ++k) {
+            const auto& sp = dedup_spans[k];
+            uint32_t o_k = sp.start_frame;
+            uint32_t next_o = (k + 1 < dedup_spans.size()) ? dedup_spans[k + 1].start_frame : in_frames;
+            uint32_t dist_to_next = (next_o > o_k) ? (next_o - o_k) : 0;
+
+            // Natural transient length from detector
+            uint32_t natural_w = (sp.decay_end_frame > o_k) ? (sp.decay_end_frame - o_k) : 480u;
+            // Bound transient length by inter-onset interval (at most 75% of interval to leave room for sustain)
+            uint32_t w = std::min(natural_w, (dist_to_next * 3) / 4);
             if (w < 32 && dist_to_next >= 32) w = 32;
             if (o_k + w > in_frames) w = in_frames - o_k;
 
@@ -671,8 +689,20 @@ public:
             }
             if (out_start >= out_stretched_frames) break;
 
-            uint32_t out_w = std::min(w, out_stretched_frames - out_start);
-            trans_spans.push_back(TransientSpan{
+            // Compute available space in output before next transient or end of file
+            uint32_t next_out_start = (k + 1 < dedup_spans.size()) 
+                ? static_cast<uint32_t>(std::round(static_cast<double>(next_o) * stretch_factor))
+                : out_stretched_frames;
+            uint32_t dist_out = (next_out_start > out_start) ? (next_out_start - out_start) : 0;
+
+            // When compressing (stretch_factor < 1.0), bound out_w to prevent overlapping
+            uint32_t out_w = std::min(w, (dist_out * 4) / 5);
+            if (out_w < 16 && dist_out >= 16) out_w = 16;
+            if (out_start + out_w > out_stretched_frames) {
+                out_w = out_stretched_frames - out_start;
+            }
+
+            trans_spans.push_back(TransientSpanLayout{
                 .in_start = o_k,
                 .in_len = out_w,
                 .out_start = out_start,
