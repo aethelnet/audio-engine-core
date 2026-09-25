@@ -95,17 +95,30 @@ if (UNIX AND NOT APPLE AND NOT ANDROID)
     endif()
 endif()
 
-# Dependencies (threads, math, dl, wasm3, pipewire)
+# Platform Audio Driver Options
+if (UNIX AND NOT APPLE AND NOT ANDROID)
+    option(AUDIO_CORE_ENABLE_PIPEWIRE "Enable Linux PipeWire pro-audio backend" ON)
+else()
+    option(AUDIO_CORE_ENABLE_PIPEWIRE "Enable Linux PipeWire pro-audio backend" OFF)
+endif()
+
+# Dependencies (threads, math, dl, wasm3)
 target_link_libraries(audio_core PUBLIC
     wasm3_core
     Threads::Threads
     ${CMAKE_DL_LIBS}
-    ${PIPEWIRE_LIB}
     m
 )
 
+if (AUDIO_CORE_ENABLE_PIPEWIRE)
+    target_link_libraries(audio_core PUBLIC ${PIPEWIRE_LIB})
+    target_compile_definitions(audio_core PUBLIC AUDIO_CORE_HAS_PIPEWIRE=1)
+endif()
+
 if (ANDROID)
-    target_link_libraries(audio_core PUBLIC aaudio)
+    target_sources(audio_core PRIVATE android/jni/aethel_audio_jni.cpp)
+    target_link_libraries(audio_core PUBLIC aaudio log)
+    target_compile_definitions(audio_core PUBLIC AUDIO_CORE_HAS_AAUDIO=1)
 endif()
 
 # Test Suite Executable & Automated Verification Harness
