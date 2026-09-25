@@ -438,14 +438,17 @@ int main(int argc, char** argv) {
     sampling::SampleAssetPool::instance().register_asset(vocal_clip, "vocal_chops.wav");
     sampling::SampleAssetPool::instance().register_asset(perc_clip, "percussion_loop.wav");
 
-    // Arranger Timeline Clip Interactive State (Draggable, Trimmable, Slip-Editable & Fades)
-    static float arranger_clip_start_bar[4] = {0.0f, 2.0f, 4.0f, 6.0f};
-    static float arranger_clip_len_bars[4]   = {4.0f, 4.0f, 4.0f, 4.0f};
-    static float arranger_clip_offset_bars[4]= {0.0f, 0.0f, 0.0f, 0.0f};
-    static float arranger_fade_in_bars[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
-    static float arranger_fade_out_bars[4]   = {0.0f, 0.0f, 0.0f, 0.0f};
-    static sampling::FadeShape arranger_fade_in_shape[4]  = {sampling::FadeShape::Linear, sampling::FadeShape::Linear, sampling::FadeShape::Linear, sampling::FadeShape::Linear};
-    static sampling::FadeShape arranger_fade_out_shape[4] = {sampling::FadeShape::Linear, sampling::FadeShape::Linear, sampling::FadeShape::Linear, sampling::FadeShape::Linear};
+    // Arranger Multi-Clip Track Lanes & Tool State
+    static std::vector<sequencer::ArrangerClipInstance> track_arranger_clips[4];
+    static int g_selected_clip_idx = 0;
+    static bool g_arranger_initialized = false;
+
+    enum class ArrangerTool {
+        Select = 0,
+        Razor = 1,
+        Slip = 2
+    };
+    static ArrangerTool g_arranger_tool = ArrangerTool::Select;
 
     enum class ArrangerDragMode {
         None,
@@ -459,6 +462,7 @@ int main(int argc, char** argv) {
     };
     static ArrangerDragMode g_arranger_drag_mode = ArrangerDragMode::None;
     static int g_arranger_drag_track = -1;
+    static int g_arranger_drag_clip_idx = -1;
     static int g_arranger_drag_hover_track = -1;
     static float g_arranger_drag_start_mouse_x = 0.0f;
     static float g_arranger_drag_orig_start_bar = 0.0f;
@@ -486,6 +490,40 @@ int main(int argc, char** argv) {
     char manual_wav_path[512] = "";
     char status_toast[256] = "READY // DRAG & DROP ANY .WAV AUDIO FILE ONTO THE WORKSTATION";
 
+    auto sync_arranger_to_mixer = [&](int t) {
+        if (t < 0 || t >= 4) return;
+        Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+        if (!trk) return;
+        trk->arranger().clear_clips();
+        for (const auto& c : track_arranger_clips[t]) {
+            trk->arranger().add_clip(c);
+        }
+    };
+
+    if (!g_arranger_initialized) {
+        g_arranger_initialized = true;
+        track_arranger_clips[0].push_back(sequencer::ArrangerClipInstance{
+            .id = 1, .name = "Kick / 808 Sub", .clip = drum_clip,
+            .start_bar = 0.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+        });
+        track_arranger_clips[1].push_back(sequencer::ArrangerClipInstance{
+            .id = 2, .name = "Acid 303 Lead", .clip = acid_clip,
+            .start_bar = 2.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+        });
+        track_arranger_clips[2].push_back(sequencer::ArrangerClipInstance{
+            .id = 3, .name = "Vocal Chops", .clip = vocal_clip,
+            .start_bar = 4.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+        });
+        track_arranger_clips[3].push_back(sequencer::ArrangerClipInstance{
+            .id = 4, .name = "Percussion Loop", .clip = perc_clip,
+            .start_bar = 6.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+        });
+
+        for (int t = 0; t < 4; ++t) {
+            sync_arranger_to_mixer(t);
+        }
+    }
+
     auto sync_track_clip = [&](int t, std::shared_ptr<sampling::AudioClip> clip) {
         if (t < 0 || t >= 4 || !clip) return;
         track_clips[t] = clip;
@@ -495,6 +533,13 @@ int main(int argc, char** argv) {
         else if (t == 1) trk1->set_clip(clip, true);
         else if (t == 2) trk2->set_clip(clip, true);
         else if (t == 3) trk3->set_clip(clip, true);
+
+        if (!track_arranger_clips[t].empty()) {
+            int sel_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+            track_arranger_clips[t][sel_idx].clip = clip;
+            track_arranger_clips[t][sel_idx].name = clip->name();
+            sync_arranger_to_mixer(t);
+        }
 
         if (t == selected_track) {
             const uint32_t f = clip->num_frames();
@@ -991,6 +1036,77 @@ int main(int argc, char** argv) {
                 session_status_time = std::chrono::steady_clock::now();
             }
 
+            // Arranger Tool Shortcuts (1=Select, 2=Razor, 3=Slip)
+            if (!ImGui::GetIO().WantTextInput) {
+                if (ImGui::IsKeyPressed(ImGuiKey_1)) {
+                    g_arranger_tool = ArrangerTool::Select;
+                    std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: SELECT / MOVE");
+                } else if (ImGui::IsKeyPressed(ImGuiKey_2)) {
+                    g_arranger_tool = ArrangerTool::Razor;
+                    std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: RAZOR / SPLIT (CLICK CLIP TO CUT)");
+                } else if (ImGui::IsKeyPressed(ImGuiKey_3)) {
+                    g_arranger_tool = ArrangerTool::Slip;
+                    std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: SLIP-EDIT (ALT+DRAG)");
+                }
+            }
+
+            // Ctrl+E: Split selected clip at playhead
+            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E)) {
+                constexpr int kTotalBarsShort = 16;
+                float playhead_bar = (playhead_seconds / loop_length_seconds) * static_cast<float>(kTotalBarsShort);
+                int t = selected_track;
+                if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                    int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                    auto& c = track_arranger_clips[t][c_idx];
+                    if (playhead_bar > c.start_bar + 0.05f && playhead_bar < c.end_bar() - 0.05f) {
+                        Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                        if (trk) {
+                            trk->arranger().split_clip_at_bar(c.id, playhead_bar, bpm, kSampleRate);
+                            track_arranger_clips[t] = trk->arranger().clips();
+                            std::snprintf(status_toast, sizeof(status_toast), "SPLIT CLIP '%s' AT BAR %.2f (CTRL+E)", c.name.c_str(), playhead_bar + 1.0f);
+                        }
+                    } else {
+                        std::snprintf(status_toast, sizeof(status_toast), "CANNOT SPLIT: PLAYHEAD (%.2fb) OUTSIDE SELECTED CLIP (%.2f-%.2fb)",
+                                      playhead_bar + 1.0f, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                    }
+                }
+            }
+
+            // Delete / Backspace: Remove selected clip
+            if (!ImGui::GetIO().WantTextInput && (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+                int t = selected_track;
+                if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                    int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                    uint32_t cid = track_arranger_clips[t][c_idx].id;
+                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                    if (trk) {
+                        trk->arranger().remove_clip(cid);
+                        track_arranger_clips[t] = trk->arranger().clips();
+                        g_selected_clip_idx = std::max(0, c_idx - 1);
+                        std::snprintf(status_toast, sizeof(status_toast), "DELETED CLIP (TRACK %d)", t + 1);
+                    }
+                }
+            }
+
+            // Ctrl+D: Duplicate selected clip
+            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
+                int t = selected_track;
+                if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                    int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                    auto orig = track_arranger_clips[t][c_idx];
+                    orig.id = 0;
+                    orig.start_bar = orig.end_bar();
+                    orig.name += " (Copy)";
+                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                    if (trk) {
+                        trk->arranger().add_clip(orig);
+                        track_arranger_clips[t] = trk->arranger().clips();
+                        g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                        std::snprintf(status_toast, sizeof(status_toast), "DUPLICATED CLIP '%s' TO BAR %.1f", orig.name.c_str(), orig.start_bar + 1.0f);
+                    }
+                }
+            }
+
             ImGui::SameLine(0, 10);
             if (ImGui::Button("[ SESSION ]", ImVec2(85, 32))) {
                 ImGui::OpenPopup("SessionMenuPopup");
@@ -1254,7 +1370,112 @@ int main(int argc, char** argv) {
                     // RIGHT COLUMN: MULTITRACK ARRANGER TIMELINE & STEP PATTERN MATRIX
                     // ========================================================
                     ImGui::BeginGroup();
-                    const float top_pane_h = std::max(avail_sz.y * 0.44f, 105.0f);
+                    // Arranger Toolbar: Tools (Select, Razor, Slip), Actions (Split @ Playhead, Dup, Del) & Snap Info
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 4));
+
+                    bool is_sel_tool = (g_arranger_tool == ArrangerTool::Select);
+                    if (is_sel_tool) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton("1: SELECT")) {
+                        g_arranger_tool = ArrangerTool::Select;
+                        std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: SELECT / MOVE");
+                    }
+                    if (is_sel_tool) ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
+                    bool is_razor_tool = (g_arranger_tool == ArrangerTool::Razor);
+                    if (is_razor_tool) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.25f, 0.20f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton("2: RAZOR")) {
+                        g_arranger_tool = ArrangerTool::Razor;
+                        std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: RAZOR / SPLIT (CLICK CLIP TO CUT)");
+                    }
+                    if (is_razor_tool) ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
+                    bool is_slip_tool = (g_arranger_tool == ArrangerTool::Slip);
+                    if (is_slip_tool) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.65f, 0.35f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton("3: SLIP")) {
+                        g_arranger_tool = ArrangerTool::Slip;
+                        std::snprintf(status_toast, sizeof(status_toast), "ARRANGER TOOL: SLIP-EDIT (DRAG AUDIO OFFSET)");
+                    }
+                    if (is_slip_tool) ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("|");
+                    ImGui::SameLine();
+
+                    if (ImGui::SmallButton("SPLIT (Ctrl+E)")) {
+                        constexpr int kTotalBarsShort = 16;
+                        float playhead_bar = (playhead_seconds / loop_length_seconds) * static_cast<float>(kTotalBarsShort);
+                        int t = selected_track;
+                        if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                            int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                            auto& c = track_arranger_clips[t][c_idx];
+                            if (playhead_bar > c.start_bar + 0.05f && playhead_bar < c.end_bar() - 0.05f) {
+                                Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                if (trk) {
+                                    trk->arranger().split_clip_at_bar(c.id, playhead_bar, bpm, kSampleRate);
+                                    track_arranger_clips[t] = trk->arranger().clips();
+                                    std::snprintf(status_toast, sizeof(status_toast), "SPLIT CLIP '%s' AT BAR %.2f (CTRL+E)", c.name.c_str(), playhead_bar + 1.0f);
+                                }
+                            } else {
+                                std::snprintf(status_toast, sizeof(status_toast), "CANNOT SPLIT: PLAYHEAD (%.2fb) OUTSIDE SELECTED CLIP (%.2f-%.2fb)",
+                                              playhead_bar + 1.0f, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                            }
+                        }
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("+ DUP (Ctrl+D)")) {
+                        int t = selected_track;
+                        if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                            int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                            auto orig = track_arranger_clips[t][c_idx];
+                            orig.id = 0;
+                            orig.start_bar = orig.end_bar();
+                            orig.name += " (Copy)";
+                            Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                            if (trk) {
+                                trk->arranger().add_clip(orig);
+                                track_arranger_clips[t] = trk->arranger().clips();
+                                g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                                std::snprintf(status_toast, sizeof(status_toast), "DUPLICATED CLIP '%s' TO BAR %.1f", orig.name.c_str(), orig.start_bar + 1.0f);
+                            }
+                        }
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("DEL (Del)")) {
+                        int t = selected_track;
+                        if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
+                            int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
+                            uint32_t cid = track_arranger_clips[t][c_idx].id;
+                            Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                            if (trk) {
+                                trk->arranger().remove_clip(cid);
+                                track_arranger_clips[t] = trk->arranger().clips();
+                                g_selected_clip_idx = std::max(0, c_idx - 1);
+                                std::snprintf(status_toast, sizeof(status_toast), "DELETED CLIP (TRACK %d)", t + 1);
+                            }
+                        }
+                    }
+
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("|");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("SNAP: 1/4 BAR (HOLD SHIFT: FREE)");
+                    ImGui::PopStyleVar(2);
+
+                    const float top_pane_h = std::max(avail_sz.y * 0.44f - 24.0f, 105.0f);
                     ImGui::BeginChild("ArrangerTimelinePane", ImVec2(0, top_pane_h), true, ImGuiWindowFlags_NoScrollbar);
                     {
                         ImDrawList* draw_list = ImGui::GetWindowDrawList();
@@ -1338,181 +1559,210 @@ int main(int argc, char** argv) {
                                 draw_list->AddText(ImVec2(blk_x1 + 12.0f, ly + 6.0f),
                                                    ImColor(180, 83, 9, 255), act_txt);
                             } else {
-                                // Interactive Arranger Clip Block with Mini-Waveform & Sononym Meta
-                                float clip_x1 = canvas_pos.x + arranger_clip_start_bar[t] * bar_w;
-                                float clip_x2 = clip_x1 + arranger_clip_len_bars[t] * bar_w;
-                                bool is_sel = (selected_track == t);
+                                // Multi-Clip Timeline Lanes
+                                for (size_t c_idx = 0; c_idx < track_arranger_clips[t].size(); ++c_idx) {
+                                    auto& c = track_arranger_clips[t][c_idx];
+                                    float clip_x1 = canvas_pos.x + c.start_bar * bar_w;
+                                    float clip_x2 = canvas_pos.x + c.end_bar() * bar_w;
+                                    bool is_sel = (selected_track == t && static_cast<int>(c_idx) == g_selected_clip_idx);
 
-                                // Main Clip Body Box
-                                draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                         ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
-                                                         is_sel ? ImColor(220, 235, 255, 245) : ImColor(240, 245, 252, 230),
-                                                         3.0f);
-                                draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                   ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
-                                                   is_sel ? ImColor(31, 97, 217, 255) : ImColor(160, 180, 210, 200),
-                                                   3.0f, 0, is_sel ? 2.0f : 1.0f);
+                                    // Main Clip Body Box
+                                    draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                             ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                             is_sel ? ImColor(220, 235, 255, 245) : ImColor(240, 245, 252, 230),
+                                                             3.0f);
+                                    draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                       ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                       is_sel ? ImColor(31, 97, 217, 255) : ImColor(160, 180, 210, 200),
+                                                       3.0f, 0, is_sel ? 2.0f : 1.0f);
 
-                                // Mini Waveform preview inside clip with Slip-Editing Sliding Window
-                                auto clip_ptr = track_clips[t];
-                                if (clip_ptr && clip_ptr->num_frames() > 0 && clip_ptr->channel(0)) {
-                                    const float* ch0 = clip_ptr->channel(0);
-                                    const uint32_t total_f = clip_ptr->num_frames();
-                                    float wf_mid_y = ly + lane_h * 0.58f;
-                                    float max_h = (lane_h - 18.0f) * 0.42f;
-                                    float clip_content_w = clip_x2 - clip_x1 - 8.0f;
-                                    int num_bars_draw = static_cast<int>(clip_content_w / 3.0f);
-                                    num_bars_draw = std::clamp(num_bars_draw, 4, 250);
+                                    // Mini Waveform preview inside clip with Slip-Editing Sliding Window
+                                    auto clip_ptr = c.clip ? c.clip : track_clips[t];
+                                    if (clip_ptr && clip_ptr->num_frames() > 0 && clip_ptr->channel(0)) {
+                                        const float* ch0 = clip_ptr->channel(0);
+                                        const uint32_t total_f = clip_ptr->num_frames();
+                                        float wf_mid_y = ly + lane_h * 0.58f;
+                                        float max_h = (lane_h - 18.0f) * 0.42f;
+                                        float clip_content_w = clip_x2 - clip_x1 - 8.0f;
+                                        int num_bars_draw = static_cast<int>(clip_content_w / 3.0f);
+                                        num_bars_draw = std::clamp(num_bars_draw, 4, 250);
 
-                                    double bpm = (clip_ptr->bpm() > 10.0) ? clip_ptr->bpm() : 120.0;
-                                    uint32_t sr = clip_ptr->sample_rate();
-                                    uint32_t offset_f = clip_ptr->start_offset_frames();
-                                    double clip_dur_sec = (arranger_clip_len_bars[t] * 4.0 / bpm) * 60.0;
-                                    uint32_t visible_window_f = static_cast<uint32_t>(clip_dur_sec * static_cast<double>(sr));
-                                    if (visible_window_f == 0 || visible_window_f > total_f) visible_window_f = total_f;
+                                        double clip_bpm = (clip_ptr->bpm() > 10.0) ? clip_ptr->bpm() : 120.0;
+                                        uint32_t sr = clip_ptr->sample_rate();
+                                        uint32_t offset_f = c.start_offset_frames;
+                                        double clip_dur_sec = (c.len_bars * 4.0 / clip_bpm) * 60.0;
+                                        uint32_t visible_window_f = static_cast<uint32_t>(clip_dur_sec * static_cast<double>(sr));
+                                        if (visible_window_f == 0 || visible_window_f > total_f) visible_window_f = total_f;
 
-                                    for (int wb = 0; wb < num_bars_draw; ++wb) {
-                                        float bx = clip_x1 + 4.0f + wb * 3.0f;
-                                        uint32_t rel_s = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * visible_window_f);
-                                        uint32_t rel_e = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * visible_window_f);
-                                        uint32_t f_start = (offset_f + rel_s) % total_f;
-                                        uint32_t f_end = (offset_f + rel_e) % total_f;
-                                        if (f_end <= f_start) f_end = total_f;
+                                        for (int wb = 0; wb < num_bars_draw; ++wb) {
+                                            float bx = clip_x1 + 4.0f + wb * 3.0f;
+                                            uint32_t rel_s = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * visible_window_f);
+                                            uint32_t rel_e = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * visible_window_f);
+                                            uint32_t f_start = (offset_f + rel_s) % total_f;
+                                            uint32_t f_end = (offset_f + rel_e) % total_f;
+                                            if (f_end <= f_start) f_end = total_f;
 
-                                        float peak_val = 0.0f;
-                                        uint32_t stride = std::max(1u, (f_end - f_start) / 16u);
-                                        for (uint32_t fi = f_start; fi < f_end; fi += stride) {
-                                            peak_val = std::max(peak_val, std::abs(ch0[fi]));
+                                            float peak_val = 0.0f;
+                                            uint32_t stride = std::max(1u, (f_end - f_start) / 16u);
+                                            for (uint32_t fi = f_start; fi < f_end; fi += stride) {
+                                                peak_val = std::max(peak_val, std::abs(ch0[fi]));
+                                            }
+                                            float h = std::clamp(peak_val * max_h, 1.0f, max_h);
+                                            draw_list->AddLine(ImVec2(bx, wf_mid_y - h),
+                                                               ImVec2(bx, wf_mid_y + h),
+                                                               is_sel ? ImColor(31, 97, 217, 150) : ImColor(100, 130, 170, 120), 1.5f);
                                         }
-                                        float h = std::clamp(peak_val * max_h, 1.0f, max_h);
-                                        draw_list->AddLine(ImVec2(bx, wf_mid_y - h),
-                                                           ImVec2(bx, wf_mid_y + h),
-                                                           is_sel ? ImColor(31, 97, 217, 150) : ImColor(100, 130, 170, 120), 1.5f);
                                     }
-                                }
 
-                                // Fade In Shaded Polygon & Grab Handle
-                                float fin_b = arranger_fade_in_bars[t];
-                                if (fin_b > 0.01f) {
-                                    float fin_w = fin_b * bar_w;
-                                    fin_w = std::min(fin_w, (clip_x2 - clip_x1) * 0.95f);
-                                    float hx = clip_x1 + fin_w;
+                                    constexpr float kPiOver2 = 1.5707963267948966f;
 
-                                    constexpr int kRampSteps = 16;
-                                    ImVec2 poly_pts[kRampSteps + 2];
-                                    poly_pts[0] = ImVec2(clip_x1 + 1.0f, ly + 2.0f);
-                                    for (int si = 0; si <= kRampSteps; ++si) {
-                                        float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
-                                        float px = clip_x1 + 1.0f + u * fin_w;
-                                        float gain = u;
-                                        switch (arranger_fade_in_shape[t]) {
-                                            case sampling::FadeShape::Linear:      gain = u; break;
-                                            case sampling::FadeShape::Exponential: gain = std::pow(u, 2.8f); break;
-                                            case sampling::FadeShape::Logarithmic: gain = 1.0f - std::pow(1.0f - u, 2.8f); break;
-                                            case sampling::FadeShape::SCurve:      gain = u * u * (3.0f - 2.0f * u); break;
+                                    // Fade In Shaded Polygon & Grab Handle
+                                    float fin_b = c.fade_in_bars;
+                                    if (fin_b > 0.01f) {
+                                        float fin_w = fin_b * bar_w;
+                                        fin_w = std::min(fin_w, (clip_x2 - clip_x1) * 0.95f);
+                                        float hx = clip_x1 + fin_w;
+
+                                        constexpr int kRampSteps = 16;
+                                        ImVec2 poly_pts[kRampSteps + 2];
+                                        poly_pts[0] = ImVec2(clip_x1 + 1.0f, ly + 2.0f);
+                                        for (int si = 0; si <= kRampSteps; ++si) {
+                                            float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
+                                            float px = clip_x1 + 1.0f + u * fin_w;
+                                            float gain = u;
+                                            switch (c.fade_in_shape) {
+                                                case sampling::FadeShape::Linear:      gain = u; break;
+                                                case sampling::FadeShape::Exponential: gain = std::pow(u, 2.8f); break;
+                                                case sampling::FadeShape::Logarithmic: gain = 1.0f - std::pow(1.0f - u, 2.8f); break;
+                                                case sampling::FadeShape::SCurve:      gain = u * u * (3.0f - 2.0f * u); break;
+                                                case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * u); break;
+                                            }
+                                            float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
+                                            poly_pts[si + 1] = ImVec2(px, py);
                                         }
-                                        float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
-                                        poly_pts[si + 1] = ImVec2(px, py);
-                                    }
-                                    draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, ImColor(245, 158, 11, 45));
+                                        ImColor poly_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
+                                        ImColor line_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
+                                        draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
 
-                                    for (int si = 0; si < kRampSteps; ++si) {
-                                        draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], ImColor(217, 119, 6, 220), 1.8f);
-                                    }
-
-                                    draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
-                                                                 ImVec2(hx + 4.0f, ly + 2.0f),
-                                                                 ImVec2(hx, ly + 9.0f),
-                                                                 ImColor(217, 119, 6, 255));
-                                } else {
-                                    // Subtle top-left indicator tab to drag new fade in
-                                    draw_list->AddTriangleFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                                 ImVec2(clip_x1 + 8.0f, ly + 2.0f),
-                                                                 ImVec2(clip_x1 + 1.0f, ly + 9.0f),
-                                                                 ImColor(180, 190, 205, 180));
-                                }
-
-                                // Fade Out Shaded Polygon & Grab Handle
-                                float fout_b = arranger_fade_out_bars[t];
-                                if (fout_b > 0.01f) {
-                                    float fout_w = fout_b * bar_w;
-                                    fout_w = std::min(fout_w, (clip_x2 - clip_x1) * 0.95f);
-                                    float hx = clip_x2 - fout_w;
-
-                                    constexpr int kRampSteps = 16;
-                                    ImVec2 poly_pts[kRampSteps + 2];
-                                    poly_pts[0] = ImVec2(clip_x2 - 1.0f, ly + 2.0f);
-                                    for (int si = 0; si <= kRampSteps; ++si) {
-                                        float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
-                                        float px = clip_x2 - 1.0f - (1.0f - u) * fout_w;
-                                        float gain = 1.0f - u;
-                                        switch (arranger_fade_out_shape[t]) {
-                                            case sampling::FadeShape::Linear:      gain = 1.0f - u; break;
-                                            case sampling::FadeShape::Exponential: gain = std::pow(1.0f - u, 2.8f); break;
-                                            case sampling::FadeShape::Logarithmic: gain = 1.0f - (1.0f - std::pow(u, 2.8f)); break;
-                                            case sampling::FadeShape::SCurve:      gain = 1.0f - (u * u * (3.0f - 2.0f * u)); break;
+                                        for (int si = 0; si < kRampSteps; ++si) {
+                                            draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
                                         }
-                                        float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
-                                        poly_pts[si + 1] = ImVec2(px, py);
+
+                                        draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
+                                                                     ImVec2(hx + 4.0f, ly + 2.0f),
+                                                                     ImVec2(hx, ly + 9.0f),
+                                                                     line_col);
+                                    } else {
+                                        draw_list->AddTriangleFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                                     ImVec2(clip_x1 + 8.0f, ly + 2.0f),
+                                                                     ImVec2(clip_x1 + 1.0f, ly + 9.0f),
+                                                                     ImColor(180, 190, 205, 180));
                                     }
-                                    draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, ImColor(245, 158, 11, 45));
 
-                                    for (int si = 0; si < kRampSteps; ++si) {
-                                        draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], ImColor(217, 119, 6, 220), 1.8f);
+                                    // Fade Out Shaded Polygon & Grab Handle
+                                    float fout_b = c.fade_out_bars;
+                                    if (fout_b > 0.01f) {
+                                        float fout_w = fout_b * bar_w;
+                                        fout_w = std::min(fout_w, (clip_x2 - clip_x1) * 0.95f);
+                                        float hx = clip_x2 - fout_w;
+
+                                        constexpr int kRampSteps = 16;
+                                        ImVec2 poly_pts[kRampSteps + 2];
+                                        poly_pts[0] = ImVec2(clip_x2 - 1.0f, ly + 2.0f);
+                                        for (int si = 0; si <= kRampSteps; ++si) {
+                                            float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
+                                            float px = clip_x2 - 1.0f - (1.0f - u) * fout_w;
+                                            float gain = 1.0f - u;
+                                            switch (c.fade_out_shape) {
+                                                case sampling::FadeShape::Linear:      gain = 1.0f - u; break;
+                                                case sampling::FadeShape::Exponential: gain = std::pow(1.0f - u, 2.8f); break;
+                                                case sampling::FadeShape::Logarithmic: gain = 1.0f - (1.0f - std::pow(u, 2.8f)); break;
+                                                case sampling::FadeShape::SCurve:      gain = 1.0f - (u * u * (3.0f - 2.0f * u)); break;
+                                                case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * (1.0f - u)); break;
+                                            }
+                                            float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
+                                            poly_pts[si + 1] = ImVec2(px, py);
+                                        }
+                                        ImColor poly_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
+                                        ImColor line_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
+                                        draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
+
+                                        for (int si = 0; si < kRampSteps; ++si) {
+                                            draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
+                                        }
+
+                                        draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
+                                                                     ImVec2(hx + 4.0f, ly + 2.0f),
+                                                                     ImVec2(hx, ly + 9.0f),
+                                                                     line_col);
+                                    } else {
+                                        draw_list->AddTriangleFilled(ImVec2(clip_x2 - 8.0f, ly + 2.0f),
+                                                                     ImVec2(clip_x2 - 1.0f, ly + 2.0f),
+                                                                     ImVec2(clip_x2 - 1.0f, ly + 9.0f),
+                                                                     ImColor(180, 190, 205, 180));
                                     }
 
-                                    draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
-                                                                 ImVec2(hx + 4.0f, ly + 2.0f),
-                                                                 ImVec2(hx, ly + 9.0f),
-                                                                 ImColor(217, 119, 6, 255));
-                                } else {
-                                    // Subtle top-right indicator tab to drag new fade out
-                                    draw_list->AddTriangleFilled(ImVec2(clip_x2 - 8.0f, ly + 2.0f),
-                                                                 ImVec2(clip_x2 - 1.0f, ly + 2.0f),
-                                                                 ImVec2(clip_x2 - 1.0f, ly + 9.0f),
-                                                                 ImColor(180, 190, 205, 180));
+                                    // Clip Title, Sononym Key & Slip/Fade Info
+                                    char clip_label[160];
+                                    auto desc = sampling::SampleAssetPool::instance().get_descriptor(
+                                        clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
+                                    const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
+
+                                    char extra_meta[64] = "";
+                                    if (c.offset_bars > 0.05f) {
+                                        std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", c.offset_bars);
+                                    }
+
+                                    if (std::strlen(key_str) > 0) {
+                                        std::snprintf(clip_label, sizeof(clip_label), "%s [%s]%s (%.1f-%.1fb)",
+                                                      c.name.c_str(), key_str, extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                    } else {
+                                        std::snprintf(clip_label, sizeof(clip_label), "%s%s (%.1f-%.1fb)",
+                                                      c.name.c_str(), extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                    }
+                                    draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
+                                                       is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
+                                                       clip_label);
+
+                                    // Trim Handles visual indicators on edges
+                                    draw_list->AddLine(ImVec2(clip_x1 + 4.0f, ly + 5.0f), ImVec2(clip_x1 + 4.0f, ly + lane_h - 5.0f),
+                                                       is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
+                                    draw_list->AddLine(ImVec2(clip_x2 - 4.0f, ly + 5.0f), ImVec2(clip_x2 - 4.0f, ly + lane_h - 5.0f),
+                                                       is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
+
+                                    // Auto-Crossfade Overlap Box with Adjacent Clip
+                                    if (c_idx + 1 < track_arranger_clips[t].size()) {
+                                        const auto& next_c = track_arranger_clips[t][c_idx + 1];
+                                        if (c.end_bar() > next_c.start_bar + 0.005f) {
+                                            float xf_x1 = canvas_pos.x + next_c.start_bar * bar_w;
+                                            float xf_x2 = canvas_pos.x + std::min(c.end_bar(), next_c.end_bar()) * bar_w;
+
+                                            draw_list->AddRectFilled(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
+                                                                     ImColor(147, 51, 234, 45), 2.0f);
+                                            draw_list->AddRect(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
+                                                               ImColor(168, 85, 247, 180), 2.0f, 0, 1.0f);
+
+                                            draw_list->AddLine(ImVec2(xf_x1, ly + 4.0f), ImVec2(xf_x2, ly + lane_h - 4.0f),
+                                                               ImColor(168, 85, 247, 220), 1.5f);
+                                            draw_list->AddLine(ImVec2(xf_x1, ly + lane_h - 4.0f), ImVec2(xf_x2, ly + 4.0f),
+                                                               ImColor(168, 85, 247, 220), 1.5f);
+
+                                            draw_list->AddText(ImVec2(xf_x1 + 3.0f, ly + lane_h * 0.5f - 6.0f),
+                                                               ImColor(126, 34, 206, 255), "[X-FADE]");
+                                        }
+                                    }
                                 }
-
-                                // Clip Title, Sononym Key & Slip/Fade Info
-                                char clip_label[160];
-                                auto desc = sampling::SampleAssetPool::instance().get_descriptor(
-                                    clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
-                                const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
-
-                                char extra_meta[64] = "";
-                                if (arranger_clip_offset_bars[t] > 0.05f) {
-                                    std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", arranger_clip_offset_bars[t]);
-                                }
-
-                                if (std::strlen(key_str) > 0) {
-                                    std::snprintf(clip_label, sizeof(clip_label), "%s [%s]%s (%.1f-%.1fb)",
-                                                  clip_ptr ? clip_ptr->name().c_str() : track_names[t],
-                                                  key_str, extra_meta, arranger_clip_start_bar[t] + 1.0f,
-                                                  arranger_clip_start_bar[t] + arranger_clip_len_bars[t] + 1.0f);
-                                } else {
-                                    std::snprintf(clip_label, sizeof(clip_label), "%s%s (%.1f-%.1fb)",
-                                                  clip_ptr ? clip_ptr->name().c_str() : track_names[t],
-                                                  extra_meta, arranger_clip_start_bar[t] + 1.0f,
-                                                  arranger_clip_start_bar[t] + arranger_clip_len_bars[t] + 1.0f);
-                                }
-                                draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
-                                                   is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
-                                                   clip_label);
-
-                                // Trim Handles visual indicators on edges
-                                draw_list->AddLine(ImVec2(clip_x1 + 4.0f, ly + 5.0f), ImVec2(clip_x1 + 4.0f, ly + lane_h - 5.0f),
-                                                   is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
-                                draw_list->AddLine(ImVec2(clip_x2 - 4.0f, ly + 5.0f), ImVec2(clip_x2 - 4.0f, ly + lane_h - 5.0f),
-                                                   is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160), 2.0f);
                             }
                         }
 
                         // Ghost Target Lane Rendering during Vertical Cross-Track Drag
                         if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0 &&
-                            g_arranger_drag_hover_track >= 0 && g_arranger_drag_hover_track != g_arranger_drag_track) {
+                            g_arranger_drag_hover_track >= 0 && g_arranger_drag_hover_track != g_arranger_drag_track &&
+                            g_arranger_drag_clip_idx >= 0 && g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
+                            const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
                             float gh_ly = canvas_pos.y + 20.0f + g_arranger_drag_hover_track * lane_h;
-                            float gh_x1 = canvas_pos.x + arranger_clip_start_bar[g_arranger_drag_track] * bar_w;
-                            float gh_x2 = gh_x1 + arranger_clip_len_bars[g_arranger_drag_track] * bar_w;
+                            float gh_x1 = canvas_pos.x + c.start_bar * bar_w;
+                            float gh_x2 = canvas_pos.x + c.end_bar() * bar_w;
 
                             draw_list->AddRectFilled(ImVec2(gh_x1, gh_ly + 2.0f),
                                                      ImVec2(gh_x2, gh_ly + lane_h - 2.0f),
@@ -1553,23 +1803,40 @@ int main(int argc, char** argv) {
                             if (m.y >= canvas_pos.y + 20.0f) {
                                 int hov_t = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
                                 if (hov_t >= 0 && hov_t < 4) {
-                                    float hov_x1 = canvas_pos.x + arranger_clip_start_bar[hov_t] * bar_w;
-                                    float hov_x2 = hov_x1 + arranger_clip_len_bars[hov_t] * bar_w;
-                                    if (m.x >= hov_x1 && m.x <= hov_x2) {
-                                        float fin_hx = hov_x1 + std::max(8.0f, arranger_fade_in_bars[hov_t] * bar_w);
-                                        float fout_hx = hov_x2 - std::max(8.0f, arranger_fade_out_bars[hov_t] * bar_w);
-                                        float top_y = canvas_pos.y + 20.0f + hov_t * lane_h;
+                                    for (size_t i = 0; i < track_arranger_clips[hov_t].size(); ++i) {
+                                        const auto& c = track_arranger_clips[hov_t][i];
+                                        float hov_x1 = canvas_pos.x + c.start_bar * bar_w;
+                                        float hov_x2 = canvas_pos.x + c.end_bar() * bar_w;
+                                        if (m.x >= hov_x1 && m.x <= hov_x2) {
+                                            if (g_arranger_tool == ArrangerTool::Razor) {
+                                                ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+                                                float rly = canvas_pos.y + 20.0f + hov_t * lane_h;
+                                                float cut_bar = (m.x - canvas_pos.x) / bar_w;
+                                                if (!ImGui::GetIO().KeyShift) cut_bar = std::round(cut_bar * 4.0f) / 4.0f;
+                                                float cut_x = canvas_pos.x + cut_bar * bar_w;
+                                                draw_list->AddLine(ImVec2(cut_x, rly + 1.0f), ImVec2(cut_x, rly + lane_h - 1.0f),
+                                                                   ImColor(239, 68, 68, 240), 2.0f);
+                                                char cut_lbl[32];
+                                                std::snprintf(cut_lbl, sizeof(cut_lbl), "CUT %.2fb", cut_bar + 1.0f);
+                                                draw_list->AddText(ImVec2(cut_x + 3.0f, rly + 3.0f), ImColor(220, 38, 38, 255), cut_lbl);
+                                            } else {
+                                                float fin_hx = hov_x1 + std::max(8.0f, c.fade_in_bars * bar_w);
+                                                float fout_hx = hov_x2 - std::max(8.0f, c.fade_out_bars * bar_w);
+                                                float top_y = canvas_pos.y + 20.0f + hov_t * lane_h;
 
-                                        if (m.y <= top_y + 12.0f && std::abs(m.x - fin_hx) < 8.0f) {
-                                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                                        } else if (m.y <= top_y + 12.0f && std::abs(m.x - fout_hx) < 8.0f) {
-                                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                                        } else if (std::abs(m.x - hov_x1) < 8.0f || std::abs(m.x - hov_x2) < 8.0f) {
-                                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                                        } else if (ImGui::GetIO().KeyAlt) {
-                                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
-                                        } else {
-                                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                                if (m.y <= top_y + 12.0f && std::abs(m.x - fin_hx) < 8.0f) {
+                                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                                } else if (m.y <= top_y + 12.0f && std::abs(m.x - fout_hx) < 8.0f) {
+                                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                                } else if (std::abs(m.x - hov_x1) < 8.0f || std::abs(m.x - hov_x2) < 8.0f) {
+                                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                                } else if (ImGui::GetIO().KeyAlt || g_arranger_tool == ArrangerTool::Slip) {
+                                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                                                } else {
+                                                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                                }
+                                            }
+                                            break;
                                         }
                                     }
                                 }
@@ -1588,62 +1855,89 @@ int main(int argc, char** argv) {
                                 int clicked_lane = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
                                 clicked_lane = std::clamp(clicked_lane, 0, 3);
                                 selected_track = clicked_lane;
-                                sync_track_clip(selected_track, track_clips[selected_track]);
 
-                                float cx1 = canvas_pos.x + arranger_clip_start_bar[clicked_lane] * bar_w;
-                                float cx2 = cx1 + arranger_clip_len_bars[clicked_lane] * bar_w;
-                                float top_y = canvas_pos.y + 20.0f + clicked_lane * lane_h;
+                                // Find which clip in this lane was clicked
+                                int clicked_clip_idx = -1;
+                                for (size_t i = 0; i < track_arranger_clips[clicked_lane].size(); ++i) {
+                                    float cx1 = canvas_pos.x + track_arranger_clips[clicked_lane][i].start_bar * bar_w;
+                                    float cx2 = canvas_pos.x + track_arranger_clips[clicked_lane][i].end_bar() * bar_w;
+                                    if (m.x >= cx1 && m.x <= cx2) {
+                                        clicked_clip_idx = static_cast<int>(i);
+                                        break;
+                                    }
+                                }
 
-                                if (m.x >= cx1 && m.x <= cx2) {
-                                    g_arranger_drag_track = clicked_lane;
-                                    g_arranger_drag_hover_track = clicked_lane;
-                                    g_arranger_drag_start_mouse_x = m.x;
-                                    g_arranger_drag_orig_start_bar = arranger_clip_start_bar[clicked_lane];
-                                    g_arranger_drag_orig_len_bars = arranger_clip_len_bars[clicked_lane];
-                                    g_arranger_drag_orig_offset_bars = arranger_clip_offset_bars[clicked_lane];
-                                    g_arranger_drag_orig_fade_in = arranger_fade_in_bars[clicked_lane];
-                                    g_arranger_drag_orig_fade_out = arranger_fade_out_bars[clicked_lane];
-
-                                    float fin_hx = cx1 + std::max(8.0f, arranger_fade_in_bars[clicked_lane] * bar_w);
-                                    float fout_hx = cx2 - std::max(8.0f, arranger_fade_out_bars[clicked_lane] * bar_w);
-
-                                    // Right click on fade handle cycles shape
-                                    bool handled_shape_click = false;
-                                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                                        if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
-                                            arranger_fade_in_shape[clicked_lane] = static_cast<sampling::FadeShape>((static_cast<int>(arranger_fade_in_shape[clicked_lane]) + 1) % 4);
-                                            auto clip = track_clips[clicked_lane];
-                                            if (clip) {
-                                                clip->set_fade_in(arranger_fade_in_bars[clicked_lane] * 4.0f, arranger_fade_in_shape[clicked_lane]);
-                                                clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[clicked_lane] * 4.0f);
-                                            }
-                                            std::snprintf(status_toast, sizeof(status_toast), "TRACK %d FADE-IN SHAPE: %d", clicked_lane + 1, static_cast<int>(arranger_fade_in_shape[clicked_lane]));
-                                            handled_shape_click = true;
-                                        } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
-                                            arranger_fade_out_shape[clicked_lane] = static_cast<sampling::FadeShape>((static_cast<int>(arranger_fade_out_shape[clicked_lane]) + 1) % 4);
-                                            auto clip = track_clips[clicked_lane];
-                                            if (clip) {
-                                                clip->set_fade_out(arranger_fade_out_bars[clicked_lane] * 4.0f, arranger_fade_out_shape[clicked_lane]);
-                                                clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[clicked_lane] * 4.0f);
-                                            }
-                                            std::snprintf(status_toast, sizeof(status_toast), "TRACK %d FADE-OUT SHAPE: %d", clicked_lane + 1, static_cast<int>(arranger_fade_out_shape[clicked_lane]));
-                                            handled_shape_click = true;
-                                        }
+                                if (clicked_clip_idx >= 0) {
+                                    g_selected_clip_idx = clicked_clip_idx;
+                                    auto& c = track_arranger_clips[clicked_lane][clicked_clip_idx];
+                                    if (c.clip) {
+                                        sync_track_clip(selected_track, c.clip);
                                     }
 
-                                    if (!handled_shape_click) {
-                                        if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
-                                            g_arranger_drag_mode = ArrangerDragMode::FadeIn;
-                                        } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
-                                            g_arranger_drag_mode = ArrangerDragMode::FadeOut;
-                                        } else if (std::abs(m.x - cx1) < 8.0f) {
-                                            g_arranger_drag_mode = ArrangerDragMode::TrimStart;
-                                        } else if (std::abs(m.x - cx2) < 8.0f) {
-                                            g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
-                                        } else if (ImGui::GetIO().KeyAlt) {
-                                            g_arranger_drag_mode = ArrangerDragMode::SlipEdit;
+                                    if (g_arranger_tool == ArrangerTool::Razor) {
+                                        // Razor split at mouse position
+                                        float click_bar = (m.x - canvas_pos.x) / bar_w;
+                                        if (!ImGui::GetIO().KeyShift) {
+                                            click_bar = std::round(click_bar * 4.0f) / 4.0f; // 1-beat snap
+                                        }
+                                        if (click_bar > c.start_bar + 0.05f && click_bar < c.end_bar() - 0.05f) {
+                                            Track* trk = (clicked_lane == 0) ? trk0 : ((clicked_lane == 1) ? trk1 : ((clicked_lane == 2) ? trk2 : trk3));
+                                            if (trk) {
+                                                trk->arranger().split_clip_at_bar(c.id, click_bar, bpm, kSampleRate);
+                                                track_arranger_clips[clicked_lane] = trk->arranger().clips();
+                                                std::snprintf(status_toast, sizeof(status_toast), "RAZOR SPLIT '%s' AT BAR %.2f", c.name.c_str(), click_bar + 1.0f);
+                                            }
                                         } else {
-                                            g_arranger_drag_mode = ArrangerDragMode::MoveClip;
+                                            std::snprintf(status_toast, sizeof(status_toast), "CANNOT SPLIT AT BAR %.2f (TOO CLOSE TO CLIP BOUNDARY)", click_bar + 1.0f);
+                                        }
+                                    } else {
+                                        // Select / Move / Trim / Fade / Slip
+                                        g_arranger_drag_track = clicked_lane;
+                                        g_arranger_drag_clip_idx = clicked_clip_idx;
+                                        g_arranger_drag_hover_track = clicked_lane;
+                                        g_arranger_drag_start_mouse_x = m.x;
+                                        g_arranger_drag_orig_start_bar = c.start_bar;
+                                        g_arranger_drag_orig_len_bars = c.len_bars;
+                                        g_arranger_drag_orig_offset_bars = c.offset_bars;
+                                        g_arranger_drag_orig_fade_in = c.fade_in_bars;
+                                        g_arranger_drag_orig_fade_out = c.fade_out_bars;
+
+                                        float cx1 = canvas_pos.x + c.start_bar * bar_w;
+                                        float cx2 = canvas_pos.x + c.end_bar() * bar_w;
+                                        float top_y = canvas_pos.y + 20.0f + clicked_lane * lane_h;
+                                        float fin_hx = cx1 + std::max(8.0f, c.fade_in_bars * bar_w);
+                                        float fout_hx = cx2 - std::max(8.0f, c.fade_out_bars * bar_w);
+
+                                        // Right-click on fade handle cycles fade curvature shape (0..4)
+                                        bool handled_shape_click = false;
+                                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                                            if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
+                                                c.fade_in_shape = static_cast<sampling::FadeShape>((static_cast<int>(c.fade_in_shape) + 1) % 5);
+                                                sync_arranger_to_mixer(clicked_lane);
+                                                std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' FADE-IN SHAPE: %d", c.name.c_str(), static_cast<int>(c.fade_in_shape));
+                                                handled_shape_click = true;
+                                            } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
+                                                c.fade_out_shape = static_cast<sampling::FadeShape>((static_cast<int>(c.fade_out_shape) + 1) % 5);
+                                                sync_arranger_to_mixer(clicked_lane);
+                                                std::snprintf(status_toast, sizeof(status_toast), "CLIP '%s' FADE-OUT SHAPE: %d", c.name.c_str(), static_cast<int>(c.fade_out_shape));
+                                                handled_shape_click = true;
+                                            }
+                                        }
+
+                                        if (!handled_shape_click) {
+                                            if (m.y <= top_y + 14.0f && std::abs(m.x - fin_hx) < 10.0f) {
+                                                g_arranger_drag_mode = ArrangerDragMode::FadeIn;
+                                            } else if (m.y <= top_y + 14.0f && std::abs(m.x - fout_hx) < 10.0f) {
+                                                g_arranger_drag_mode = ArrangerDragMode::FadeOut;
+                                            } else if (std::abs(m.x - cx1) < 8.0f) {
+                                                g_arranger_drag_mode = ArrangerDragMode::TrimStart;
+                                            } else if (std::abs(m.x - cx2) < 8.0f) {
+                                                g_arranger_drag_mode = ArrangerDragMode::TrimEnd;
+                                            } else if (ImGui::GetIO().KeyAlt || g_arranger_tool == ArrangerTool::Slip) {
+                                                g_arranger_drag_mode = ArrangerDragMode::SlipEdit;
+                                            } else {
+                                                g_arranger_drag_mode = ArrangerDragMode::MoveClip;
+                                            }
                                         }
                                     }
                                 } else {
@@ -1656,85 +1950,78 @@ int main(int argc, char** argv) {
                                 }
                             }
                         } else if (is_active) {
-                            if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_start = g_arranger_drag_orig_start_bar + delta_bars;
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_start = std::round(new_start * 4.0f) / 4.0f; // 1 beat snap (1/4 bar)
-                                }
-                                float max_start = static_cast<float>(kTotalBars) - arranger_clip_len_bars[g_arranger_drag_track];
-                                new_start = std::clamp(new_start, 0.0f, max_start);
-                                arranger_clip_start_bar[g_arranger_drag_track] = new_start;
+                            if (g_arranger_drag_track >= 0 && g_arranger_drag_clip_idx >= 0 &&
+                                g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
+                                auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
 
-                                // Update hover track lane for cross-track dragging
-                                int cur_lane = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
-                                g_arranger_drag_hover_track = std::clamp(cur_lane, 0, 3);
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::SlipEdit && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_offset = std::max(0.0f, g_arranger_drag_orig_offset_bars - delta_bars);
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_offset = std::round(new_offset * 16.0f) / 16.0f; // 1/16th bar snap
-                                }
-                                arranger_clip_offset_bars[g_arranger_drag_track] = new_offset;
-                                auto clip = track_clips[g_arranger_drag_track];
-                                if (clip) {
-                                    double bpm = (clip->bpm() > 10.0) ? clip->bpm() : 120.0;
-                                    double dur_sec = (new_offset * 4.0 / bpm) * 60.0;
-                                    uint32_t off_f = static_cast<uint32_t>(dur_sec * clip->sample_rate());
-                                    clip->set_start_offset_frames(off_f);
-                                }
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::FadeIn && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_fade_in = std::clamp(g_arranger_drag_orig_fade_in + delta_bars, 0.0f,
-                                                               arranger_clip_len_bars[g_arranger_drag_track] - arranger_fade_out_bars[g_arranger_drag_track]);
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_fade_in = std::round(new_fade_in * 16.0f) / 16.0f;
-                                }
-                                arranger_fade_in_bars[g_arranger_drag_track] = new_fade_in;
-                                auto clip = track_clips[g_arranger_drag_track];
-                                if (clip) {
-                                    clip->set_fade_in(new_fade_in * 4.0f, arranger_fade_in_shape[g_arranger_drag_track]);
-                                    clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[g_arranger_drag_track] * 4.0f);
-                                }
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::FadeOut && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_fade_out = std::clamp(g_arranger_drag_orig_fade_out - delta_bars, 0.0f,
-                                                                arranger_clip_len_bars[g_arranger_drag_track] - arranger_fade_in_bars[g_arranger_drag_track]);
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_fade_out = std::round(new_fade_out * 16.0f) / 16.0f;
-                                }
-                                arranger_fade_out_bars[g_arranger_drag_track] = new_fade_out;
-                                auto clip = track_clips[g_arranger_drag_track];
-                                if (clip) {
-                                    clip->set_fade_out(new_fade_out * 4.0f, arranger_fade_out_shape[g_arranger_drag_track]);
-                                    clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[g_arranger_drag_track] * 4.0f);
-                                }
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::TrimStart && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_start = g_arranger_drag_orig_start_bar + delta_bars;
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_start = std::round(new_start * 4.0f) / 4.0f;
-                                }
-                                float clip_end_bar = g_arranger_drag_orig_start_bar + g_arranger_drag_orig_len_bars;
-                                new_start = std::clamp(new_start, 0.0f, clip_end_bar - 0.25f);
-                                arranger_clip_start_bar[g_arranger_drag_track] = new_start;
-                                arranger_clip_len_bars[g_arranger_drag_track] = clip_end_bar - new_start;
-                                auto clip = track_clips[g_arranger_drag_track];
-                                if (clip) {
-                                    clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[g_arranger_drag_track] * 4.0f);
-                                }
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::TrimEnd && g_arranger_drag_track >= 0) {
-                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
-                                float new_len = g_arranger_drag_orig_len_bars + delta_bars;
-                                if (!ImGui::GetIO().KeyShift) {
-                                    new_len = std::round(new_len * 4.0f) / 4.0f;
-                                }
-                                float max_len = static_cast<float>(kTotalBars) - arranger_clip_start_bar[g_arranger_drag_track];
-                                new_len = std::clamp(new_len, 0.25f, max_len);
-                                arranger_clip_len_bars[g_arranger_drag_track] = new_len;
-                                auto clip = track_clips[g_arranger_drag_track];
-                                if (clip) {
-                                    clip->apply_fades_to_gain_envelope(arranger_clip_len_bars[g_arranger_drag_track] * 4.0f);
+                                if (g_arranger_drag_mode == ArrangerDragMode::MoveClip) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_start = g_arranger_drag_orig_start_bar + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_start = std::round(new_start * 4.0f) / 4.0f; // 1 beat snap (1/4 bar)
+                                    }
+                                    float max_start = static_cast<float>(kTotalBars) - c.len_bars;
+                                    new_start = std::clamp(new_start, 0.0f, max_start);
+                                    c.start_bar = new_start;
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
+
+                                    // Update hover track lane for cross-track dragging
+                                    int cur_lane = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
+                                    g_arranger_drag_hover_track = std::clamp(cur_lane, 0, 3);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::SlipEdit) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_offset = std::max(0.0f, g_arranger_drag_orig_offset_bars - delta_bars);
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_offset = std::round(new_offset * 16.0f) / 16.0f; // 1/16th bar snap
+                                    }
+                                    c.offset_bars = new_offset;
+                                    double clip_bpm = (c.clip && c.clip->bpm() > 10.0) ? c.clip->bpm() : 120.0;
+                                    uint32_t clip_sr = c.clip ? c.clip->sample_rate() : 48000;
+                                    double dur_sec = (new_offset * 4.0 / clip_bpm) * 60.0;
+                                    c.start_offset_frames = static_cast<uint32_t>(dur_sec * static_cast<double>(clip_sr));
+                                    if (c.clip && c.clip->num_frames() > 0) {
+                                        c.start_offset_frames %= c.clip->num_frames();
+                                    }
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::FadeIn) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_fade_in = std::clamp(g_arranger_drag_orig_fade_in + delta_bars, 0.0f,
+                                                                   c.len_bars - c.fade_out_bars);
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_fade_in = std::round(new_fade_in * 16.0f) / 16.0f;
+                                    }
+                                    c.fade_in_bars = new_fade_in;
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::FadeOut) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_fade_out = std::clamp(g_arranger_drag_orig_fade_out - delta_bars, 0.0f,
+                                                                    c.len_bars - c.fade_in_bars);
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_fade_out = std::round(new_fade_out * 16.0f) / 16.0f;
+                                    }
+                                    c.fade_out_bars = new_fade_out;
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::TrimStart) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_start = g_arranger_drag_orig_start_bar + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_start = std::round(new_start * 4.0f) / 4.0f;
+                                    }
+                                    float clip_end_bar = g_arranger_drag_orig_start_bar + g_arranger_drag_orig_len_bars;
+                                    new_start = std::clamp(new_start, 0.0f, clip_end_bar - 0.25f);
+                                    c.start_bar = new_start;
+                                    c.len_bars = clip_end_bar - new_start;
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
+                                } else if (g_arranger_drag_mode == ArrangerDragMode::TrimEnd) {
+                                    float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                    float new_len = g_arranger_drag_orig_len_bars + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) {
+                                        new_len = std::round(new_len * 4.0f) / 4.0f;
+                                    }
+                                    float max_len = static_cast<float>(kTotalBars) - c.start_bar;
+                                    new_len = std::clamp(new_len, 0.25f, max_len);
+                                    c.len_bars = new_len;
+                                    sync_arranger_to_mixer(g_arranger_drag_track);
                                 }
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
@@ -1750,28 +2037,35 @@ int main(int argc, char** argv) {
                                 playhead_seconds = ratio * loop_length_seconds;
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.end_scrub(target_sample);
-                            } else if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0 &&
-                                       g_arranger_drag_hover_track >= 0 && g_arranger_drag_hover_track != g_arranger_drag_track) {
-                                // Vertical Cross-Track State Swap
-                                int src = g_arranger_drag_track;
-                                int dst = g_arranger_drag_hover_track;
-                                std::swap(track_clips[src], track_clips[dst]);
-                                std::swap(track_clips_orig[src], track_clips_orig[dst]);
-                                std::swap(arranger_clip_start_bar[src], arranger_clip_start_bar[dst]);
-                                std::swap(arranger_clip_len_bars[src], arranger_clip_len_bars[dst]);
-                                std::swap(arranger_clip_offset_bars[src], arranger_clip_offset_bars[dst]);
-                                std::swap(arranger_fade_in_bars[src], arranger_fade_in_bars[dst]);
-                                std::swap(arranger_fade_out_bars[src], arranger_fade_out_bars[dst]);
-                                std::swap(arranger_fade_in_shape[src], arranger_fade_in_shape[dst]);
-                                std::swap(arranger_fade_out_shape[src], arranger_fade_out_shape[dst]);
-
-                                sync_track_clip(src, track_clips[src]);
-                                sync_track_clip(dst, track_clips[dst]);
-                                selected_track = dst;
-                                std::snprintf(status_toast, sizeof(status_toast), "CROSS-TRACK SWAP: TRACK %d <-> TRACK %d", src + 1, dst + 1);
+                            } else if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0) {
+                                int src_t = g_arranger_drag_track;
+                                int dst_t = g_arranger_drag_hover_track;
+                                if (dst_t >= 0 && dst_t != src_t && g_arranger_drag_clip_idx >= 0 &&
+                                    g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[src_t].size())) {
+                                    // Move clip to new track
+                                    auto clip_to_move = track_arranger_clips[src_t][g_arranger_drag_clip_idx];
+                                    track_arranger_clips[src_t].erase(track_arranger_clips[src_t].begin() + g_arranger_drag_clip_idx);
+                                    track_arranger_clips[dst_t].push_back(clip_to_move);
+                                    sync_arranger_to_mixer(src_t);
+                                    sync_arranger_to_mixer(dst_t);
+                                    Track* dst_trk = (dst_t == 0) ? trk0 : ((dst_t == 1) ? trk1 : ((dst_t == 2) ? trk2 : trk3));
+                                    if (dst_trk) {
+                                        track_arranger_clips[dst_t] = dst_trk->arranger().clips();
+                                    }
+                                    selected_track = dst_t;
+                                    g_selected_clip_idx = static_cast<int>(track_arranger_clips[dst_t].size() - 1);
+                                    std::snprintf(status_toast, sizeof(status_toast), "MOVED CLIP '%s' TO TRACK %d", clip_to_move.name.c_str(), dst_t + 1);
+                                } else {
+                                    sync_arranger_to_mixer(src_t);
+                                    Track* src_trk = (src_t == 0) ? trk0 : ((src_t == 1) ? trk1 : ((src_t == 2) ? trk2 : trk3));
+                                    if (src_trk) {
+                                        track_arranger_clips[src_t] = src_trk->arranger().clips();
+                                    }
+                                }
                             }
                             g_arranger_drag_mode = ArrangerDragMode::None;
                             g_arranger_drag_track = -1;
+                            g_arranger_drag_clip_idx = -1;
                             g_arranger_drag_hover_track = -1;
                         }
 

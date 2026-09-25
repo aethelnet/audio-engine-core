@@ -12350,6 +12350,277 @@ void test_arranger_slip_editing_cross_track_and_fade_ramps() {
     std::cout << "  -> Arranger Slip-Editing, Cross-Track & Fade Ramps: ALL PASSED" << std::endl;
 }
 
+void test_arranger_multi_clip_razor_split_and_auto_crossfades() {
+    std::cout << "[TEST 84] Running Arranger Multi-Clip Sequencing, Razor Split & Auto-Crossfades..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+    using namespace audio_core::sequencer;
+
+    // ========================================================================
+    // Part A: Multi-Clip Sequencing & Boundary Triggering
+    // ========================================================================
+    {
+        sequencer::ArrangerTrack track;
+        TEST_CHECK(track.is_empty());
+        TEST_CHECK(track.num_clips() == 0);
+
+        auto clip1 = std::make_shared<AudioClip>("kick_loop.wav", 48000, 2, 48000);
+        auto clip2 = std::make_shared<AudioClip>("synth_lead.wav", 48000, 2, 48000);
+        clip1->set_bpm(120.0);
+        clip2->set_bpm(120.0);
+
+        for (uint32_t i = 0; i < 48000; ++i) {
+            clip1->set_sample(0, i, 0.4f);
+            clip1->set_sample(1, i, 0.4f);
+            clip2->set_sample(0, i, 0.8f);
+            clip2->set_sample(1, i, 0.8f);
+        }
+
+        // Clip 1 placed at bars [0.0, 2.0]
+        // Silence at bars [2.0, 3.0]
+        // Clip 2 placed at bars [3.0, 5.0]
+        uint32_t id1 = track.add_clip(sequencer::ArrangerClipInstance{
+            .name = "Kick",
+            .clip = clip1,
+            .start_bar = 0.0f,
+            .len_bars = 2.0f,
+            .offset_bars = 0.0f
+        });
+        uint32_t id2 = track.add_clip(sequencer::ArrangerClipInstance{
+            .name = "Lead",
+            .clip = clip2,
+            .start_bar = 3.0f,
+            .len_bars = 2.0f,
+            .offset_bars = 0.0f
+        });
+
+        TEST_CHECK(!track.is_empty());
+        TEST_CHECK(track.num_clips() == 2);
+        TEST_CHECK(id1 != 0 && id2 != 0 && id1 != id2);
+
+        // Verify audio rendering at each region
+        std::vector<float> buf_l(256, 0.0f);
+        std::vector<float> buf_r(256, 0.0f);
+
+        // 1. Render during bar 1.0 (inside Clip 1): 4.0 total beats
+        track.render(buf_l.data(), buf_r.data(), 256, 48000, 120.0, true, 4.0);
+        for (int i = 0; i < 256; ++i) {
+            TEST_CHECK(std::abs(buf_l[i] - 0.4f) < 1e-4f);
+            TEST_CHECK(std::abs(buf_r[i] - 0.4f) < 1e-4f);
+        }
+
+        // 2. Render during bar 2.5 (gap silence between Clip 1 and Clip 2): 10.0 total beats
+        track.render(buf_l.data(), buf_r.data(), 256, 48000, 120.0, true, 10.0);
+        for (int i = 0; i < 256; ++i) {
+            TEST_CHECK(buf_l[i] == 0.0f);
+            TEST_CHECK(buf_r[i] == 0.0f);
+        }
+
+        // 3. Render during bar 4.0 (inside Clip 2): 16.0 total beats
+        track.render(buf_l.data(), buf_r.data(), 256, 48000, 120.0, true, 16.0);
+        for (int i = 0; i < 256; ++i) {
+            TEST_CHECK(std::abs(buf_l[i] - 0.8f) < 1e-4f);
+            TEST_CHECK(std::abs(buf_r[i] - 0.8f) < 1e-4f);
+        }
+
+        std::cout << "  -> Part A (Arranger Multi-Clip Sequencing & Gap Silence): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: Non-Destructive Razor Split & Sample Continuity
+    // ========================================================================
+    {
+        sequencer::ArrangerTrack track;
+
+        // Create ramp audio clip: sample[i] = (float)i / 96000.0f
+        const uint32_t kFrames = 96000;
+        auto ramp_clip = std::make_shared<AudioClip>("ramp.wav", 48000, 2, kFrames);
+        ramp_clip->set_bpm(120.0);
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            float val = static_cast<float>(i) / static_cast<float>(kFrames);
+            ramp_clip->set_sample(0, i, val);
+            ramp_clip->set_sample(1, i, val);
+        }
+
+        uint32_t orig_id = track.add_clip(sequencer::ArrangerClipInstance{
+            .name = "Ramp",
+            .clip = ramp_clip,
+            .start_bar = 0.0f,
+            .len_bars = 4.0f,
+            .offset_bars = 0.0f,
+            .start_offset_frames = 0
+        });
+
+        // Split clip at bar 1.5
+        auto [c1_id, c2_id] = track.split_clip_at_bar(orig_id, 1.5f, 120.0, 48000);
+        TEST_CHECK(c1_id != 0 && c2_id != 0);
+        TEST_CHECK(track.num_clips() == 2);
+
+        const auto* c1 = track.find_clip(c1_id);
+        const auto* c2 = track.find_clip(c2_id);
+        TEST_CHECK(c1 != nullptr && c2 != nullptr);
+        TEST_CHECK(std::abs(c1->start_bar - 0.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c1->len_bars - 1.5f) < 1e-4f);
+        TEST_CHECK(std::abs(c2->start_bar - 1.5f) < 1e-4f);
+        TEST_CHECK(std::abs(c2->len_bars - 2.5f) < 1e-4f);
+
+        // Frame offset check: 1.5 bars at 120 bpm: (1.5 * 4 / 120) * 60 = 3.0 sec
+        // 3.0 sec * 48000 = 144000 frames. Modulo kFrames (96000): 48000 frames
+        uint32_t expected_offset = static_cast<uint32_t>(3.0 * 48000.0) % kFrames;
+        TEST_CHECK(c2->start_offset_frames == expected_offset);
+
+        // Render audio across the split boundary:
+        std::vector<float> split_render_l(512, 0.0f);
+        std::vector<float> split_render_r(512, 0.0f);
+
+        // Split occurs at beat 6.0 (1.5 bars). Render 256 samples before to 256 samples after:
+        double start_beat = 6.0 - (256.0 * 2.0 / 48000.0);
+        track.render(split_render_l.data(), split_render_r.data(), 512, 48000, 120.0, true, start_beat);
+
+        for (int i = 1; i < 512; ++i) {
+            float diff = split_render_l[i] - split_render_l[i - 1];
+            TEST_CHECK(diff > 0.0f); // strictly increasing ramp
+            TEST_CHECK(diff < 0.001f); // no sudden jump or click
+        }
+
+        std::cout << "  -> Part B (Non-Destructive Razor Split & Sample Continuity): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: Overlap Auto-Crossfades & Equal-Power Energy Invariant
+    // ========================================================================
+    {
+        sequencer::ArrangerTrack track;
+
+        auto clip_a = std::make_shared<AudioClip>("track_a.wav", 48000, 2, 96000);
+        auto clip_b = std::make_shared<AudioClip>("track_b.wav", 48000, 2, 96000);
+        clip_a->set_bpm(120.0);
+        clip_b->set_bpm(120.0);
+
+        for (uint32_t i = 0; i < 96000; ++i) {
+            clip_a->set_sample(0, i, 1.0f);
+            clip_a->set_sample(1, i, 1.0f);
+            clip_b->set_sample(0, i, 1.0f);
+            clip_b->set_sample(1, i, 1.0f);
+        }
+
+        // Clip A: bars [0.0, 3.0]
+        // Clip B: bars [2.0, 5.0]
+        // Overlap: 1.0 bar interval [2.0, 3.0]
+        uint32_t id_a = track.add_clip(sequencer::ArrangerClipInstance{
+            .name = "Clip A",
+            .clip = clip_a,
+            .start_bar = 0.0f,
+            .len_bars = 3.0f
+        });
+        uint32_t id_b = track.add_clip(sequencer::ArrangerClipInstance{
+            .name = "Clip B",
+            .clip = clip_b,
+            .start_bar = 2.0f,
+            .len_bars = 3.0f
+        });
+
+        const auto* c_a = track.find_clip(id_a);
+        const auto* c_b = track.find_clip(id_b);
+        TEST_CHECK(c_a != nullptr && c_b != nullptr);
+        TEST_CHECK(c_a->is_auto_crossfade_out);
+        TEST_CHECK(c_b->is_auto_crossfade_in);
+        TEST_CHECK(std::abs(c_a->fade_out_bars - 1.0f) < 1e-4f);
+        TEST_CHECK(std::abs(c_b->fade_in_bars - 1.0f) < 1e-4f);
+        TEST_CHECK(c_a->fade_out_shape == FadeShape::EqualPower);
+        TEST_CHECK(c_b->fade_in_shape == FadeShape::EqualPower);
+
+        // Verify Equal-Power energy invariant across the crossover:
+        // g_a^2(u) + g_b^2(u) == 1.0 for all u in [0, 1]
+        for (int step = 0; step <= 100; ++step) {
+            float bar = 2.0f + static_cast<float>(step) / 100.0f;
+            float g_a = c_a->evaluate_gain_at_bar(bar);
+            float g_b = c_b->evaluate_gain_at_bar(bar);
+
+            float power_sum = (g_a * g_a) + (g_b * g_b);
+            TEST_CHECK(std::abs(power_sum - 1.0f) < 1e-5f);
+        }
+
+        // Render audio across the crossover and verify sum of audio
+        std::vector<float> xover_l(1024, 0.0f);
+        std::vector<float> xover_r(1024, 0.0f);
+        track.render(xover_l.data(), xover_r.data(), 1024, 48000, 120.0, true, 9.0);
+
+        for (int i = 0; i < 1024; ++i) {
+            TEST_CHECK(!std::isnan(xover_l[i]) && !std::isinf(xover_l[i]));
+            TEST_CHECK(!std::isnan(xover_r[i]) && !std::isinf(xover_r[i]));
+            TEST_CHECK(xover_l[i] >= 0.99f && xover_l[i] <= 1.42f);
+        }
+
+        std::cout << "  -> Part C (Overlap Auto-Crossfades & Equal-Power Invariant): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part D: Slip-Editing, Per-Clip Fades & MixerGraph Integration
+    // ========================================================================
+    {
+        MixerGraph mixer(256);
+        auto trk0 = mixer.add_track("Track 1 - MultiClip");
+
+        auto clip = std::make_shared<AudioClip>("multiclip.wav", 48000, 2, 96000);
+        clip->set_bpm(120.0);
+        for (uint32_t i = 0; i < 96000; ++i) {
+            clip->set_sample(0, i, 0.5f);
+            clip->set_sample(1, i, 0.5f);
+        }
+
+        uint32_t id1 = trk0->arranger().add_clip(sequencer::ArrangerClipInstance{
+            .name = "Segment 1",
+            .clip = clip,
+            .start_bar = 0.0f,
+            .len_bars = 2.0f,
+            .fade_in_bars = 0.5f,
+            .fade_in_shape = FadeShape::SCurve
+        });
+
+        uint32_t id2 = trk0->arranger().add_clip(sequencer::ArrangerClipInstance{
+            .name = "Segment 2",
+            .clip = clip,
+            .start_bar = 2.0f,
+            .len_bars = 2.0f,
+            .fade_out_bars = 0.5f,
+            .fade_out_shape = FadeShape::Exponential
+        });
+
+        TEST_CHECK(trk0->has_arranger_clips());
+        TEST_CHECK(trk0->arranger().num_clips() == 2);
+        TEST_CHECK(id1 != 0 && id2 != 0);
+
+        // Test slip editing on Segment 2 (slip by 0.5 bars = 1.0 sec = 48000 frames)
+        bool slip_ok = trk0->arranger().slip_edit_clip(id2, 0.5f, 120.0);
+        TEST_CHECK(slip_ok);
+        const auto* c2 = trk0->arranger().find_clip(id2);
+        TEST_CHECK(c2 != nullptr);
+        TEST_CHECK(std::abs(c2->offset_bars - 0.5f) < 1e-4f);
+        TEST_CHECK(c2->start_offset_frames == 48000);
+
+        // Render audio through entire MixerGraph
+        AudioBuffer master_out(2, 256);
+        auto master_view = master_out.view();
+        mixer.clock().set_playing(true);
+
+        for (int b = 0; b < 16; ++b) {
+            mixer.render(master_view);
+            const float* out_l = master_out.channel(0);
+            const float* out_r = master_out.channel(1);
+            for (int s = 0; s < 256; ++s) {
+                TEST_CHECK(!std::isnan(out_l[s]) && !std::isinf(out_l[s]));
+                TEST_CHECK(!std::isnan(out_r[s]) && !std::isinf(out_r[s]));
+            }
+        }
+
+        std::cout << "  -> Part D (Slip-Editing & MixerGraph Arranger Timeline): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Arranger Multi-Clip Sequencing, Razor Split & Auto-Crossfades: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -12438,6 +12709,7 @@ int main() {
     test_realtime_scheduler_and_bounded_event_budget();
     test_sample_asset_management_and_project_bundle();
     test_arranger_slip_editing_cross_track_and_fade_ramps();
+    test_arranger_multi_clip_razor_split_and_auto_crossfades();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

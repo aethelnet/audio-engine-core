@@ -24,7 +24,8 @@ enum class FadeShape : uint8_t {
     Linear      = 0,
     Exponential = 1,
     Logarithmic = 2,
-    SCurve      = 3
+    SCurve      = 3,
+    EqualPower  = 4
 };
 
 struct FadeConfig {
@@ -679,6 +680,7 @@ public:
                 case FadeShape::Logarithmic:
                     return {routing::NodeMode::Corner, (std::abs(user_tension) > 1e-4f) ? user_tension : (is_out ? 0.6f : -0.6f)};
                 case FadeShape::SCurve:
+                case FadeShape::EqualPower:
                     return {routing::NodeMode::Smooth, user_tension};
             }
             return {routing::NodeMode::Corner, 0.0f};

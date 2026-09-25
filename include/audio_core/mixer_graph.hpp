@@ -13,6 +13,7 @@
 #include "audio_core/clock/timeline_clock.hpp"
 #include "audio_core/sequencer/step_sequencer.hpp"
 #include "audio_core/sequencer/clip_launcher.hpp"
+#include "audio_core/sequencer/arranger_track.hpp"
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/dsp/multichannel_bus.hpp"
 #include "audio_core/dsp/kinetic_meter.hpp"
@@ -541,6 +542,11 @@ public:
         return m_launcher.is_active();
     }
 
+    // Multi-Clip Arranger Timeline Integration
+    [[nodiscard]] sequencer::ArrangerTrack& arranger() noexcept { return m_arranger; }
+    [[nodiscard]] const sequencer::ArrangerTrack& arranger() const noexcept { return m_arranger; }
+    [[nodiscard]] bool has_arranger_clips() const noexcept { return !m_arranger.is_empty(); }
+
     void set_input_mode(TrackInputMode mode) noexcept { m_input_mode.store(mode, std::memory_order_relaxed); }
     [[nodiscard]] TrackInputMode input_mode() const noexcept { return m_input_mode.load(std::memory_order_relaxed); }
 
@@ -609,6 +615,12 @@ public:
                     left[f] += tmp_l[f];
                     right[f] += tmp_r[f];
                 }
+            } else if (m_arranger.is_enabled() && !m_arranger.is_empty()) {
+                m_arranger.render(tmp_l, tmp_r, f_proc, clock);
+                for (uint32_t f = 0; f < f_proc; ++f) {
+                    left[f] += tmp_l[f];
+                    right[f] += tmp_r[f];
+                }
             } else if (m_clip) {
                 if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
                     if (clock.is_scrubbing()) {
@@ -638,9 +650,11 @@ public:
             return;
         }
 
-        // Arranger fallback
+        // Arranger timeline / fallback
         if (is_sequencer_enabled()) {
             m_sequencer->render(left, right, frames, clock, boundary_events);
+        } else if (m_arranger.is_enabled() && !m_arranger.is_empty()) {
+            m_arranger.render(left, right, frames, clock);
         } else if (m_clip) {
             if (m_sync_to_transport.load(std::memory_order_relaxed) && !clock.is_playing()) {
                 if (clock.is_scrubbing()) {
@@ -867,6 +881,7 @@ private:
     std::shared_ptr<sequencer::StepSequencer> m_sequencer{nullptr};
     std::atomic<bool> m_sequencer_enabled{false};
     sequencer::ClipLauncher m_launcher;
+    sequencer::ArrangerTrack m_arranger;
 
     routing::AutomationCurve m_gain_curve;
     std::atomic<bool> m_gain_automation_enabled{false};
