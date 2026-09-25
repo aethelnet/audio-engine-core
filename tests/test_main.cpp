@@ -67,6 +67,9 @@
 #include "audio_core/threading/audio_worker_pool.hpp"
 #include "audio_core/sampling/sample_asset_manager.hpp"
 #include "audio_core/undo/undo_manager.hpp"
+#include "audio_core/sequencer/tracker_timing.hpp"
+#include "audio_core/sequencer/instrument_phrase.hpp"
+#include "audio_core/tuning/scales_and_tuning.hpp"
 #include <numbers>
 #include <fstream>
 #include <iostream>
@@ -14000,6 +14003,375 @@ void test_daw_unified_undo_redo_engine() {
     std::cout << "  -> Unified DAW Undo / Redo Command History: ALL PASSED" << std::endl;
 }
 
+void test_tracker_timing_and_granular_lpb_tpl() {
+    std::cout << "[Test 91] Renoise Tracker Timing Engine & Granular LPB / TPL..." << std::endl;
+    using namespace audio_core::sequencer;
+
+    // Part A: 120 BPM standard timing math
+    {
+        TrackerTiming timing;
+        timing.bpm = 120.0;
+        timing.lpb = 4;
+        timing.tpl = 12;
+        timing.lines_per_pattern = 64;
+        timing.beats_per_bar = 4;
+
+        assert(std::abs(timing.beat_duration_seconds() - 0.5) < 1e-6);
+        assert(std::abs(timing.line_duration_seconds() - 0.125) < 1e-6);
+        assert(std::abs(timing.tick_duration_seconds() - (0.125 / 12.0)) < 1e-6);
+        assert(std::abs(timing.pattern_duration_seconds() - 8.0) < 1e-6);
+
+        constexpr double sr = 48000.0;
+        assert(std::abs(timing.samples_per_beat(sr) - 24000.0) < 1e-6);
+        assert(std::abs(timing.samples_per_line(sr) - 6000.0) < 1e-6);
+        assert(std::abs(timing.samples_per_tick(sr) - 500.0) < 1e-6);
+        assert(std::abs(timing.samples_per_bar(sr) - 96000.0) < 1e-6);
+        assert(timing.samples_for_pattern(sr) == 384000);
+
+        std::cout << "  -> Part A (120 BPM Math @ 48kHz): PASSED" << std::endl;
+    }
+
+    // Part B: Variable LPB and TPL (Fast Drill LPB=16, Triplet LPB=12)
+    {
+        TrackerTiming fast_timing;
+        fast_timing.bpm = 175.0; // Drum & Bass
+        fast_timing.lpb = 8;     // 32nd notes
+        fast_timing.tpl = 16;
+        fast_timing.lines_per_pattern = 128;
+        constexpr double sr = 44100.0;
+
+        double expected_line_sec = (60.0 / 175.0) / 8.0;
+        assert(std::abs(fast_timing.line_duration_seconds() - expected_line_sec) < 1e-6);
+        double expected_spl = expected_line_sec * sr;
+        assert(std::abs(fast_timing.samples_per_line(sr) - expected_spl) < 1e-4);
+
+        // Micro-timing delay to samples
+        uint32_t d_samples = fast_timing.delay_ticks_to_samples(4, sr);
+        double expected_tick_samples = (expected_line_sec / 16.0) * sr;
+        assert(std::abs(static_cast<double>(d_samples) - (4.0 * expected_tick_samples)) < 2.0);
+
+        std::cout << "  -> Part B (DnB 175 BPM High-Res LPB/TPL): PASSED" << std::endl;
+    }
+
+    // Part C: Sample Position to Tracker Coordinates
+    {
+        TrackerTiming timing;
+        timing.bpm = 120.0;
+        timing.lpb = 4;
+        timing.tpl = 12;
+        timing.lines_per_pattern = 64;
+        constexpr double sr = 48000.0; // spl = 6000, spt = 500
+
+        // Origin
+        auto pos0 = timing.position_at_sample(0, sr);
+        assert(pos0.pattern_index == 0);
+        assert(pos0.line_in_pattern == 0);
+        assert(pos0.tick_in_line == 0);
+
+        // Exactly Line 1
+        auto pos1 = timing.position_at_sample(6000, sr);
+        assert(pos1.pattern_index == 0);
+        assert(pos1.line_in_pattern == 1);
+        assert(pos1.tick_in_line == 0);
+
+        // Line 2, Tick 3 (6000 * 2 + 500 * 3 = 13500)
+        auto pos2 = timing.position_at_sample(13500, sr);
+        assert(pos2.pattern_index == 0);
+        assert(pos2.line_in_pattern == 2);
+        assert(pos2.tick_in_line == 3);
+
+        // Pattern 1 start (384000 samples)
+        auto pos3 = timing.position_at_sample(384000, sr);
+        assert(pos3.pattern_index == 1);
+        assert(pos3.line_in_pattern == 0);
+        assert(pos3.tick_in_line == 0);
+
+        // Bars <-> Lines conversion
+        assert(timing.lines_per_bar() == 16);
+        assert(timing.line_to_bar(32.0) == 2.0);
+        assert(timing.bar_to_line(2.0) == 32.0);
+
+        std::cout << "  -> Part C (Coordinate Resolution & Transport Mapping): PASSED" << std::endl;
+    }
+}
+
+void test_instrument_phrase_arpeggiator_and_drum_variations() {
+    std::cout << "[Test 92] Instrument-Owned Phrases, Arpeggiator & Drum Variations..." << std::endl;
+    using namespace audio_core::sequencer;
+
+    TrackerTiming timing;
+    timing.bpm = 120.0;
+    timing.lpb = 4;
+    timing.tpl = 12;
+    timing.lines_per_pattern = 64;
+    constexpr double sr = 48000.0;
+
+    // Part A: Phrase Construction & Multi-Column Lines
+    {
+        InstrumentPhrase phrase(1, "Bassline", 16);
+        assert(phrase.num_lines == 16);
+        assert(phrase.lines.size() == 16);
+
+        // Polyphonic chord line on step 0: Root (0), Fifth (7), Octave (12)
+        phrase.set_note(0, 0, 0, 100);
+        phrase.set_note(0, 1, 7, 95);
+        phrase.set_note(0, 2, 12, 90);
+        assert(phrase.lines[0].has_active_notes());
+        assert(phrase.lines[0].columns[0].active);
+        assert(phrase.lines[0].columns[1].active);
+        assert(phrase.lines[0].columns[2].active);
+        assert(!phrase.lines[0].columns[3].active);
+
+        std::cout << "  -> Part A (Multi-Column Phrase Construction): PASSED" << std::endl;
+    }
+
+    // Part B: Melodic Arpeggiator (Transposed & ArpUp Modes)
+    {
+        InstrumentPhrase phrase(1, "Triad Arp", 4);
+        phrase.playback_mode = PhraseArpMode::Transposed;
+        phrase.base_note = 60; // C-4
+        phrase.set_note(0, 0, 0, 100);  // Root
+        phrase.set_note(1, 0, 4, 100);  // Major Third
+        phrase.set_note(2, 0, 7, 100);  // Fifth
+        phrase.set_note(3, 0, 12, 100); // Octave
+
+        InstrumentPhrasePlayer player;
+        player.set_phrase(&phrase);
+
+        // Press C-4 (60)
+        player.note_on(60, 100);
+        assert(player.is_playing());
+        assert(player.held_note_count() == 1);
+
+        PhraseOutputEvent events[32];
+        size_t num_events = 0;
+
+        // Process line 0 (samples_per_line = 6000 frames)
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(num_events >= 1);
+        assert(events[0].is_note_on);
+        assert(events[0].note == 60);
+
+        // Process line 1
+        num_events = 0;
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(num_events >= 1);
+        bool found_note1 = false;
+        for (size_t i = 0; i < num_events; ++i) {
+            if (events[i].is_note_on && events[i].note == 64) {
+                found_note1 = true;
+                break;
+            }
+        }
+        assert(found_note1);
+
+        // Release note
+        player.note_off(60);
+        assert(!player.is_playing());
+
+        // Test ArpUp with held chord (C-4, E-4, G-4)
+        phrase.playback_mode = PhraseArpMode::ArpUp;
+        phrase.set_note(0, 0, 0, 100);
+        phrase.set_note(1, 0, 0, 100);
+        phrase.set_note(2, 0, 0, 100);
+
+        player.all_notes_off();
+        player.note_on(60, 100); // C
+        player.note_on(64, 100); // E
+        player.note_on(67, 100); // G
+        assert(player.held_note_count() == 3);
+
+        num_events = 0;
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(events[0].note == 60); // C
+
+        num_events = 0;
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(events[0].note == 64 || (num_events > 1 && events[1].note == 64)); // E
+
+        std::cout << "  -> Part B (Melodic Arpeggiator & Chord Step Cycling): PASSED" << std::endl;
+    }
+
+    // Part C: Drum Variations & Ratcheting Retriggers
+    {
+        InstrumentPhrase drum_phrase(2, "Jungle Break", 16);
+        drum_phrase.build_drum_break_variation(0, 1, 2, true);
+
+        InstrumentPhrasePlayer drum_player;
+        drum_player.set_phrase(&drum_phrase);
+        drum_player.note_on(60, 120);
+
+        PhraseOutputEvent events[64];
+        size_t num_events = 0;
+
+        // Step 0: Kick (slice 0) + Hat (slice 2)
+        drum_player.process_block(6000, timing, sr, events, 64, num_events);
+        assert(num_events >= 2);
+        bool has_kick = false, has_hat = false;
+        for (size_t i = 0; i < num_events; ++i) {
+            if (events[i].is_slice && events[i].slice_id == 0) has_kick = true;
+            if (events[i].is_slice && events[i].slice_id == 2) has_hat = true;
+        }
+        assert(has_kick && has_hat);
+
+        // Advance to step 14 (ratchet drill: retrigger_ticks = 3)
+        for (int s = 1; s < 14; ++s) {
+            num_events = 0;
+            drum_player.process_block(6000, timing, sr, events, 64, num_events);
+        }
+
+        // Step 14 should contain multiple ratchet slice events!
+        num_events = 0;
+        drum_player.process_block(6000, timing, sr, events, 64, num_events);
+        size_t ratchet_count = 0;
+        for (size_t i = 0; i < num_events; ++i) {
+            if (events[i].is_note_on && events[i].is_slice && events[i].slice_id == 1) {
+                ++ratchet_count;
+            }
+        }
+        assert(ratchet_count >= 2);
+
+        std::cout << "  -> Part C (Drum Slices & Sub-Line Ratcheting Drill): PASSED" << std::endl;
+    }
+
+    // Part D: Keymapped Phrases Bank
+    {
+        InstrumentPhraseBank bank;
+        auto& p0 = bank.add_phrase("Beat A", 16);
+        p0.playback_mode = PhraseArpMode::Keymap;
+        p0.key_trigger_min = 48; // C-3
+        p0.key_trigger_max = 48;
+
+        auto& p1 = bank.add_phrase("Roll Fill", 16);
+        p1.playback_mode = PhraseArpMode::Keymap;
+        p1.key_trigger_min = 50; // D-3
+        p1.key_trigger_max = 50;
+
+        assert(bank.find_phrase_for_key(48) == 1); // p0 index
+        assert(bank.find_phrase_for_key(50) == 2); // p1 index
+        assert(bank.find_phrase_for_key(60) == -1);
+
+        std::cout << "  -> Part D (Instrument Phrase Bank & Keymap Triggering): PASSED" << std::endl;
+    }
+}
+
+void test_scales_and_microtonal_scala_tuning_engine() {
+    std::cout << "[Test 93] Scales Catalog & Scala / Microtonal Tuning Engine..." << std::endl;
+    using namespace audio_core::tuning;
+
+    // Part A: ScaleDictionary Lookup and Degrees
+    {
+        // C Major (root 60)
+        assert(ScaleDictionary::is_note_in_scale(60, 60, ScaleType::Major)); // C
+        assert(!ScaleDictionary::is_note_in_scale(61, 60, ScaleType::Major)); // C#
+        assert(ScaleDictionary::is_note_in_scale(62, 60, ScaleType::Major)); // D
+        assert(ScaleDictionary::is_note_in_scale(64, 60, ScaleType::Major)); // E
+        assert(ScaleDictionary::is_note_in_scale(65, 60, ScaleType::Major)); // F
+        assert(ScaleDictionary::is_note_in_scale(67, 60, ScaleType::Major)); // G
+        assert(ScaleDictionary::is_note_in_scale(69, 60, ScaleType::Major)); // A
+        assert(ScaleDictionary::is_note_in_scale(71, 60, ScaleType::Major)); // B
+
+        // D Dorian (root 62: D, E, F, G, A, B, C)
+        assert(ScaleDictionary::is_note_in_scale(62, 62, ScaleType::Dorian)); // D
+        assert(ScaleDictionary::is_note_in_scale(65, 62, ScaleType::Dorian)); // F natural
+        assert(!ScaleDictionary::is_note_in_scale(66, 62, ScaleType::Dorian)); // F#
+
+        // Pentatonic Minor (root 60: C, Eb, F, G, Bb -> 60, 63, 65, 67, 70)
+        assert(ScaleDictionary::is_note_in_scale(63, 60, ScaleType::PentatonicMinor));
+        assert(!ScaleDictionary::is_note_in_scale(64, 60, ScaleType::PentatonicMinor));
+
+        // Scale snapping
+        assert(ScaleDictionary::snap_to_scale(61, 60, ScaleType::Major, SnapMode::Floor) == 60);
+        assert(ScaleDictionary::snap_to_scale(61, 60, ScaleType::Major, SnapMode::Ceil) == 62);
+        assert(ScaleDictionary::snap_to_scale(61, 60, ScaleType::Major, SnapMode::Nearest) == 60 ||
+               ScaleDictionary::snap_to_scale(61, 60, ScaleType::Major, SnapMode::Nearest) == 62);
+
+        // Degrees
+        assert(ScaleDictionary::get_degree(60, 60, ScaleType::Major) == 0);
+        assert(ScaleDictionary::get_degree(67, 60, ScaleType::Major) == 4); // 5th scale degree
+        assert(ScaleDictionary::degree_to_note(4, 60, ScaleType::Major) == 67);
+
+        // Names
+        assert(ScaleDictionary::note_name(60) == "C-4");
+        assert(ScaleDictionary::note_name(69) == "A-4");
+        assert(ScaleDictionary::note_name(61, false) == "C#4");
+        assert(ScaleDictionary::note_name(61, true) == "Db4");
+
+        std::cout << "  -> Part A (ScaleDictionary & Modes): PASSED" << std::endl;
+    }
+
+    // Part B: TuningTable Presets (12-TET, Just Intonation, 24-EDO)
+    {
+        TuningTable table;
+        table.make_12tet(440.0);
+        assert(std::abs(table.frequency(69) - 440.0) < 1e-4);
+        assert(std::abs(table.frequency(81) - 880.0) < 1e-4);
+        assert(std::abs(table.frequency(57) - 220.0) < 1e-4);
+
+        // Just Intonation 5-limit (root C-4 = 60)
+        table.make_just_intonation(60, 440.0);
+        double f_c4 = table.frequency(60);
+        double f_g4 = table.frequency(67); // pure 3/2 fifth
+        assert(std::abs((f_g4 / f_c4) - 1.5) < 1e-6);
+        double f_e4 = table.frequency(64); // pure 5/4 major third
+        assert(std::abs((f_e4 / f_c4) - 1.25) < 1e-6);
+
+        // 24-EDO Quarter-tone
+        table.make_24edo(440.0);
+        assert(std::abs(table.frequency(69) - 440.0) < 1e-4);
+        // 24 quarter-tones up is 1 octave: note 69 + 24 = 93
+        assert(std::abs(table.frequency(93) - 880.0) < 1e-4);
+
+        std::cout << "  -> Part B (TuningTable Presets 12-TET / Just / 24-EDO): PASSED" << std::endl;
+    }
+
+    // Part C: Huygens-Fokker Scala (.scl) Parser
+    {
+        std::string_view scl_sample = 
+            "! 7-limit-just.scl\n"
+            "! A classic 7-tone Just scale\n"
+            "7-Limit Just Intonation\n"
+            "7\n"
+            "! Scale intervals\n"
+            "9/8\n"
+            "5/4\n"
+            "4/3\n"
+            "3/2\n"
+            "5/3\n"
+            "15/8\n"
+            "2/1\n";
+
+        TuningTable scl_table;
+        bool ok = scl_table.parse_scl(scl_sample, 60, 261.625565);
+        assert(ok);
+        assert(scl_table.name == "7-Limit Just Intonation");
+        assert(std::abs(scl_table.frequency(60) - 261.625565) < 1e-4);
+
+        // Check ratio 3/2 on fifth (degree 4 -> note 64 in 7-tone mapping)
+        double f64 = scl_table.frequency(64);
+        assert(std::abs((f64 / 261.625565) - 1.5) < 1e-5);
+
+        // Octave: note 67 (60 + 7)
+        double f67 = scl_table.frequency(67);
+        assert(std::abs((f67 / 261.625565) - 2.0) < 1e-5);
+
+        // Cents-based Scala parse
+        std::string_view scl_cents =
+            "! cents_scale.scl\n"
+            "Equal 3-tone scale\n"
+            "3\n"
+            "400.0\n"
+            "800.0\n"
+            "1200.0\n";
+        TuningTable cents_table;
+        assert(cents_table.parse_scl(scl_cents, 60, 200.0));
+        assert(std::abs(cents_table.frequency(60) - 200.0) < 1e-4);
+        assert(std::abs(cents_table.frequency(63) - 400.0) < 1e-4); // Octave
+
+        std::cout << "  -> Part C (Huygens-Fokker .scl Parser Ratios & Cents): PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -14095,6 +14467,9 @@ int main() {
     test_arranger_warp_pins_and_nonlinear_elastic_audio();
     test_realtime_transient_shaper_insert_processor();
     test_daw_unified_undo_redo_engine();
+    test_tracker_timing_and_granular_lpb_tpl();
+    test_instrument_phrase_arpeggiator_and_drum_variations();
+    test_scales_and_microtonal_scala_tuning_engine();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
