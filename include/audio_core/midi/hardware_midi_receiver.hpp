@@ -6,6 +6,7 @@
 #include "audio_core/modulation/modulation_matrix.hpp"
 #include "audio_core/midi/midi_sync.hpp"
 #include "audio_core/midi/midi_learn_router.hpp"
+#include "audio_core/sequencer/instrument_phrase.hpp"
 #include "audio_core/mixer_graph.hpp"
 
 #include <fcntl.h>
@@ -803,15 +804,36 @@ public:
         return count;
     }
 
-    size_t drain_to(MidiLearnRouter& router, MixerGraph& mixer, modulation::ModulationMatrix* matrix = nullptr, size_t max_events = 0) noexcept {
+    size_t drain_to(MidiLearnRouter& router, MixerGraph& mixer, modulation::ModulationMatrix* matrix = nullptr,
+                    sequencer::InstrumentPhrasePlayer* phrase_player = nullptr, size_t max_events = 0) noexcept {
         MidiEvent ev{};
         size_t count = 0;
         while ((max_events == 0 || count < max_events) && m_queue.try_pop(ev)) {
             // 1. Dispatch CC to MidiLearnRouter (updates parameters or handles learn capture)
             (void)router.process_midi_event(ev, mixer, matrix);
 
-            // 2. Dispatch performance and note events to modulation matrix / synth
-            if (matrix) {
+            // 2. Dispatch performance and note events
+            if (phrase_player) {
+                switch (ev.type()) {
+                    case MidiStatus::NoteOn:
+                        if (ev.velocity() > 0) {
+                            phrase_player->note_on(ev.note(), ev.velocity());
+                        } else {
+                            phrase_player->note_off(ev.note());
+                        }
+                        break;
+                    case MidiStatus::NoteOff:
+                        phrase_player->note_off(ev.note());
+                        break;
+                    case MidiStatus::ControlChange:
+                        if (ev.data1 == 120 || ev.data1 == 123) {
+                            phrase_player->all_notes_off();
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            } else if (matrix) {
                 switch (ev.type()) {
                     case MidiStatus::NoteOn:
                         if (ev.velocity() > 0) {
@@ -823,6 +845,14 @@ public:
                     case MidiStatus::NoteOff:
                         matrix->poly_note_off(ev.note());
                         break;
+                    default:
+                        break;
+                }
+            }
+
+            // 3. Dispatch common CC & PitchBend to ModulationMatrix
+            if (matrix) {
+                switch (ev.type()) {
                     case MidiStatus::ControlChange:
                         if (ev.data1 == 1) { // Mod Wheel
                             matrix->set_performance_controls(matrix->velocity(), matrix->key_track(), static_cast<float>(ev.data2) / 127.0f, matrix->pitch_bend());

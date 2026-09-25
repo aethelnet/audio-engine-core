@@ -533,6 +533,16 @@ int main(int argc, char** argv) {
         p2.set_note(14, 0, -10, 105, 3, 6);
     }
 
+    // Realtime Track Phrase / Arpeggiator Routing State
+    static bool g_track_phrase_arp_enabled[4] = { false, true, false, false }; // Default Track 2 (Acid Lead) armed with phrase arp
+    static int g_track_phrase_assigned[4] = { 0, 0, 1, 0 }; // Phrase index mapped to track
+
+    // Arranger Viewport Navigation State (Continuous Zoom & Pan)
+    static float g_arranger_visible_bars = 16.0f; // Default 16 visible bars
+    static float g_arranger_scroll_bar = 0.0f;    // Leftmost visible bar
+    constexpr float g_arranger_max_bars = 128.0f; // Max horizontal timeline extent
+    constexpr float g_arranger_min_bars = 2.0f;   // Max zoom in (2 bars across canvas)
+
     // Self-Contained Project Bundle & Sononym Library UI State
     bool open_save_bundle_modal = false;
     bool open_load_bundle_modal = false;
@@ -859,8 +869,18 @@ int main(int argc, char** argv) {
             playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
         }
 
-        // Drain incoming Hardware MIDI events through MidiLearnRouter into ModulationMatrix & PolyphonicSynth
-        midi_rx.drain_to(midi_learn, mixer, &mod_matrix);
+        // Determine if selected track has phrase arpeggiator enabled
+        int cur_trk_idx = std::clamp(selected_track, 0, 3);
+        bool cur_track_arp_on = g_track_phrase_arp_enabled[cur_trk_idx];
+        if (cur_track_arp_on) {
+            auto* p = g_phrase_bank.get_phrase(static_cast<size_t>(g_track_phrase_assigned[cur_trk_idx]));
+            if (p && g_phrase_player.phrase() != p) {
+                g_phrase_player.set_phrase(p);
+            }
+        }
+
+        // Drain incoming Hardware MIDI events through MidiLearnRouter into ModulationMatrix & PolyphonicSynth or PhrasePlayer
+        midi_rx.drain_to(midi_learn, mixer, &mod_matrix, cur_track_arp_on ? &g_phrase_player : nullptr);
         midi_rx.sync_to_clock(mixer.clock());
         if (mixer.clock().authority() == clock::ClockAuthority::MidiClockSlave ||
             mixer.clock().authority() == clock::ClockAuthority::MtcSlave) {
@@ -871,6 +891,28 @@ int main(int argc, char** argv) {
 
         // Advance Modulator Matrix & Polyphonic Voice Pool at audio clock rate for real-time visual feedback
         uint32_t mod_sim_frames = std::clamp(static_cast<uint32_t>(dt * 48000.0f), 1u, 1024u);
+
+        // Advance Instrument Phrase Player & Arpeggiator if active
+        if (g_phrase_player.is_playing() || cur_track_arp_on) {
+            constexpr size_t kMaxPhraseEvs = 64;
+            sequencer::PhraseOutputEvent phrase_evs[kMaxPhraseEvs];
+            size_t num_phrase_evs = 0;
+            g_phrase_player.process_block(mod_sim_frames, g_tracker_timing, kSampleRate,
+                                          phrase_evs, kMaxPhraseEvs, num_phrase_evs);
+            for (size_t pe = 0; pe < num_phrase_evs; ++pe) {
+                const auto& pev = phrase_evs[pe];
+                if (pev.is_note_on) {
+                    uint8_t note_to_play = pev.note;
+                    if (g_scale_snap_enabled) {
+                        note_to_play = tuning::ScaleDictionary::snap_to_scale(note_to_play, g_scale_root, g_selected_scale, g_scale_snap_mode);
+                    }
+                    mod_matrix.poly_note_on(note_to_play, pev.velocity);
+                } else {
+                    mod_matrix.poly_note_off(pev.note);
+                }
+            }
+        }
+
         float synth_sim_l[1024];
         float synth_sim_r[1024];
         for (uint32_t s = 0; s < mod_sim_frames; ++s) {
@@ -1431,7 +1473,7 @@ int main(int argc, char** argv) {
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  TIMELINE & CLIP LAUNCHER (HYBRID ARRANGER)  ")) {
                     const char* track_names[4] = { "Track 1: Kick & 808", "Track 2: Acid 303 Lead", "Track 3: Vocal Slices", "Track 4: Drum Bus" };
-                    const float launcher_w = 330.0f;
+                    const float launcher_w = 380.0f;
                     ImVec2 avail_sz = ImGui::GetContentRegionAvail();
                     avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
 
@@ -1537,6 +1579,32 @@ int main(int argc, char** argv) {
                                 if (ImGui::SmallButton("■##stp")) {
                                     mixer.stop_track_clip(t, sequencer::LaunchQuantize::Bar);
                                     std::snprintf(status_toast, sizeof(status_toast), "TRACK %d STOPPING AT NEXT BAR", t + 1);
+                                }
+
+                                ImGui::SameLine();
+                                bool arp_on = g_track_phrase_arp_enabled[t];
+                                if (arp_on) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.45f, 0.05f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.45f, 0.52f, 1.0f));
+                                }
+                                char arp_lbl[24];
+                                std::snprintf(arp_lbl, sizeof(arp_lbl), arp_on ? "ARP##%d" : "arp##%d", t);
+                                if (ImGui::SmallButton(arp_lbl)) {
+                                    g_track_phrase_arp_enabled[t] = !g_track_phrase_arp_enabled[t];
+                                    if (!g_track_phrase_arp_enabled[t]) {
+                                        g_phrase_player.all_notes_off();
+                                        mod_matrix.poly_all_notes_off();
+                                    }
+                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: INSTRUMENT PHRASE ARPEGGIATOR %s",
+                                                  t + 1, g_track_phrase_arp_enabled[t] ? "ARMED (ONLINE)" : "BYPASSED");
+                                }
+                                ImGui::PopStyleColor(2);
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("Track %d Phrase Arpeggiator: %s\nRoutes incoming live MIDI through Instrument Phrase Player",
+                                                      t + 1, arp_on ? "ARMED (ONLINE)" : "BYPASSED");
                                 }
                             }
                             ImGui::EndGroup();
@@ -1712,7 +1780,36 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
-                    ImGui::TextDisabled("SNAP: 1/4 BAR (HOLD SHIFT: FREE)");
+                    ImGui::TextDisabled("SNAP: 1/4 BAR");
+
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("|");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(" - ##arr_zm_out")) {
+                        float new_v = std::min(g_arranger_max_bars, g_arranger_visible_bars * 1.25f);
+                        g_arranger_visible_bars = new_v;
+                        g_arranger_scroll_bar = std::clamp(g_arranger_scroll_bar, 0.0f, std::max(0.0f, g_arranger_max_bars - g_arranger_visible_bars));
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom Out Timeline (Ctrl+Wheel Down)");
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(" + ##arr_zm_in")) {
+                        float new_v = std::max(g_arranger_min_bars, g_arranger_visible_bars * 0.8f);
+                        g_arranger_visible_bars = new_v;
+                        g_arranger_scroll_bar = std::clamp(g_arranger_scroll_bar, 0.0f, std::max(0.0f, g_arranger_max_bars - g_arranger_visible_bars));
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom In Timeline (Ctrl+Wheel Up)");
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("FIT 16B")) {
+                        g_arranger_visible_bars = 16.0f;
+                        g_arranger_scroll_bar = 0.0f;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset Viewport to 16 Bars");
+
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "VIEW: %.0fb (%.1f-%.1fb)",
+                                       g_arranger_visible_bars, g_arranger_scroll_bar + 1.0f, g_arranger_scroll_bar + g_arranger_visible_bars + 1.0f);
                     ImGui::PopStyleVar(2);
 
                     const float top_pane_h = std::max(avail_sz.y * 0.44f - 24.0f, 105.0f);
@@ -1731,34 +1828,57 @@ int main(int argc, char** argv) {
                                            ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
                                            ImColor(190, 196, 206, 255), 2.0f);
 
-                        // Bar Grid lines (16 bars)
-                        constexpr int kTotalBars = 16;
-                        const float bar_w = canvas_size.x / kTotalBars;
-                        for (int b = 0; b <= kTotalBars; ++b) {
-                            float bx = canvas_pos.x + b * bar_w;
-                            draw_list->AddLine(ImVec2(bx, canvas_pos.y),
-                                               ImVec2(bx, canvas_pos.y + canvas_size.y),
-                                               ImColor(230, 235, 242, 255), 1.0f);
-                            if (b < kTotalBars) {
+                        // Dynamic Viewport Coordinate Transforms (Zoom & Horizontal Pan)
+                        const float bar_w = canvas_size.x / g_arranger_visible_bars;
+                        auto bar_to_x = [&](float bar) -> float {
+                            return canvas_pos.x + (bar - g_arranger_scroll_bar) * bar_w;
+                        };
+                        auto x_to_bar = [&](float px) -> float {
+                            return g_arranger_scroll_bar + (px - canvas_pos.x) / bar_w;
+                        };
+
+                        draw_list->PushClipRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), true);
+
+                        // Dynamic Bar Grid Lines
+                        int b_start = static_cast<int>(std::floor(g_arranger_scroll_bar));
+                        int b_end = static_cast<int>(std::ceil(g_arranger_scroll_bar + g_arranger_visible_bars));
+                        for (int b = b_start; b <= b_end; ++b) {
+                            float bx = bar_to_x(static_cast<float>(b));
+                            if (bx >= canvas_pos.x - 1.0f && bx <= canvas_pos.x + canvas_size.x + 1.0f) {
+                                draw_list->AddLine(ImVec2(bx, canvas_pos.y),
+                                                   ImVec2(bx, canvas_pos.y + canvas_size.y),
+                                                   ImColor(230, 235, 242, 255), 1.0f);
                                 char b_txt[16];
                                 std::snprintf(b_txt, sizeof(b_txt), "%d.1", b + 1);
                                 draw_list->AddText(ImVec2(bx + 4.0f, canvas_pos.y + 2.0f),
                                                    ImColor(100, 110, 125, 255), b_txt);
                             }
+                            if (bar_w >= 50.0f) {
+                                for (int q = 1; q <= 3; ++q) {
+                                    float qx = bar_to_x(static_cast<float>(b) + q * 0.25f);
+                                    if (qx >= canvas_pos.x && qx <= canvas_pos.x + canvas_size.x) {
+                                        draw_list->AddLine(ImVec2(qx, canvas_pos.y + 14.0f),
+                                                           ImVec2(qx, canvas_pos.y + canvas_size.y),
+                                                           ImColor(240, 243, 248, 180), 1.0f);
+                                    }
+                                }
+                            }
                         }
 
                         // Loop Region Highlighting (Bars 1 to 5)
                         if (loop_region_active) {
-                            float loop_x1 = canvas_pos.x;
-                            float loop_x2 = canvas_pos.x + 4.0f * bar_w;
-                            draw_list->AddRectFilled(ImVec2(loop_x1, canvas_pos.y),
-                                                     ImVec2(loop_x2, canvas_pos.y + 16.0f),
-                                                     ImColor(31, 97, 217, 35));
-                            draw_list->AddLine(ImVec2(loop_x1, canvas_pos.y + 16.0f),
-                                               ImVec2(loop_x2, canvas_pos.y + 16.0f),
-                                               ImColor(31, 97, 217, 200), 2.0f);
-                            draw_list->AddText(ImVec2(loop_x1 + 4.0f, canvas_pos.y + 2.0f),
-                                               ImColor(31, 97, 217, 255), "[ LOOP: 4 BARS ]");
+                            float loop_x1 = std::max(canvas_pos.x, bar_to_x(0.0f));
+                            float loop_x2 = std::min(canvas_pos.x + canvas_size.x, bar_to_x(4.0f));
+                            if (loop_x2 > loop_x1) {
+                                draw_list->AddRectFilled(ImVec2(loop_x1, canvas_pos.y),
+                                                         ImVec2(loop_x2, canvas_pos.y + 16.0f),
+                                                         ImColor(31, 97, 217, 35));
+                                draw_list->AddLine(ImVec2(loop_x1, canvas_pos.y + 16.0f),
+                                                   ImVec2(loop_x2, canvas_pos.y + 16.0f),
+                                                   ImColor(31, 97, 217, 200), 2.0f);
+                                draw_list->AddText(ImVec2(loop_x1 + 4.0f, canvas_pos.y + 2.0f),
+                                                   ImColor(31, 97, 217, 255), "[ LOOP: 4 BARS ]");
+                            }
                         }
 
                         // 4 Track Lanes
@@ -1802,8 +1922,12 @@ int main(int argc, char** argv) {
                                 // Multi-Clip Timeline Lanes
                                 for (size_t c_idx = 0; c_idx < track_arranger_clips[t].size(); ++c_idx) {
                                     auto& c = track_arranger_clips[t][c_idx];
-                                    float clip_x1 = canvas_pos.x + c.start_bar * bar_w;
-                                    float clip_x2 = canvas_pos.x + c.end_bar() * bar_w;
+                                    float clip_x1 = bar_to_x(c.start_bar);
+                                    float clip_x2 = bar_to_x(c.end_bar());
+                                    // Viewport Culling: Skip clip if completely off-screen
+                                    if (clip_x2 < canvas_pos.x - 2.0f || clip_x1 > canvas_pos.x + canvas_size.x + 2.0f) {
+                                        continue;
+                                    }
                                     bool is_sel = (selected_track == t && static_cast<int>(c_idx) == g_selected_clip_idx);
 
                                     // Main Clip Body Box
@@ -1866,7 +1990,7 @@ int main(int argc, char** argv) {
                                         // Transient Markers (Unpinned ticks)
                                         for (const auto& span : c.detected_transients) {
                                             float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, total_f));
-                                            float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                            float tx = bar_to_x(c.start_bar + rel_b);
                                             if (tx >= clip_x1 + 3.0f && tx <= clip_x2 - 3.0f) {
                                                 bool is_pinned = false;
                                                 for (const auto& pin : c.warp_pins) {
@@ -1894,10 +2018,10 @@ int main(int argc, char** argv) {
 
                                         // Pinned Warp-Pins (prominent amber diamond flags)
                                         for (const auto& pin : c.warp_pins) {
-                                            float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                            float px = bar_to_x(c.start_bar + pin.pinned_bar);
                                             if (px >= clip_x1 && px <= clip_x2) {
                                                 bool is_dragged = (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag &&
-                                                                   g_arranger_drag_warp_pin_id == pin.id);
+                                                                  g_arranger_drag_warp_pin_id == pin.id);
                                                 ImColor pin_col = is_dragged ? ImColor(251, 191, 36, 255) : ImColor(245, 158, 11, 230);
                                                 draw_list->AddLine(ImVec2(px, ly + 2.0f), ImVec2(px, ly + lane_h - 2.0f),
                                                                    pin_col, is_dragged ? 2.5f : 1.8f);
@@ -2048,21 +2172,23 @@ int main(int argc, char** argv) {
                                     if (c_idx + 1 < track_arranger_clips[t].size()) {
                                         const auto& next_c = track_arranger_clips[t][c_idx + 1];
                                         if (c.end_bar() > next_c.start_bar + 0.005f) {
-                                            float xf_x1 = canvas_pos.x + next_c.start_bar * bar_w;
-                                            float xf_x2 = canvas_pos.x + std::min(c.end_bar(), next_c.end_bar()) * bar_w;
+                                            float xf_x1 = bar_to_x(next_c.start_bar);
+                                            float xf_x2 = bar_to_x(std::min(c.end_bar(), next_c.end_bar()));
 
-                                            draw_list->AddRectFilled(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
-                                                                     ImColor(147, 51, 234, 45), 2.0f);
-                                            draw_list->AddRect(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
-                                                               ImColor(168, 85, 247, 180), 2.0f, 0, 1.0f);
+                                            if (xf_x2 >= canvas_pos.x && xf_x1 <= canvas_pos.x + canvas_size.x) {
+                                                draw_list->AddRectFilled(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
+                                                                         ImColor(147, 51, 234, 45), 2.0f);
+                                                draw_list->AddRect(ImVec2(xf_x1, ly + 2.0f), ImVec2(xf_x2, ly + lane_h - 2.0f),
+                                                                   ImColor(168, 85, 247, 180), 2.0f, 0, 1.0f);
 
-                                            draw_list->AddLine(ImVec2(xf_x1, ly + 4.0f), ImVec2(xf_x2, ly + lane_h - 4.0f),
-                                                               ImColor(168, 85, 247, 220), 1.5f);
-                                            draw_list->AddLine(ImVec2(xf_x1, ly + lane_h - 4.0f), ImVec2(xf_x2, ly + 4.0f),
-                                                               ImColor(168, 85, 247, 220), 1.5f);
+                                                draw_list->AddLine(ImVec2(xf_x1, ly + 4.0f), ImVec2(xf_x2, ly + lane_h - 4.0f),
+                                                                   ImColor(168, 85, 247, 220), 1.5f);
+                                                draw_list->AddLine(ImVec2(xf_x1, ly + lane_h - 4.0f), ImVec2(xf_x2, ly + 4.0f),
+                                                                   ImColor(168, 85, 247, 220), 1.5f);
 
-                                            draw_list->AddText(ImVec2(xf_x1 + 3.0f, ly + lane_h * 0.5f - 6.0f),
-                                                               ImColor(126, 34, 206, 255), "[X-FADE]");
+                                                draw_list->AddText(ImVec2(xf_x1 + 3.0f, ly + lane_h * 0.5f - 6.0f),
+                                                                   ImColor(126, 34, 206, 255), "[X-FADE]");
+                                            }
                                         }
                                     }
                                 }
@@ -2075,8 +2201,8 @@ int main(int argc, char** argv) {
                             g_arranger_drag_clip_idx >= 0 && g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
                             const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
                             float gh_ly = canvas_pos.y + 20.0f + g_arranger_drag_hover_track * lane_h;
-                            float gh_x1 = canvas_pos.x + c.start_bar * bar_w;
-                            float gh_x2 = canvas_pos.x + c.end_bar() * bar_w;
+                            float gh_x1 = bar_to_x(c.start_bar);
+                            float gh_x2 = bar_to_x(c.end_bar());
 
                             draw_list->AddRectFilled(ImVec2(gh_x1, gh_ly + 2.0f),
                                                      ImVec2(gh_x2, gh_ly + lane_h - 2.0f),
@@ -2099,7 +2225,7 @@ int main(int argc, char** argv) {
                             const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
                             float base_l = (c.base_len_bars > 0.01f) ? c.base_len_bars : g_arranger_drag_orig_len_bars;
                             float ratio = c.len_bars / base_l;
-                            float b_x = canvas_pos.x + c.start_bar * bar_w + 6.0f;
+                            float b_x = bar_to_x(c.start_bar) + 6.0f;
                             float b_y = canvas_pos.y + 20.0f + g_arranger_drag_track * lane_h + lane_h * 0.5f - 8.0f;
                             char badge_txt[64];
                             const char* badge_algo = (c.stretch_algo == dsp::PitchAlgorithm::TransientWarpWsola) ? "T-WARP" :
@@ -2118,7 +2244,7 @@ int main(int argc, char** argv) {
                             const auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
                             const auto* p = c.find_warp_pin(g_arranger_drag_warp_pin_id);
                             if (p) {
-                                float px = canvas_pos.x + (c.start_bar + p->pinned_bar) * bar_w;
+                                float px = bar_to_x(c.start_bar + p->pinned_bar);
                                 float py = canvas_pos.y + 20.0f + g_arranger_drag_track * lane_h + lane_h * 0.5f - 8.0f;
                                 char badge_txt[64];
                                 std::snprintf(badge_txt, sizeof(badge_txt), "[WARP PIN: BAR %.2f]", c.start_bar + p->pinned_bar + 1.0f);
@@ -2129,14 +2255,17 @@ int main(int argc, char** argv) {
 
                         // Playhead Needle
                         float play_ratio = playhead_seconds / loop_length_seconds;
-                        float playhead_x = canvas_pos.x + play_ratio * canvas_size.x;
-                        draw_list->AddLine(ImVec2(playhead_x, canvas_pos.y),
-                                           ImVec2(playhead_x, canvas_pos.y + canvas_size.y),
-                                           ImColor(20, 25, 35, 255), 2.0f);
-                        draw_list->AddTriangleFilled(ImVec2(playhead_x - 6.0f, canvas_pos.y),
-                                                     ImVec2(playhead_x + 6.0f, canvas_pos.y),
-                                                     ImVec2(playhead_x, canvas_pos.y + 10.0f),
-                                                     ImColor(20, 25, 35, 255));
+                        float playhead_bar = play_ratio * 16.0f;
+                        float playhead_x = bar_to_x(playhead_bar);
+                        if (playhead_x >= canvas_pos.x - 2.0f && playhead_x <= canvas_pos.x + canvas_size.x + 2.0f) {
+                            draw_list->AddLine(ImVec2(playhead_x, canvas_pos.y),
+                                               ImVec2(playhead_x, canvas_pos.y + canvas_size.y),
+                                               ImColor(20, 25, 35, 255), 2.0f);
+                            draw_list->AddTriangleFilled(ImVec2(playhead_x - 6.0f, canvas_pos.y),
+                                                         ImVec2(playhead_x + 6.0f, canvas_pos.y),
+                                                         ImVec2(playhead_x, canvas_pos.y + 10.0f),
+                                                         ImColor(20, 25, 35, 255));
+                        }
 
                         // Interactive Arranger Controls: Clip Drag, Trim, Fade, Slip-Edit & Scrubbing
                         ImGui::SetCursorScreenPos(canvas_pos);
@@ -2147,6 +2276,32 @@ int main(int argc, char** argv) {
                         const bool is_deactivated = ImGui::IsItemDeactivated();
                         ImVec2 m = ImGui::GetIO().MousePos;
 
+                        // Zoom & Pan Interactions (Ctrl+Wheel, Shift+Wheel, Middle-Mouse Drag)
+                        if (is_hovered) {
+                            float wheel = ImGui::GetIO().MouseWheel;
+                            if (ImGui::GetIO().KeyCtrl && std::abs(wheel) > 0.0f) {
+                                float mouse_bar = x_to_bar(m.x);
+                                float zoom_factor = (wheel > 0.0f) ? 0.85f : 1.176f;
+                                float new_visible = std::clamp(g_arranger_visible_bars * zoom_factor, g_arranger_min_bars, g_arranger_max_bars);
+                                float new_bar_w = canvas_size.x / new_visible;
+                                float new_scroll = mouse_bar - (m.x - canvas_pos.x) / new_bar_w;
+                                float max_scroll = std::max(0.0f, g_arranger_max_bars - new_visible);
+                                g_arranger_visible_bars = new_visible;
+                                g_arranger_scroll_bar = std::clamp(new_scroll, 0.0f, max_scroll);
+                            } else if (ImGui::GetIO().KeyShift && std::abs(wheel) > 0.0f) {
+                                float pan_bars = wheel * (g_arranger_visible_bars * 0.125f);
+                                float max_scroll = std::max(0.0f, g_arranger_max_bars - g_arranger_visible_bars);
+                                g_arranger_scroll_bar = std::clamp(g_arranger_scroll_bar - pan_bars, 0.0f, max_scroll);
+                            }
+
+                            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+                                float dx = ImGui::GetIO().MouseDelta.x;
+                                float d_bar = (dx / bar_w);
+                                float max_scroll = std::max(0.0f, g_arranger_max_bars - g_arranger_visible_bars);
+                                g_arranger_scroll_bar = std::clamp(g_arranger_scroll_bar - d_bar, 0.0f, max_scroll);
+                            }
+                        }
+
                         // Cursor styling based on hover location
                         if (is_hovered && g_arranger_drag_mode == ArrangerDragMode::None) {
                             if (m.y >= canvas_pos.y + 20.0f) {
@@ -2154,13 +2309,13 @@ int main(int argc, char** argv) {
                                 if (hov_t >= 0 && hov_t < 4) {
                                     for (size_t i = 0; i < track_arranger_clips[hov_t].size(); ++i) {
                                         const auto& c = track_arranger_clips[hov_t][i];
-                                        float hov_x1 = canvas_pos.x + c.start_bar * bar_w;
-                                        float hov_x2 = canvas_pos.x + c.end_bar() * bar_w;
+                                        float hov_x1 = bar_to_x(c.start_bar);
+                                        float hov_x2 = bar_to_x(c.end_bar());
                                         if (m.x >= hov_x1 && m.x <= hov_x2) {
                                             if (g_arranger_tool == ArrangerTool::Warp) {
                                                 bool on_pin = false;
                                                 for (const auto& pin : c.warp_pins) {
-                                                    float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                                    float px = bar_to_x(c.start_bar + pin.pinned_bar);
                                                     if (std::abs(m.x - px) < 8.0f) {
                                                         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
                                                         on_pin = true;
@@ -2172,7 +2327,7 @@ int main(int argc, char** argv) {
                                                     if (nf > 0) {
                                                         for (const auto& span : c.detected_transients) {
                                                             float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, nf));
-                                                            float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                                            float tx = bar_to_x(c.start_bar + rel_b);
                                                             if (std::abs(m.x - tx) < 8.0f) {
                                                                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                                                                 on_pin = true;
@@ -2187,9 +2342,9 @@ int main(int argc, char** argv) {
                                             if (g_arranger_tool == ArrangerTool::Razor) {
                                                 ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
                                                 float rly = canvas_pos.y + 20.0f + hov_t * lane_h;
-                                                float cut_bar = (m.x - canvas_pos.x) / bar_w;
+                                                float cut_bar = x_to_bar(m.x);
                                                 if (!ImGui::GetIO().KeyShift) cut_bar = std::round(cut_bar * 4.0f) / 4.0f;
-                                                float cut_x = canvas_pos.x + cut_bar * bar_w;
+                                                float cut_x = bar_to_x(cut_bar);
                                                 draw_list->AddLine(ImVec2(cut_x, rly + 1.0f), ImVec2(cut_x, rly + lane_h - 1.0f),
                                                                    ImColor(239, 68, 68, 240), 2.0f);
                                                 char cut_lbl[32];
@@ -2232,8 +2387,8 @@ int main(int argc, char** argv) {
                             if (m.y < canvas_pos.y + 20.0f) {
                                 // Clicked on Timeline Ruler -> Scrub / Seek
                                 g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
-                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                                playhead_seconds = ratio * loop_length_seconds;
+                                float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
+                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.start_scrub(target_sample);
                             } else {
@@ -2244,8 +2399,8 @@ int main(int argc, char** argv) {
                                 // Find which clip in this lane was clicked
                                 int clicked_clip_idx = -1;
                                 for (size_t i = 0; i < track_arranger_clips[clicked_lane].size(); ++i) {
-                                    float cx1 = canvas_pos.x + track_arranger_clips[clicked_lane][i].start_bar * bar_w;
-                                    float cx2 = canvas_pos.x + track_arranger_clips[clicked_lane][i].end_bar() * bar_w;
+                                    float cx1 = bar_to_x(track_arranger_clips[clicked_lane][i].start_bar);
+                                    float cx2 = bar_to_x(track_arranger_clips[clicked_lane][i].end_bar());
                                     if (m.x >= cx1 && m.x <= cx2) {
                                         clicked_clip_idx = static_cast<int>(i);
                                         break;
@@ -2261,7 +2416,7 @@ int main(int argc, char** argv) {
 
                                     if (g_arranger_tool == ArrangerTool::Razor) {
                                         // Razor split at mouse position
-                                        float click_bar = (m.x - canvas_pos.x) / bar_w;
+                                        float click_bar = x_to_bar(m.x);
                                         if (!ImGui::GetIO().KeyShift) {
                                             click_bar = std::round(click_bar * 4.0f) / 4.0f; // 1-beat snap
                                         }
@@ -2291,8 +2446,8 @@ int main(int argc, char** argv) {
                                         g_arranger_drag_orig_fade_in = c.fade_in_bars;
                                         g_arranger_drag_orig_fade_out = c.fade_out_bars;
 
-                                        float cx1 = canvas_pos.x + c.start_bar * bar_w;
-                                        float cx2 = canvas_pos.x + c.end_bar() * bar_w;
+                                        float cx1 = bar_to_x(c.start_bar);
+                                        float cx2 = bar_to_x(c.end_bar());
                                         float top_y = canvas_pos.y + 20.0f + clicked_lane * lane_h;
                                         float fin_hx = cx1 + std::max(8.0f, c.fade_in_bars * bar_w);
                                         float fout_hx = cx2 - std::max(8.0f, c.fade_out_bars * bar_w);
@@ -2335,7 +2490,7 @@ int main(int argc, char** argv) {
 
                                             // 1. Existing Warp Pins
                                             for (const auto& pin : c.warp_pins) {
-                                                float px = canvas_pos.x + (c.start_bar + pin.pinned_bar) * bar_w;
+                                                float px = bar_to_x(c.start_bar + pin.pinned_bar);
                                                 if (std::abs(m.x - px) < 8.0f) {
                                                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                                                         if (trk) {
@@ -2367,7 +2522,7 @@ int main(int argc, char** argv) {
                                                 if (num_f > 0) {
                                                     for (const auto& span : c.detected_transients) {
                                                         float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, num_f));
-                                                        float tx = canvas_pos.x + (c.start_bar + rel_b) * bar_w;
+                                                        float tx = bar_to_x(c.start_bar + rel_b);
                                                         if (std::abs(m.x - tx) < 8.0f) {
                                                             if (trk) {
                                                                 auto before_clips = trk->arranger().clips();
@@ -2419,8 +2574,8 @@ int main(int argc, char** argv) {
                                 } else {
                                     // Clicked outside clip on lane -> Seek playhead
                                     g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
-                                    float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                                    playhead_seconds = ratio * loop_length_seconds;
+                                    float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
+                                    playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
                                     uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                     mixer.start_scrub(target_sample);
                                 }
@@ -2436,7 +2591,7 @@ int main(int argc, char** argv) {
                                     if (!ImGui::GetIO().KeyShift) {
                                         new_start = std::round(new_start * 4.0f) / 4.0f; // 1 beat snap (1/4 bar)
                                     }
-                                    float max_start = static_cast<float>(kTotalBars) - c.len_bars;
+                                    float max_start = g_arranger_max_bars - c.len_bars;
                                     new_start = std::clamp(new_start, 0.0f, max_start);
                                     c.start_bar = new_start;
                                     sync_arranger_to_mixer(g_arranger_drag_track);
@@ -2494,7 +2649,7 @@ int main(int argc, char** argv) {
                                     if (!ImGui::GetIO().KeyShift) {
                                         new_len = std::round(new_len * 4.0f) / 4.0f;
                                     }
-                                    float max_len = static_cast<float>(kTotalBars) - c.start_bar;
+                                    float max_len = g_arranger_max_bars - c.start_bar;
                                     new_len = std::clamp(new_len, 0.25f, max_len);
                                     c.len_bars = new_len;
                                     sync_arranger_to_mixer(g_arranger_drag_track);
@@ -2514,7 +2669,7 @@ int main(int argc, char** argv) {
                                     if (!ImGui::GetIO().KeyShift) {
                                         new_len = std::round(new_len * 4.0f) / 4.0f;
                                     }
-                                    float max_len = static_cast<float>(kTotalBars) - c.start_bar;
+                                    float max_len = g_arranger_max_bars - c.start_bar;
                                     new_len = std::clamp(new_len, 0.25f, max_len);
                                     c.len_bars = new_len;
                                 } else if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag) {
@@ -2530,9 +2685,9 @@ int main(int argc, char** argv) {
                                     }
                                 }
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
-                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
+                                float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
                                 float prev_sec = playhead_seconds;
-                                playhead_seconds = ratio * loop_length_seconds;
+                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
                                 float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.update_scrub(target_sample, static_cast<double>(vel));
@@ -2544,8 +2699,8 @@ int main(int argc, char** argv) {
                                 g_arranger_drag_mode = ArrangerDragMode::None;
                                 g_arranger_drag_warp_pin_id = 0;
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
-                                float ratio = std::clamp((m.x - canvas_pos.x) / canvas_size.x, 0.0f, 1.0f);
-                                playhead_seconds = ratio * loop_length_seconds;
+                                float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
+                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.end_scrub(target_sample);
                             } else if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0) {
@@ -2734,9 +2889,25 @@ int main(int argc, char** argv) {
                             }
                             ImGui::EndPopup();
                         }
-
+                        draw_list->PopClipRect();
                     }
                     ImGui::EndChild();
+
+                    // Horizontal Arranger Overview Scrollbar
+                    float max_scroll = std::max(0.0f, g_arranger_max_bars - g_arranger_visible_bars);
+                    if (max_scroll > 0.001f) {
+                        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.92f, 0.94f, 0.98f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.12f, 0.38f, 0.85f, 0.85f));
+                        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.08f, 0.30f, 0.75f, 1.0f));
+                        ImGui::SetNextItemWidth(-1.0f);
+                        char scroll_fmt[64];
+                        std::snprintf(scroll_fmt, sizeof(scroll_fmt), "PAN: Bar %.1f - %.1f (Total: %.0f Bars)",
+                                      g_arranger_scroll_bar + 1.0f, g_arranger_scroll_bar + g_arranger_visible_bars + 1.0f, g_arranger_max_bars);
+                        if (ImGui::SliderFloat("##ArrangerTimelineScrollbar", &g_arranger_scroll_bar, 0.0f, max_scroll, scroll_fmt)) {
+                            // clamped automatically
+                        }
+                        ImGui::PopStyleColor(3);
+                    }
 
                     // ========================================================
                     // LOWER SECTION: STEP PATTERN MATRIX & MPC AUDITION PADS
@@ -7436,6 +7607,43 @@ int main(int argc, char** argv) {
                         ImGui::Separator();
                         ImGui::Spacing();
 
+                        // Realtime Arp Track Target & Status
+                        ImGui::TextDisabled("Target Track:");
+                        ImGui::SameLine();
+                        const char* trk_targets[] = { "Track 1 (TRK 1)", "Track 2 (TRK 2)", "Track 3 (TRK 3)", "Track 4 (TRK 4)" };
+                        ImGui::SetNextItemWidth(140);
+                        if (ImGui::Combo("##PhraseTargetTrackCombo", &selected_track, trk_targets, 4)) {
+                            g_active_phrase_idx = g_track_phrase_assigned[selected_track];
+                        }
+                        ImGui::SameLine();
+                        bool cur_arp = g_track_phrase_arp_enabled[selected_track];
+                        if (cur_arp) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.05f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.25f, 0.35f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
+                        }
+                        char arp_btn_lbl[48];
+                        std::snprintf(arp_btn_lbl, sizeof(arp_btn_lbl), "ARP: %s##Tab7Arp", cur_arp ? "ACTIVE [ON]" : "OFF");
+                        if (ImGui::Button(arp_btn_lbl)) {
+                            g_track_phrase_arp_enabled[selected_track] = !cur_arp;
+                            if (g_track_phrase_arp_enabled[selected_track]) {
+                                g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
+                                std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: LIVE PHRASE ARP ROUTING ENABLED", selected_track + 1);
+                            } else {
+                                g_phrase_player.all_notes_off();
+                                for (int v = 0; v < 16; ++v) mod_matrix.poly_note_off(v);
+                                std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: ARP ROUTING DISABLED", selected_track + 1);
+                            }
+                        }
+                        ImGui::PopStyleColor(2);
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("When ACTIVE, incoming MIDI notes on Track %d trigger tracker-timed phrase playback through PolySynth.", selected_track + 1);
+                        }
+
+                        ImGui::Spacing();
+
                         // Phrase Selector & Header Controls
                         ImGui::TextDisabled("Active Phrase:");
                         ImGui::SameLine();
@@ -7449,12 +7657,14 @@ int main(int argc, char** argv) {
 
                         if (ImGui::Combo("##ActivePhraseCombo", &g_active_phrase_idx, phrase_ptrs.data(), static_cast<int>(phrase_ptrs.size()))) {
                             g_phrase_bank.active_phrase_index = static_cast<size_t>(g_active_phrase_idx);
+                            g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
                         }
 
                         ImGui::SameLine();
                         if (ImGui::Button("+ ADD PHRASE")) {
                             g_phrase_bank.add_phrase("New Phrase", 16);
                             g_active_phrase_idx = static_cast<int>(g_phrase_bank.phrases.size() - 1);
+                            g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
                         }
 
                         auto* phrase = g_phrase_bank.get_phrase(static_cast<size_t>(g_active_phrase_idx));
@@ -7532,6 +7742,7 @@ int main(int argc, char** argv) {
                             ImGui::SameLine();
                             if (ImGui::Button("[ STOP ]")) {
                                 g_phrase_player.all_notes_off();
+                                mod_matrix.poly_all_notes_off();
                             }
 
                             // Matrix Table

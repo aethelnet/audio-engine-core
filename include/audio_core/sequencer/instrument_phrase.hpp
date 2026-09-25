@@ -545,11 +545,22 @@ private:
         const double samples_per_line = phrase_timing.samples_per_line(sample_rate);
 
         // Gather sorted held note pitches for arpeggiator modes
+        const size_t held_count = std::min(m_num_held, kMaxHeldNotes);
         std::array<uint8_t, kMaxHeldNotes> sorted_notes{};
-        for (size_t i = 0; i < m_num_held; ++i) {
+        for (size_t i = 0; i < held_count; ++i) {
             sorted_notes[i] = m_held_keys[i].note;
         }
-        std::sort(sorted_notes.begin(), sorted_notes.begin() + m_num_held);
+        if (held_count > 1) {
+            for (size_t i = 1; i < held_count; ++i) {
+                uint8_t key = sorted_notes[i];
+                size_t j = i;
+                while (j > 0 && sorted_notes[j - 1] > key) {
+                    sorted_notes[j] = sorted_notes[j - 1];
+                    --j;
+                }
+                sorted_notes[j] = key;
+            }
+        }
 
         for (const auto& note_col : line.columns) {
             if (!note_col.active) continue;
@@ -622,9 +633,9 @@ private:
                         break;
                     }
                     case PhraseArpMode::ArpUp: {
-                        if (m_num_held > 0) {
-                            uint8_t arp_note = sorted_notes[m_arp_note_index % m_num_held];
-                            m_arp_note_index = (m_arp_note_index + 1) % m_num_held;
+                        if (held_count > 0) {
+                            uint8_t arp_note = sorted_notes[m_arp_note_index % held_count];
+                            m_arp_note_index = (m_arp_note_index + 1) % held_count;
                             int32_t final_note = std::clamp<int32_t>(static_cast<int32_t>(arp_note) + note_col.note_offset, 0, 127);
                             emit_single_event(trig_frame, true, static_cast<uint8_t>(final_note), 0, false,
                                               note_col.velocity, note_col.pan, note_col.cutoff_offset,
@@ -634,10 +645,10 @@ private:
                         break;
                     }
                     case PhraseArpMode::ArpDown: {
-                        if (m_num_held > 0) {
-                            size_t rev_idx = (m_num_held - 1) - (m_arp_note_index % m_num_held);
+                        if (held_count > 0) {
+                            size_t rev_idx = (held_count - 1) - (m_arp_note_index % held_count);
                             uint8_t arp_note = sorted_notes[rev_idx];
-                            m_arp_note_index = (m_arp_note_index + 1) % m_num_held;
+                            m_arp_note_index = (m_arp_note_index + 1) % held_count;
                             int32_t final_note = std::clamp<int32_t>(static_cast<int32_t>(arp_note) + note_col.note_offset, 0, 127);
                             emit_single_event(trig_frame, true, static_cast<uint8_t>(final_note), 0, false,
                                               note_col.velocity, note_col.pan, note_col.cutoff_offset,
@@ -647,19 +658,19 @@ private:
                         break;
                     }
                     case PhraseArpMode::ArpUpDown: {
-                        if (m_num_held > 1) {
-                            uint8_t arp_note = sorted_notes[m_arp_note_index];
+                        if (held_count > 1) {
+                            uint8_t arp_note = sorted_notes[m_arp_note_index % held_count];
                             if (m_arp_direction_up) {
-                                if (m_arp_note_index + 1 >= m_num_held) {
+                                if (m_arp_note_index + 1 >= held_count) {
                                     m_arp_direction_up = false;
-                                    m_arp_note_index = m_num_held - 2;
+                                    m_arp_note_index = (held_count >= 2) ? (held_count - 2) : 0;
                                 } else {
                                     ++m_arp_note_index;
                                 }
                             } else {
                                 if (m_arp_note_index == 0) {
                                     m_arp_direction_up = true;
-                                    m_arp_note_index = 1;
+                                    m_arp_note_index = (held_count > 1) ? 1 : 0;
                                 } else {
                                     --m_arp_note_index;
                                 }
@@ -669,7 +680,7 @@ private:
                                               note_col.velocity, note_col.pan, note_col.cutoff_offset,
                                               note_col.res_offset, gate_samples, current_abs_sample + delay_samples,
                                               out_events, max_events, num_events, frames);
-                        } else if (m_num_held == 1) {
+                        } else if (held_count == 1) {
                             int32_t final_note = std::clamp<int32_t>(static_cast<int32_t>(sorted_notes[0]) + note_col.note_offset, 0, 127);
                             emit_single_event(trig_frame, true, static_cast<uint8_t>(final_note), 0, false,
                                               note_col.velocity, note_col.pan, note_col.cutoff_offset,
@@ -679,8 +690,8 @@ private:
                         break;
                     }
                     case PhraseArpMode::ArpRandom: {
-                        if (m_num_held > 0) {
-                            size_t rnd_idx = next_random() % m_num_held;
+                        if (held_count > 0) {
+                            size_t rnd_idx = next_random() % held_count;
                             uint8_t arp_note = sorted_notes[rnd_idx];
                             int32_t final_note = std::clamp<int32_t>(static_cast<int32_t>(arp_note) + note_col.note_offset, 0, 127);
                             emit_single_event(trig_frame, true, static_cast<uint8_t>(final_note), 0, false,
@@ -691,7 +702,7 @@ private:
                         break;
                     }
                     case PhraseArpMode::ArpChord: {
-                        for (size_t c = 0; c < m_num_held; ++c) {
+                        for (size_t c = 0; c < held_count; ++c) {
                             int32_t final_note = std::clamp<int32_t>(static_cast<int32_t>(sorted_notes[c]) + note_col.note_offset, 0, 127);
                             emit_single_event(trig_frame, true, static_cast<uint8_t>(final_note), 0, false,
                                               note_col.velocity, note_col.pan, note_col.cutoff_offset,

@@ -14372,6 +14372,140 @@ void test_scales_and_microtonal_scala_tuning_engine() {
     }
 }
 
+void test_live_midi_phrase_routing_and_track_arpeggiation() {
+    std::cout << "[Test 94] Live Hardware MIDI Routing, Dynamic Track Arpeggiation & Scale Snapping..." << std::endl;
+    using namespace audio_core;
+
+    constexpr double sr = 48000.0;
+    sequencer::TrackerTiming timing;
+    timing.bpm = 120.0;
+    timing.lpb = 4;
+    timing.tpl = 12;
+
+    midi::HardwareMidiReceiver rx;
+    midi::MidiLearnRouter router;
+    MixerGraph mixer;
+    modulation::ModulationMatrix matrix;
+    matrix.init(sr);
+
+    sequencer::InstrumentPhrase phrase(1, "Live Acid Arp", 4);
+    phrase.playback_mode = sequencer::PhraseArpMode::ArpUp;
+    phrase.set_note(0, 0, 0, 100);  // Root
+    phrase.set_note(1, 0, 3, 105);  // Minor 3rd
+    phrase.set_note(2, 0, 7, 110);  // 5th
+    phrase.set_note(3, 0, 10, 115); // Minor 7th
+
+    sequencer::InstrumentPhrasePlayer player;
+    player.set_phrase(&phrase);
+
+    // Part A: Direct Routing vs Phrase Player Routing
+    {
+        // 1. When phrase_player is nullptr, NoteOn goes directly to ModulationMatrix poly synth
+        MidiEvent ev_note_on{};
+        ev_note_on.status = static_cast<uint8_t>(MidiStatus::NoteOn) | 0x00;
+        ev_note_on.data1 = 48; // C3
+        ev_note_on.data2 = 100;
+        rx.inject_event(ev_note_on);
+
+        size_t count = rx.drain_to(router, mixer, &matrix, nullptr);
+        assert(count == 1);
+        assert(matrix.poly_synth().active_voice_count() > 0);
+        assert(!player.is_playing());
+
+        // NoteOff direct
+        MidiEvent ev_note_off{};
+        ev_note_off.status = static_cast<uint8_t>(MidiStatus::NoteOff) | 0x00;
+        ev_note_off.data1 = 48;
+        ev_note_off.data2 = 0;
+        rx.inject_event(ev_note_off);
+        rx.drain_to(router, mixer, &matrix, nullptr);
+
+        std::cout << "  -> Part A (Direct MIDI Ingestion to PolySynth Voice Pool): PASSED" << std::endl;
+    }
+
+    // Part B: Active Track Phrase Routing & Real-Time Block Processing
+    {
+        matrix.poly_all_notes_off();
+
+        // 2. When phrase_player is provided, NoteOn routes into player
+        MidiEvent ev_note_on{};
+        ev_note_on.status = static_cast<uint8_t>(MidiStatus::NoteOn) | 0x00;
+        ev_note_on.data1 = 60; // C4
+        ev_note_on.data2 = 110;
+        rx.inject_event(ev_note_on);
+
+        size_t count = rx.drain_to(router, mixer, &matrix, &player);
+        assert(count == 1);
+        assert(player.is_playing());
+        assert(player.held_note_count() == 1);
+
+        // Process block 0 through player (6000 frames @ 120bpm = 1 line)
+        sequencer::PhraseOutputEvent events[32];
+        size_t num_events = 0;
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(num_events >= 1);
+        assert(events[0].is_note_on);
+        assert(events[0].note == 60); // Root note C4
+
+        // Feed event to matrix
+        matrix.poly_note_on(events[0].note, events[0].velocity);
+        assert(matrix.poly_synth().active_voice_count() > 0);
+
+        // Process block 1: Step 1 (Minor 3rd: 60 + 3 = 63 Eb4)
+        num_events = 0;
+        player.process_block(6000, timing, sr, events, 32, num_events);
+        assert(num_events >= 1);
+        bool found_eb4 = false;
+        for (size_t i = 0; i < num_events; ++i) {
+            if (events[i].is_note_on && events[i].note == 63) found_eb4 = true;
+        }
+        assert(found_eb4);
+
+        // Part B2: Scale Quantization / Snapping
+        // Suppose scale is Major (root C=60), Eb4 (63) is non-scale, snaps to E4 (64) in Ceil or D4 (62) in Floor
+        uint8_t snapped_ceil = tuning::ScaleDictionary::snap_to_scale(63, 60, tuning::ScaleType::Major, tuning::SnapMode::Ceil);
+        assert(snapped_ceil == 64);
+        uint8_t snapped_floor = tuning::ScaleDictionary::snap_to_scale(63, 60, tuning::ScaleType::Major, tuning::SnapMode::Floor);
+        assert(snapped_floor == 62);
+        (void)snapped_ceil;
+        (void)snapped_floor;
+
+        // NoteOff through player
+        MidiEvent ev_note_off{};
+        ev_note_off.status = static_cast<uint8_t>(MidiStatus::NoteOff) | 0x00;
+        ev_note_off.data1 = 60;
+        ev_note_off.data2 = 0;
+        rx.inject_event(ev_note_off);
+
+        count = rx.drain_to(router, mixer, &matrix, &player);
+        assert(count == 1);
+        assert(!player.is_playing());
+        assert(player.held_note_count() == 0);
+
+        std::cout << "  -> Part B (Hardware MIDI Phrase Routing & Dynamic Arpeggiation): PASSED" << std::endl;
+    }
+
+    // Part C: All Notes Off & Modulation Safety
+    {
+        player.note_on(60, 100);
+        player.note_on(64, 100);
+        assert(player.held_note_count() == 2);
+
+        // CC 123 (All Notes Off)
+        MidiEvent ev_panic{};
+        ev_panic.status = static_cast<uint8_t>(MidiStatus::ControlChange) | 0x00;
+        ev_panic.data1 = 123;
+        ev_panic.data2 = 0;
+        rx.inject_event(ev_panic);
+
+        rx.drain_to(router, mixer, &matrix, &player);
+        assert(!player.is_playing());
+        assert(player.held_note_count() == 0);
+
+        std::cout << "  -> Part C (MIDI Panic & All-Notes-Off Flush Invariants): PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -14470,6 +14604,7 @@ int main() {
     test_tracker_timing_and_granular_lpb_tpl();
     test_instrument_phrase_arpeggiator_and_drum_variations();
     test_scales_and_microtonal_scala_tuning_engine();
+    test_live_midi_phrase_routing_and_track_arpeggiation();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
