@@ -146,6 +146,9 @@ private:
 
         uint32_t l_start = m_loop_start.load(std::memory_order_relaxed);
         uint32_t l_end = m_loop_end.load(std::memory_order_relaxed);
+        if (l_start == 0 && m_clip) {
+            l_start = m_clip->start_offset_frames();
+        }
         if (l_end == 0 || l_end > clip_total_frames || l_end <= l_start) {
             l_end = clip_total_frames;
         }

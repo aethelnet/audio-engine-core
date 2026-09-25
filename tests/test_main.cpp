@@ -12142,6 +12142,214 @@ void test_sample_asset_management_and_project_bundle() {
     std::cout << "  -> Sononym & Renoise Inspired Sample Asset Management: ALL PASSED" << std::endl;
 }
 
+// ============================================================================
+// TEST 83: Arranger Slip-Editing, Cross-Track Drag & Drop, and Fade Ramps
+// ============================================================================
+void test_arranger_slip_editing_cross_track_and_fade_ramps() {
+    std::cout << "[TEST 83] Running Arranger Slip-Editing, Cross-Track & Fade Ramps Test..." << std::endl;
+
+    using namespace audio_core;
+    using namespace audio_core::sampling;
+
+    // ========================================================================
+    // Part A: Fade In & Fade Out Curvature Models (Linear, Exp, Log, S-Curve)
+    // ========================================================================
+    {
+        constexpr uint32_t kSr = 48000;
+        constexpr uint32_t kFrames = 48000; // 1 second
+        auto clip = std::make_shared<AudioClip>("fade_test.wav", kSr, 2, kFrames);
+        clip->set_bpm(120.0); // 1 sec = 2.0 beats
+        clip->set_envelope_length_beats(2.0);
+
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            clip->set_sample(0, i, 1.0f);
+            clip->set_sample(1, i, 1.0f);
+        }
+
+        // 1. Fade In Curvatures (2 beats total, midpoint = 1.0 beat)
+        // Linear: gain at midpoint = 0.5
+        clip->set_fade_in(2.0f, FadeShape::Linear);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_lin = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(std::abs(v_lin - 0.5f) < 0.02f);
+        TEST_CHECK(std::abs(clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(0.0) - 0.0f) < 0.01f);
+        TEST_CHECK(std::abs(clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(2.0) - 1.0f) < 0.01f);
+
+        // Exponential: gain at midpoint < 0.20 (slow start, rapid finish)
+        clip->set_fade_in(2.0f, FadeShape::Exponential);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_exp = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(v_exp < 0.20f && v_exp > 0.05f); // Theoretical ~0.1436
+
+        // Logarithmic: gain at midpoint > 0.80 (rapid launch, smooth settle)
+        clip->set_fade_in(2.0f, FadeShape::Logarithmic);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_log = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(v_log > 0.80f && v_log < 0.95f); // Theoretical ~0.8564
+
+        // SCurve: gain at midpoint = 0.5, C^1 smooth Hermite tangents
+        clip->set_fade_in(2.0f, FadeShape::SCurve);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_scurve = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(std::abs(v_scurve - 0.5f) < 0.02f);
+
+        // 2. Fade Out Curvatures (2 beats total, fade out across 2 beats, midpoint = 1.0 beat)
+        clip->set_fade_in(0.0f);
+
+        // Linear Fade Out
+        clip->set_fade_out(2.0f, FadeShape::Linear);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_out_lin = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(std::abs(v_out_lin - 0.5f) < 0.02f);
+        TEST_CHECK(std::abs(clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(0.0) - 1.0f) < 0.01f);
+        TEST_CHECK(std::abs(clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(2.0) - 0.0f) < 0.01f);
+
+        // Exponential Fade Out (steep drop, gentle tail: < 0.20 at midpoint)
+        clip->set_fade_out(2.0f, FadeShape::Exponential);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_out_exp = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(v_out_exp < 0.20f && v_out_exp > 0.05f);
+
+        // Logarithmic Fade Out (stays loud, drops at finish: > 0.80 at midpoint)
+        clip->set_fade_out(2.0f, FadeShape::Logarithmic);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_out_log = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(v_out_log > 0.80f && v_out_log < 0.95f);
+
+        // SCurve Fade Out
+        clip->set_fade_out(2.0f, FadeShape::SCurve);
+        clip->apply_fades_to_gain_envelope(2.0);
+        float v_out_scurve = clip->envelope(ClipEnvelopeTarget::Gain).evaluate_audio_sample(1.0);
+        TEST_CHECK(std::abs(v_out_scurve - 0.5f) < 0.02f);
+
+        // 3. Audio Thread Envelope Application (Zero-Allocation Block Evaluation)
+        alignas(64) float buf_l[512];
+        alignas(64) float buf_r[512];
+        std::fill_n(buf_l, 512, 1.0f);
+        std::fill_n(buf_r, 512, 1.0f);
+
+        // Evaluate fade out over 512 frames from frame 0 to 512
+        clip->apply_envelopes(buf_l, buf_r, 512, 0.0, 512.0, 0, kFrames, 0.5); // 0.5 bars = 2 beats
+        TEST_CHECK(buf_l[0] <= 1.0f && buf_l[0] > 0.95f);
+        TEST_CHECK(buf_l[511] < buf_l[0]);
+        TEST_CHECK(!std::isnan(buf_l[256]));
+
+        std::cout << "  -> Part A (Fade In & Fade Out Curvature Models: Linear, Exp, Log, S-Curve): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part B: Arranger Slip-Editing & Non-Destructive Offset Mapping
+    // ========================================================================
+    {
+        constexpr uint32_t kFrames = 96000; // 2 seconds
+        auto clip = std::make_shared<AudioClip>("slip_test.wav", 48000, 2, kFrames);
+        clip->set_bpm(120.0);
+
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            clip->set_sample(0, i, static_cast<float>(i));
+            clip->set_sample(1, i, static_cast<float>(i * 2));
+        }
+
+        // Set non-destructive offset of 24,000 frames (0.5 sec)
+        clip->set_start_offset_frames(24000);
+        TEST_CHECK(clip->start_offset_frames() == 24000);
+
+        // Verify underlying audio data remains 100% unaltered
+        TEST_CHECK(clip->sample(0, 0) == 0.0f);
+        TEST_CHECK(clip->sample(0, 24000) == 24000.0f);
+
+        // Read from playhead = 0: first frame must be sample 24,000
+        alignas(64) float read_l[256];
+        alignas(64) float read_r[256];
+        uint64_t ph = 0;
+        uint32_t rendered = clip->read(ph, read_l, read_r, 256, false);
+        TEST_CHECK(rendered == 256);
+        TEST_CHECK(read_l[0] == 24000.0f);
+        TEST_CHECK(read_r[0] == 48000.0f);
+        TEST_CHECK(read_l[100] == 24100.0f);
+
+        // Envelope beat mapping: frame 24,000 corresponds to start of clip envelope (beat 0.0)
+        double beat_at_offset = clip->frame_to_envelope_beat(24000.0, 0, kFrames);
+        TEST_CHECK(std::abs(beat_at_offset - 0.0) < 1e-4);
+
+        // Offset Clamping Safety: huge offset must clamp to num_frames() - 1 without crashing
+        clip->set_start_offset_frames(99999999);
+        TEST_CHECK(clip->start_offset_frames() == kFrames - 1);
+
+        // Reset to normal offset
+        clip->set_start_offset_frames(12000);
+        TEST_CHECK(clip->start_offset_frames() == 12000);
+
+        std::cout << "  -> Part B (Arranger Slip-Editing & Non-Destructive Offset Mapping): PASSED" << std::endl;
+    }
+
+    // ========================================================================
+    // Part C: Vertical Cross-Track State Invariants & Audio Thread Integrity
+    // ========================================================================
+    {
+        MixerGraph mixer(256);
+        auto trk0 = mixer.add_track("Track 1 - Lead");
+        mixer.add_track("Track 2 - Bass");
+        auto trk2 = mixer.add_track("Track 3 - Chords");
+        mixer.add_track("Track 4 - Perc");
+
+        auto clip_a = std::make_shared<AudioClip>("lead_clip.wav", 48000, 2, 48000);
+        clip_a->set_start_offset_frames(5000);
+        clip_a->set_fade_in(1.0f, FadeShape::Exponential);
+        clip_a->apply_fades_to_gain_envelope(4.0);
+
+        auto clip_b = std::make_shared<AudioClip>("chord_clip.wav", 48000, 2, 48000);
+        clip_b->set_start_offset_frames(15000);
+        clip_b->set_fade_out(1.0f, FadeShape::Logarithmic);
+        clip_b->apply_fades_to_gain_envelope(4.0);
+
+        for (uint32_t i = 0; i < 48000; ++i) {
+            clip_a->set_sample(0, i, 0.4f);
+            clip_a->set_sample(1, i, 0.4f);
+            clip_b->set_sample(0, i, 0.6f);
+            clip_b->set_sample(1, i, 0.6f);
+        }
+
+        trk0->set_clip(clip_a, true);
+        trk2->set_clip(clip_b, true);
+
+        TEST_CHECK(trk0->clip() == clip_a);
+        TEST_CHECK(trk2->clip() == clip_b);
+        TEST_CHECK(trk0->clip()->start_offset_frames() == 5000);
+        TEST_CHECK(trk2->clip()->start_offset_frames() == 15000);
+
+        // Simulate Cross-Track Vertical Drag Swap (Track 0 <-> Track 2)
+        std::shared_ptr<AudioClip> temp_clip = trk0->clip();
+        trk0->set_clip(trk2->clip(), true);
+        trk2->set_clip(temp_clip, true);
+
+        // Verify clean state transfer & invariants
+        TEST_CHECK(trk0->clip() == clip_b);
+        TEST_CHECK(trk2->clip() == clip_a);
+        TEST_CHECK(trk0->clip()->start_offset_frames() == 15000);
+        TEST_CHECK(trk2->clip()->start_offset_frames() == 5000);
+        TEST_CHECK(trk0->clip()->fade_config().out_shape == FadeShape::Logarithmic);
+        TEST_CHECK(trk2->clip()->fade_config().in_shape == FadeShape::Exponential);
+
+        // Render audio through MixerGraph post-swap
+        AudioBuffer master_out(2, 256);
+        auto master_view = master_out.view();
+        for (int b = 0; b < 16; ++b) {
+            mixer.render(master_view);
+            const float* out_l = master_out.channel(0);
+            const float* out_r = master_out.channel(1);
+            for (int s = 0; s < 256; ++s) {
+                TEST_CHECK(!std::isnan(out_l[s]) && !std::isinf(out_l[s]));
+                TEST_CHECK(!std::isnan(out_r[s]) && !std::isinf(out_r[s]));
+            }
+        }
+
+        std::cout << "  -> Part C (Vertical Cross-Track Drag & Drop State Invariants): PASSED" << std::endl;
+    }
+
+    std::cout << "  -> Arranger Slip-Editing, Cross-Track & Fade Ramps: ALL PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -12229,6 +12437,7 @@ int main() {
     test_lookahead_delay_and_multiband_linkwitz_riley_dnl();
     test_realtime_scheduler_and_bounded_event_budget();
     test_sample_asset_management_and_project_bundle();
+    test_arranger_slip_editing_cross_track_and_fade_ramps();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;

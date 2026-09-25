@@ -4,7 +4,7 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 82/82 Passed](https://img.shields.io/badge/CTest-82%2F82%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 83/83 Passed](https://img.shields.io/badge/CTest-83%2F83%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![RTKit: SCHED_FIFO Support](https://img.shields.io/badge/Linux%20RT-RTKit%20%7C%20SCHED__FIFO-blueviolet.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
@@ -100,7 +100,7 @@ Sub-millisecond buffer rendering (down to 32 frames / 666.7 µs deadline @ 48 kH
 
 ## 3. Test Suite & Verification Matrix
 
-The test harness runs under `ctest` and executes **82 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
+The test harness runs under `ctest` and executes **83 comprehensive unit test suites** covering real-time guarantees, stability, and signal integrity.
 
 ```bash
 $ ./build/audio_tests
@@ -127,8 +127,9 @@ $ ./build/audio_tests
 [TEST 76..80] Lookahead Multiband DNL & LR4 4-Way Crossover:      PASSED
 [TEST 81]     RTKit Real-Time Scheduling Client & Bounded Budget: PASSED
 [TEST 82]     Sononym & Renoise Sample Asset Pool & .aethel Bundle: PASSED
+[TEST 83]     Arranger Slip-Editing, Cross-Track & Fade Ramps:     PASSED
 ===============================================================================
-   82 / 82 UNIT TESTS PASSED (100.0% SUCCESS)
+   83 / 83 UNIT TESTS PASSED (100.0% SUCCESS)
 ===============================================================================
 ```
 

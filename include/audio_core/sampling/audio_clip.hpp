@@ -20,6 +20,22 @@ enum class ClipEnvelopeTarget : uint8_t {
     Pitch = 2   // Clip Pitch Transposition in semitones [-24.0, +24.0] (0.0 = Natural)
 };
 
+enum class FadeShape : uint8_t {
+    Linear      = 0,
+    Exponential = 1,
+    Logarithmic = 2,
+    SCurve      = 3
+};
+
+struct FadeConfig {
+    float in_beats{0.0f};
+    float out_beats{0.0f};
+    FadeShape in_shape{FadeShape::Linear};
+    FadeShape out_shape{FadeShape::Linear};
+    float in_tension{0.0f};
+    float out_tension{0.0f};
+};
+
 struct AudioSlice {
     uint32_t slice_id{0};
     uint32_t start_frame{0};
@@ -65,7 +81,9 @@ public:
           m_gain_envelope_enabled(other.m_gain_envelope_enabled.load(std::memory_order_relaxed)),
           m_pan_envelope_enabled(other.m_pan_envelope_enabled.load(std::memory_order_relaxed)),
           m_pitch_envelope_enabled(other.m_pitch_envelope_enabled.load(std::memory_order_relaxed)),
-          m_envelope_length_beats(other.m_envelope_length_beats.load(std::memory_order_relaxed)) {}
+          m_envelope_length_beats(other.m_envelope_length_beats.load(std::memory_order_relaxed)),
+          m_start_offset_frames(other.m_start_offset_frames.load(std::memory_order_relaxed)),
+          m_fade_config(other.m_fade_config) {}
 
     AudioClip& operator=(const AudioClip& other) {
         if (this != &other) {
@@ -84,6 +102,8 @@ public:
             m_pan_envelope_enabled.store(other.m_pan_envelope_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
             m_pitch_envelope_enabled.store(other.m_pitch_envelope_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
             m_envelope_length_beats.store(other.m_envelope_length_beats.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_start_offset_frames.store(other.m_start_offset_frames.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_fade_config = other.m_fade_config;
         }
         return *this;
     }
@@ -221,7 +241,7 @@ public:
         }
     }
 
-    // Lock-free read of audio frames with optional looping
+    // Lock-free read of audio frames with optional looping and non-destructive start offset
     uint32_t read(uint64_t& playhead, float* dst_l, float* dst_r, uint32_t frames_to_read, bool loop = true) const noexcept {
         if (m_frames == 0 || m_channels == 0) {
             for (uint32_t i = 0; i < frames_to_read; ++i) {
@@ -233,12 +253,16 @@ public:
 
         const float* src_l = m_data[0].data();
         const float* src_r = (m_channels > 1) ? m_data[1].data() : src_l;
+        const uint32_t offset = m_start_offset_frames.load(std::memory_order_relaxed);
 
         uint32_t frames_rendered = 0;
         for (uint32_t i = 0; i < frames_to_read; ++i) {
-            if (playhead >= m_frames) {
+            uint64_t actual_frame = playhead + offset;
+            if (actual_frame >= m_frames) {
                 if (loop) {
-                    playhead %= m_frames;
+                    uint64_t span = (m_frames > offset) ? (m_frames - offset) : m_frames;
+                    actual_frame = offset + (playhead % std::max<uint64_t>(1, span));
+                    if (actual_frame >= m_frames) actual_frame = offset;
                 } else {
                     for (uint32_t j = i; j < frames_to_read; ++j) {
                         dst_l[j] = 0.0f;
@@ -247,8 +271,8 @@ public:
                     return frames_rendered;
                 }
             }
-            dst_l[i] = src_l[playhead];
-            dst_r[i] = src_r[playhead];
+            dst_l[i] = src_l[actual_frame];
+            dst_r[i] = src_r[actual_frame];
             playhead++;
             frames_rendered++;
         }
@@ -608,10 +632,100 @@ public:
         m_envelope_length_beats.store(std::max(0.1, beats), std::memory_order_relaxed);
     }
 
+    [[nodiscard]] uint32_t start_offset_frames() const noexcept {
+        return m_start_offset_frames.load(std::memory_order_relaxed);
+    }
+
+    void set_start_offset_frames(uint32_t offset) noexcept {
+        if (m_frames > 0) {
+            m_start_offset_frames.store(std::min(offset, m_frames - 1), std::memory_order_relaxed);
+        } else {
+            m_start_offset_frames.store(offset, std::memory_order_relaxed);
+        }
+    }
+
+    [[nodiscard]] const FadeConfig& fade_config() const noexcept { return m_fade_config; }
+    void set_fade_config(const FadeConfig& cfg) noexcept { m_fade_config = cfg; }
+
+    void set_fade_in(float beats, FadeShape shape = FadeShape::Linear, float tension = 0.0f) noexcept {
+        m_fade_config.in_beats = std::max(0.0f, beats);
+        m_fade_config.in_shape = shape;
+        m_fade_config.in_tension = tension;
+    }
+
+    void set_fade_out(float beats, FadeShape shape = FadeShape::Linear, float tension = 0.0f) noexcept {
+        m_fade_config.out_beats = std::max(0.0f, beats);
+        m_fade_config.out_shape = shape;
+        m_fade_config.out_tension = tension;
+    }
+
+    void apply_fades_to_gain_envelope(double total_beats = 0.0) {
+        const double tot_b = (total_beats > 0.0) ? total_beats : envelope_length_beats();
+        double in_b = std::max(0.0, static_cast<double>(m_fade_config.in_beats));
+        double out_b = std::max(0.0, static_cast<double>(m_fade_config.out_beats));
+
+        if (in_b + out_b > tot_b && (in_b + out_b) > 1e-6) {
+            double scale = tot_b / (in_b + out_b);
+            in_b *= scale;
+            out_b *= scale;
+        }
+
+        auto shape_to_mode_and_tension = [](FadeShape shape, float user_tension, bool is_out) -> std::pair<routing::NodeMode, float> {
+            switch (shape) {
+                case FadeShape::Linear:
+                    return {routing::NodeMode::Corner, 0.0f};
+                case FadeShape::Exponential:
+                    return {routing::NodeMode::Corner, (std::abs(user_tension) > 1e-4f) ? user_tension : (is_out ? -0.6f : 0.6f)};
+                case FadeShape::Logarithmic:
+                    return {routing::NodeMode::Corner, (std::abs(user_tension) > 1e-4f) ? user_tension : (is_out ? 0.6f : -0.6f)};
+                case FadeShape::SCurve:
+                    return {routing::NodeMode::Smooth, user_tension};
+            }
+            return {routing::NodeMode::Corner, 0.0f};
+        };
+
+        const auto [in_mode, in_tension] = shape_to_mode_and_tension(m_fade_config.in_shape, m_fade_config.in_tension, false);
+        const auto [out_mode, out_tension] = shape_to_mode_and_tension(m_fade_config.out_shape, m_fade_config.out_tension, true);
+
+        std::vector<routing::AutomationPoint> pts;
+        const bool has_in = (in_b > 1e-4);
+        const bool has_out = (out_b > 1e-4);
+
+        if (!has_in && !has_out) {
+            pts.push_back(routing::AutomationPoint{0.0, 1.0f, routing::NodeMode::Smooth, 0.0f});
+            pts.push_back(routing::AutomationPoint{tot_b, 1.0f, routing::NodeMode::Smooth, 0.0f});
+            set_envelope_enabled(ClipEnvelopeTarget::Gain, false);
+        } else if (has_in && !has_out) {
+            pts.push_back(routing::AutomationPoint{0.0, 0.0f, in_mode, in_tension});
+            pts.push_back(routing::AutomationPoint{in_b, 1.0f, routing::NodeMode::Smooth, 0.0f});
+            pts.push_back(routing::AutomationPoint{tot_b, 1.0f, routing::NodeMode::Smooth, 0.0f});
+            set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+        } else if (!has_in && has_out) {
+            pts.push_back(routing::AutomationPoint{0.0, 1.0f, routing::NodeMode::Smooth, 0.0f});
+            pts.push_back(routing::AutomationPoint{tot_b - out_b, 1.0f, out_mode, out_tension});
+            pts.push_back(routing::AutomationPoint{tot_b, 0.0f, routing::NodeMode::Smooth, 0.0f});
+            set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+        } else {
+            pts.push_back(routing::AutomationPoint{0.0, 0.0f, in_mode, in_tension});
+            if (in_b < tot_b - out_b - 1e-5) {
+                pts.push_back(routing::AutomationPoint{in_b, 1.0f, routing::NodeMode::Smooth, 0.0f});
+                pts.push_back(routing::AutomationPoint{tot_b - out_b, 1.0f, out_mode, out_tension});
+            } else {
+                pts.push_back(routing::AutomationPoint{in_b, 1.0f, out_mode, out_tension});
+            }
+            pts.push_back(routing::AutomationPoint{tot_b, 0.0f, routing::NodeMode::Smooth, 0.0f});
+            set_envelope_enabled(ClipEnvelopeTarget::Gain, true);
+        }
+
+        m_gain_envelope.set_points(std::move(pts));
+        set_envelope_length_beats(tot_b);
+    }
+
     // Convert frame position in loop to clip envelope beat
     [[nodiscard]] double frame_to_envelope_beat(double frame_pos, uint32_t loop_start = 0, uint32_t loop_end = 0, double user_bar_length = 0.0) const noexcept {
-        const uint32_t l_start = loop_start;
-        const uint32_t l_end = (loop_end > loop_start && loop_end <= m_frames) ? loop_end : m_frames;
+        const uint32_t offset = m_start_offset_frames.load(std::memory_order_relaxed);
+        const uint32_t l_start = (loop_start > 0) ? loop_start : offset;
+        const uint32_t l_end = (loop_end > l_start && loop_end <= m_frames) ? loop_end : m_frames;
         const double loop_len = static_cast<double>((l_end > l_start) ? (l_end - l_start) : std::max(1u, m_frames));
         double clip_beats = (user_bar_length > 0.0) ? (user_bar_length * 4.0) : envelope_length_beats();
 
@@ -631,8 +745,9 @@ public:
         const bool pan_active = m_pan_envelope_enabled.load(std::memory_order_relaxed);
         if (!gain_active && !pan_active) return;
 
-        const uint32_t l_start = loop_start;
-        const uint32_t l_end = (loop_end > loop_start && loop_end <= m_frames) ? loop_end : m_frames;
+        const uint32_t offset = m_start_offset_frames.load(std::memory_order_relaxed);
+        const uint32_t l_start = (loop_start > 0) ? loop_start : offset;
+        const uint32_t l_end = (loop_end > l_start && loop_end <= m_frames) ? loop_end : m_frames;
         const double loop_len = static_cast<double>((l_end > l_start) ? (l_end - l_start) : std::max(1u, m_frames));
         double clip_beats = (user_bar_length > 0.0) ? (user_bar_length * 4.0) : envelope_length_beats();
 
@@ -716,6 +831,8 @@ private:
     std::atomic<bool> m_pan_envelope_enabled{false};
     std::atomic<bool> m_pitch_envelope_enabled{false};
     std::atomic<double> m_envelope_length_beats{0.0};
+    std::atomic<uint32_t> m_start_offset_frames{0};
+    FadeConfig m_fade_config{};
 };
 
 } // namespace audio_core::sampling
