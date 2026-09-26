@@ -35,5 +35,6 @@ third_party/clap-wrapper/
 
 Makefile
 CTestTestfile.cmake
-Testing/
-
+# Runtime UI configs
+imgui.ini
+*.ini

@@ -128,11 +128,25 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(1440, 900, "AETHEL AUDIO DESK // SOVEREIGN ENGINE [RT 48kHz]", nullptr, nullptr);
+    // Query monitor work area for adaptive window sizing
+    GLFWmonitor* primary_mon = glfwGetPrimaryMonitor();
+    int work_x = 0, work_y = 0, work_w = 1440, work_h = 900;
+    if (primary_mon) {
+        glfwGetMonitorWorkarea(primary_mon, &work_x, &work_y, &work_w, &work_h);
+    }
+    int win_target_w = std::min(1440, work_w - 24);
+    int win_target_h = std::min(900, work_h - 48);
+    if (win_target_w < 1024) win_target_w = work_w;
+    if (win_target_h < 640) win_target_h = work_h;
+
+    GLFWwindow* window = glfwCreateWindow(win_target_w, win_target_h, "AETHEL AUDIO DESK // SOVEREIGN ENGINE [RT 48kHz]", nullptr, nullptr);
     if (!window) {
         std::cerr << "[Error] Failed to create GLFW window!" << std::endl;
         glfwTerminate();
         return 1;
+    }
+    if (primary_mon) {
+        glfwSetWindowPos(window, work_x + (work_w - win_target_w) / 2, work_y + (work_h - win_target_h) / 2);
     }
 
     glfwMakeContextCurrent(window);
@@ -1065,6 +1079,11 @@ int main(int argc, char** argv) {
         // Workstation Fullscreen Dock Window
         int win_w, win_h;
         glfwGetFramebufferSize(window, &win_w, &win_h);
+        static float g_ui_scale = (win_target_h <= 800) ? 0.85f : 1.0f;
+        static float s_zone_split_ratio = 0.48f;
+        ImGuiIO& io = ImGui::GetIO();
+        io.FontGlobalScale = g_ui_scale;
+
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2(static_cast<float>(win_w), static_cast<float>(win_h)));
         ImGui::Begin("AethelAudioDeskRoot", nullptr,
@@ -1113,8 +1132,20 @@ int main(int argc, char** argv) {
         // ====================================================================
         // ZONE 1: TOP GLOBAL TRANSPORT & HUD BAR
         // ====================================================================
-        ImGui::BeginChild("TopTransportBar", ImVec2(0, 52), true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::BeginChild("TopTransportBar", ImVec2(0, 54), true, ImGuiWindowFlags_NoScrollbar);
         {
+            // Global Transport Key Shortcuts (Space = Play/Pause, Home = Return to Zero)
+            if (!io.WantTextInput) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+                    is_playing = !is_playing;
+                    mixer.clock().set_playing(is_playing);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_Home)) {
+                    mixer.seek(0, true);
+                    playhead_seconds = 0.0f;
+                }
+            }
+
             // Transport Controls
             if (ImGui::Button(is_playing ? "[ || PAUSE ]" : "[ > PLAY ]", ImVec2(90, 32))) {
                 is_playing = !is_playing;
@@ -1128,8 +1159,26 @@ int main(int argc, char** argv) {
                 playhead_seconds = 0.0f;
             }
 
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(100);
+            // Layout Presets & UI Scaling
+            ImGui::SameLine(0, 10);
+            ImGui::SetNextItemWidth(62);
+            if (ImGui::SliderFloat("Scale", &g_ui_scale, 0.70f, 1.30f, "%.2fx")) {
+                io.FontGlobalScale = g_ui_scale;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Global UI & Font Scale (70%% - 130%%)");
+
+            ImGui::SameLine(0, 6);
+            if (ImGui::SmallButton("ARR")) { s_zone_split_ratio = 0.82f; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Arranger Focus Layout");
+            ImGui::SameLine(0, 3);
+            if (ImGui::SmallButton("50/50")) { s_zone_split_ratio = 0.48f; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Balanced Split Layout");
+            ImGui::SameLine(0, 3);
+            if (ImGui::SmallButton("MIX")) { s_zone_split_ratio = 0.16f; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mixer Focus Layout");
+
+            ImGui::SameLine(0, 10);
+            ImGui::SetNextItemWidth(90);
             if (mixer.clock().authority() == clock::ClockAuthority::MidiClockSlave) {
                 ImGui::BeginDisabled();
                 ImGui::SliderFloat("BPM", &bpm, 60.0f, 200.0f, "%.1f (MIDI)");
@@ -1458,9 +1507,11 @@ int main(int argc, char** argv) {
         ImGui::EndChild();
 
         // Calculate available vertical space for Zone 2 (Center) and Zone 3 (Bottom Dock)
-        const float available_h = static_cast<float>(win_h) - 68.0f;
-        const float zone2_h = available_h * 0.46f;
-        const float zone3_h = available_h * 0.54f;
+        const float available_h = static_cast<float>(win_h) - 72.0f;
+        const float min_z2 = 40.0f;
+        const float min_z3 = 120.0f;
+        float zone2_h = std::clamp(available_h * s_zone_split_ratio, min_z2, std::max(min_z2, available_h - min_z3 - 10.0f));
+        float zone3_h = std::max(min_z3, available_h - zone2_h - 10.0f);
 
         // ====================================================================
         // ZONE 2: CENTER WORKSPACE (TIMELINE ARRANGER vs. ROUTING MATRIX)
@@ -3964,6 +4015,24 @@ int main(int argc, char** argv) {
         }
         ImGui::EndChild();
 
+        // --------------------------------------------------------------------
+        // RESIZABLE ZONE SPLITTER HANDLE (DRAG NS TO ADJUST ARRANGER / MIXER)
+        // --------------------------------------------------------------------
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.55f, 0.85f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.70f, 1.0f, 1.0f));
+        ImGui::Button("##ZoneSplitter", ImVec2(-1, 6));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::IsItemActive()) {
+            float mouse_delta_y = io.MouseDelta.y;
+            if (available_h > 100.0f) {
+                s_zone_split_ratio = std::clamp(s_zone_split_ratio + (mouse_delta_y / available_h), 0.08f, 0.92f);
+            }
+        }
+        ImGui::PopStyleColor(3);
+
         // ====================================================================
         // ZONE 3: BOTTOM CONTEXT-SENSITIVE DOCKED TABS
         // ====================================================================
@@ -3974,6 +4043,7 @@ int main(int argc, char** argv) {
                 // TAB 1: MIXER / CHANNEL STRIP
                 // ------------------------------------------------------------
                 if (ImGui::BeginTabItem("  MIXER / CHANNEL STRIP  ")) {
+                    ImGui::BeginChild("MixerHorizontalScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
                     const char* track_names[4] = { "1: Kick / 808", "2: Acid 303", "3: Vocal", "4: Drums" };
                     const char* console_types[4] = { "Digital", "Warm Analog", "Lush Console", "Direct Clean" };
 
@@ -4188,21 +4258,35 @@ int main(int argc, char** argv) {
                                 mixer.post_command(cmd);
                             }
 
-                            // 4 Insert Slots (Zähl AM1 Modular Inserts)
-                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "Insert Slots (4x):");
+                            // 500-Series Modular Insert Strip (Zähl AM1 & API 500 Style)
+                            static bool s_slot_unfolded[4][4] = {
+                                {true, false, false, false},
+                                {true, false, false, false},
+                                {true, false, false, false},
+                                {true, false, false, false}
+                            };
+
+                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "500-Series Inserts:");
                             for (int s = 0; s < 4; ++s) {
                                 ImGui::PushID(s);
-                                ImGui::TextDisabled("S%d:", s + 1);
-                                ImGui::SameLine();
-                                const char* slot_name = "[Empty]";
-                                bool is_by = false;
                                 bool has_proc = (trk_ptr && trk_ptr->slot(s).processor() != nullptr);
+                                auto* proc = has_proc ? trk_ptr->slot(s).processor() : nullptr;
+                                bool is_by = has_proc ? trk_ptr->slot(s).is_bypassed() : false;
+
+                                // Header row: Accordion toggle, Slot name/menu button, Bypass
                                 if (has_proc) {
-                                    slot_name = trk_ptr->slot(s).processor()->name();
-                                    is_by = trk_ptr->slot(s).is_bypassed();
+                                    if (ImGui::SmallButton(s_slot_unfolded[t][s] ? "v" : ">")) {
+                                        s_slot_unfolded[t][s] = !s_slot_unfolded[t][s];
+                                    }
+                                    ImGui::SameLine(0, 3);
+                                } else {
+                                    ImGui::TextDisabled("S%d:", s + 1);
+                                    ImGui::SameLine(0, 4);
                                 }
+
+                                const char* slot_name = has_proc ? proc->name() : "[Empty]";
                                 char btn_label[48];
-                                std::snprintf(btn_label, sizeof(btn_label), "%.14s", slot_name);
+                                std::snprintf(btn_label, sizeof(btn_label), "%.13s", slot_name);
 
                                 if (has_proc) {
                                     if (is_by) {
@@ -4214,15 +4298,15 @@ int main(int argc, char** argv) {
                                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.45f, 0.50f, 0.7f));
                                 }
 
-                                if (ImGui::Button(btn_label, ImVec2(96, 18))) {
+                                if (ImGui::Button(btn_label, ImVec2(has_proc ? 88 : 105, 18))) {
                                     ImGui::OpenPopup("InsertSelectMenu");
                                 }
                                 ImGui::PopStyleColor();
 
                                 if (ImGui::IsItemHovered() && has_proc) {
-                                    ImGui::SetTooltip("%s (Click to change/clear)", trk_ptr->slot(s).processor()->name());
+                                    ImGui::SetTooltip("%s\nClick to change/clear module", proc->name());
                                 } else if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Click to load DSP module into Slot %d", s + 1);
+                                    ImGui::SetTooltip("Click to load 500-series module into Slot %d", s + 1);
                                 }
 
                                 if (ImGui::BeginPopup("InsertSelectMenu")) {
@@ -4233,6 +4317,7 @@ int main(int argc, char** argv) {
                                         if (!trk_ptr) return;
                                         auto old_p = trk_ptr->slot(s).shared_processor();
                                         trk_ptr->slot(s).set_processor(new_p);
+                                        s_slot_unfolded[t][s] = (new_p != nullptr);
                                         g_undo_mgr.push_action(std::make_unique<undo::InsertSlotAction>(
                                             &trk_ptr->slot(s), old_p, new_p, desc
                                         ));
@@ -4328,6 +4413,104 @@ int main(int argc, char** argv) {
                                         ));
                                     }
                                 }
+
+                                if (has_proc && s_slot_unfolded[t][s]) {
+                                    // Embedded 500-Series Faceplate Module with Rotary Controls
+                                    ImGui::PushStyleColor(ImGuiCol_ChildBg, is_by ? ImVec4(0.95f, 0.95f, 0.96f, 0.7f) : ImVec4(0.91f, 0.94f, 0.98f, 0.9f));
+                                    char mod_child_id[32];
+                                    std::snprintf(mod_child_id, sizeof(mod_child_id), "ModStrip_%d_%d", t, s);
+                                    ImGui::BeginChild(mod_child_id, ImVec2(0, 56), true, ImGuiWindowFlags_NoScrollbar);
+                                    {
+                                        std::string pname = proc->name();
+                                        if (pname.find("Baxandall") != std::string::npos) {
+                                            float bass = proc->get_parameter(0);
+                                            float treb = proc->get_parameter(1);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                            if (ui::DrawRotaryKnob("Bass", &bass, -12.0f, 12.0f, "dB", 12.0f)) {
+                                                proc->set_parameter(0, bass);
+                                            }
+                                            ImGui::SameLine(0, 16);
+                                            if (ui::DrawRotaryKnob("Treb", &treb, -12.0f, 12.0f, "dB", 12.0f)) {
+                                                proc->set_parameter(1, treb);
+                                            }
+                                        } else if (pname.find("ButterComp2") != std::string::npos) {
+                                            float comp = proc->get_parameter(0);
+                                            float out  = proc->get_parameter(1);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                            if (ui::DrawRotaryKnob("Comp", &comp, 0.0f, 1.0f, "", 12.0f)) {
+                                                proc->set_parameter(0, comp);
+                                            }
+                                            ImGui::SameLine(0, 16);
+                                            if (ui::DrawRotaryKnob("Out", &out, 0.0f, 2.0f, "", 12.0f)) {
+                                                proc->set_parameter(1, out);
+                                            }
+                                        } else if (pname.find("PurestDrive") != std::string::npos) {
+                                            float drv = proc->get_parameter(0);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 26.0f);
+                                            if (ui::DrawRotaryKnob("Drive", &drv, 0.0f, 1.0f, "", 12.0f)) {
+                                                proc->set_parameter(0, drv);
+                                            }
+                                            ImGui::SameLine(0, 8);
+                                            ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.10f, 1.0f), "%.0f%%", drv * 100.0f);
+                                        } else if (pname.find("DeRez") != std::string::npos) {
+                                            float rate = proc->get_parameter(0);
+                                            float res  = proc->get_parameter(1);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                            if (ui::DrawRotaryKnob("Rate", &rate, 0.0f, 1.0f, "", 12.0f)) {
+                                                proc->set_parameter(0, rate);
+                                            }
+                                            ImGui::SameLine(0, 16);
+                                            if (ui::DrawRotaryKnob("Res", &res, 0.0f, 1.0f, "", 12.0f)) {
+                                                proc->set_parameter(1, res);
+                                            }
+                                        } else if (pname.find("Vactrol") != std::string::npos || pname.find("LA-2A") != std::string::npos || pname.find("Buchla") != std::string::npos) {
+                                            float red = proc->get_parameter(0);
+                                            float gain = proc->get_parameter(1);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                            if (ui::DrawRotaryKnob("Red", &red, 0.0f, 1.0f, "", 12.0f)) {
+                                                proc->set_parameter(0, red);
+                                            }
+                                            ImGui::SameLine(0, 16);
+                                            if (ui::DrawRotaryKnob("Gain", &gain, -6.0f, 18.0f, "dB", 12.0f)) {
+                                                proc->set_parameter(1, gain);
+                                            }
+                                        } else if (pname.find("Transient") != std::string::npos || pname.find("Shaper") != std::string::npos) {
+                                            float att = proc->get_parameter(0);
+                                            float sus = proc->get_parameter(1);
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                            if (ui::DrawRotaryKnob("Att", &att, -15.0f, 15.0f, "dB", 12.0f)) {
+                                                proc->set_parameter(0, att);
+                                            }
+                                            ImGui::SameLine(0, 16);
+                                            if (ui::DrawRotaryKnob("Sus", &sus, -15.0f, 15.0f, "dB", 12.0f)) {
+                                                proc->set_parameter(1, sus);
+                                            }
+                                        } else {
+                                            uint32_t pcount = proc->parameter_count();
+                                            if (pcount >= 2) {
+                                                float p0 = proc->get_parameter(0);
+                                                float p1 = proc->get_parameter(1);
+                                                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                                                if (ui::DrawRotaryKnob(proc->parameter_name(0), &p0, proc->parameter_min(0), proc->parameter_max(0), "", 12.0f)) {
+                                                    proc->set_parameter(0, p0);
+                                                }
+                                                ImGui::SameLine(0, 16);
+                                                if (ui::DrawRotaryKnob(proc->parameter_name(1), &p1, proc->parameter_min(1), proc->parameter_max(1), "", 12.0f)) {
+                                                    proc->set_parameter(1, p1);
+                                                }
+                                            } else if (pcount == 1) {
+                                                float p0 = proc->get_parameter(0);
+                                                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 26.0f);
+                                                if (ui::DrawRotaryKnob(proc->parameter_name(0), &p0, proc->parameter_min(0), proc->parameter_max(0), "", 12.0f)) {
+                                                    proc->set_parameter(0, p0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ImGui::EndChild();
+                                    ImGui::PopStyleColor();
+                                }
+
                                 ImGui::PopID();
                             }
 
@@ -4480,7 +4663,22 @@ int main(int argc, char** argv) {
                         }
 
                         ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "[Glue Compressor]");
+                        auto* bprocA = bus_drums ? bus_drums->slot(0).processor() : nullptr;
+                        if (bprocA) {
+                            ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "500: %s", bprocA->name());
+                            float comp = bprocA->get_parameter(0);
+                            float out  = bprocA->get_parameter(1);
+                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                            if (ui::DrawRotaryKnob("Comp##ba", &comp, 0.0f, 1.0f, "", 12.0f)) {
+                                bprocA->set_parameter(0, comp);
+                            }
+                            ImGui::SameLine(0, 14);
+                            if (ui::DrawRotaryKnob("Out##ba", &out, 0.0f, 2.0f, "", 12.0f)) {
+                                bprocA->set_parameter(1, out);
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "[Glue Compressor]");
+                        }
 
                         ImGui::Spacing();
                         if (ImGui::Checkbox("M##ba", &bus_mutes[0])) {
@@ -4538,7 +4736,22 @@ int main(int argc, char** argv) {
                         }
 
                         ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "[Analog Summing]");
+                        auto* bprocB = bus_music ? bus_music->slot(0).processor() : nullptr;
+                        if (bprocB) {
+                            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "500: %s", bprocB->name());
+                            float p0 = bprocB->get_parameter(0);
+                            float p1 = bprocB->get_parameter(1);
+                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                            if (ui::DrawRotaryKnob(bprocB->parameter_name(0), &p0, bprocB->parameter_min(0), bprocB->parameter_max(0), "", 12.0f)) {
+                                bprocB->set_parameter(0, p0);
+                            }
+                            ImGui::SameLine(0, 14);
+                            if (ui::DrawRotaryKnob(bprocB->parameter_name(1), &p1, bprocB->parameter_min(1), bprocB->parameter_max(1), "", 12.0f)) {
+                                bprocB->set_parameter(1, p1);
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "[Analog Summing]");
+                        }
 
                         ImGui::Spacing();
                         if (ImGui::Checkbox("M##bb", &bus_mutes[1])) {
@@ -4585,6 +4798,22 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(ImVec4(0.85f, 0.18f, 0.22f, 1.0f), "MASTER OUT");
                         ImGui::Separator();
                         ImGui::TextDisabled("Physical DAC");
+
+                        ImGui::Spacing();
+                        auto* mproc = mixer.master_bus().slot(0).processor();
+                        if (mproc) {
+                            ImGui::TextColored(ImVec4(0.85f, 0.18f, 0.22f, 1.0f), "500: %s", mproc->name());
+                            float mbass = mproc->get_parameter(0);
+                            float mtreb = mproc->get_parameter(1);
+                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f);
+                            if (ui::DrawRotaryKnob("Bass##mst", &mbass, -12.0f, 12.0f, "dB", 12.0f)) {
+                                mproc->set_parameter(0, mbass);
+                            }
+                            ImGui::SameLine(0, 14);
+                            if (ui::DrawRotaryKnob("Treb##mst", &mtreb, -12.0f, 12.0f, "dB", 12.0f)) {
+                                mproc->set_parameter(1, mtreb);
+                            }
+                        }
 
                         ImGui::Spacing();
                         if (ImGui::Checkbox("LIMITER##mst", &master_limiter)) {
@@ -4935,6 +5164,7 @@ int main(int argc, char** argv) {
                     ImGui::EndChild();
                     ImGui::PopID();
 
+                    ImGui::EndChild(); // MixerHorizontalScrollRegion
                     ImGui::EndTabItem();
                 }
 
