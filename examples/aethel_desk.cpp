@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     auto* trk0 = mixer.allocate_track("Kick / 808 Sub");
     auto* trk1 = mixer.allocate_track("Acid 303 Lead");
     auto* trk2 = mixer.allocate_track("Vocal Chops");
-    auto* trk3 = mixer.allocate_track("Drums / Bus");
+    auto* trk3 = mixer.allocate_track("Percussion / Hats");
 
     // Allocate Submix and Auxiliary Buses
     auto* bus_drums  = mixer.allocate_submix_bus("Bus A: Drums");
@@ -202,15 +202,15 @@ int main(int argc, char** argv) {
     trk3->set_sequencer_send_a_bus(bus_reverb->id());
     trk3->set_sequencer_send_b_bus(bus_delay->id());
 
-    // Route tracks to Submix buses by default:
-    // Track 1 (Kick/808) -> Bus A (Drums)
-    // Track 2 (Acid 303) -> Bus B (Music)
-    // Track 3 (Vocal)    -> Bus B (Music)
-    // Track 4 (Drums)    -> Master
+    // Route tracks to Submix buses by default (Clean Zähl AM1 Summing Topology):
+    // Track 1 (Kick / 808 Sub)    -> Bus A (Drums)
+    // Track 2 (Acid 303 Lead)     -> Bus B (Music)
+    // Track 3 (Vocal Chops)       -> Bus B (Music)
+    // Track 4 (Percussion / Hats) -> Bus A (Drums)
     trk0->set_target_bus(bus_drums->id());
     trk1->set_target_bus(bus_music->id());
     trk2->set_target_bus(bus_music->id());
-    trk3->set_target_bus(0); // Master Out
+    trk3->set_target_bus(bus_drums->id());
 
     // Tracks 0-3 start completely clean and transparent (Zähl AM1 console baseline)
     // Inserts are user-assignable via Channel Strip slots S1..S4
@@ -439,11 +439,23 @@ int main(int argc, char** argv) {
     }
 
 
-    // Workspace UI State
+    // Workspace UI & Transport State
     bool is_playing = false;
     float bpm = 126.0f;
     float playhead_seconds = 0.0f;
-    const float loop_length_seconds = 8.0f; // 4 bars at 120bpm
+    bool loop_active = true;
+    float loop_start_bar = 0.0f;
+    float loop_bars = 4.0f;
+
+    auto get_seconds_per_bar = [](float current_bpm) noexcept -> float {
+        return (60.0f / std::max(20.0f, current_bpm)) * 4.0f;
+    };
+    auto get_loop_length_seconds = [&](float current_bpm) noexcept -> float {
+        return loop_bars * get_seconds_per_bar(current_bpm);
+    };
+    auto get_loop_start_seconds = [&](float current_bpm) noexcept -> float {
+        return loop_start_bar * get_seconds_per_bar(current_bpm);
+    };
     int selected_track = 0;
     int active_slice = 0;
 
@@ -677,7 +689,6 @@ int main(int argc, char** argv) {
     int track_consoles[4] = { 1, 2, 3, 0 }; // Warm, Lush, etc.
 
     // Clip Launcher & Arranger state
-    bool loop_region_active = true;
     int pattern_editor_pat_idx = 0; // 0..3 (Patterns 1..4)
     int pattern_editor_step_idx = 0; // 0..15
 
@@ -866,16 +877,21 @@ int main(int argc, char** argv) {
         float dt = std::chrono::duration<float>(now - last_time).count();
         last_time = now;
 
+        float loop_st_sec = get_loop_start_seconds(bpm);
+        float loop_len_sec = get_loop_length_seconds(bpm);
+        float loop_end_sec = loop_st_sec + loop_len_sec;
+
         if (is_playing) {
             if (pw_online) {
                 playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
-                if (playhead_seconds >= loop_length_seconds) {
-                    playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
+                if (loop_active && playhead_seconds >= loop_end_sec) {
+                    playhead_seconds = loop_st_sec + std::fmod(std::max(0.0f, playhead_seconds - loop_st_sec), loop_len_sec);
+                    mixer.seek(static_cast<uint64_t>(playhead_seconds * kSampleRate));
                 }
             } else {
                 playhead_seconds += dt * (bpm / 120.0f);
-                if (playhead_seconds >= loop_length_seconds) {
-                    playhead_seconds = std::fmod(playhead_seconds, loop_length_seconds);
+                if (loop_active && playhead_seconds >= loop_end_sec) {
+                    playhead_seconds = loop_st_sec + std::fmod(std::max(0.0f, playhead_seconds - loop_st_sec), loop_len_sec);
                 }
                 mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
             }
@@ -1079,7 +1095,7 @@ int main(int argc, char** argv) {
         // Workstation Fullscreen Dock Window
         int win_w, win_h;
         glfwGetFramebufferSize(window, &win_w, &win_h);
-        static float g_ui_scale = (win_target_h <= 800) ? 0.85f : 1.0f;
+        static float g_ui_scale = (win_target_h <= 800) ? 0.78f : 1.0f;
         static float s_zone_split_ratio = 0.48f;
         ImGuiIO& io = ImGui::GetIO();
         io.FontGlobalScale = g_ui_scale;
@@ -1134,7 +1150,7 @@ int main(int argc, char** argv) {
         // ====================================================================
         ImGui::BeginChild("TopTransportBar", ImVec2(0, 54), true, ImGuiWindowFlags_NoScrollbar);
         {
-            // Global Transport Key Shortcuts (Space = Play/Pause, Home = Return to Zero)
+            // Global Transport Key Shortcuts (Space = Play/Pause, Home = Return to Zero, L = Loop)
             if (!io.WantTextInput) {
                 if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
                     is_playing = !is_playing;
@@ -1143,6 +1159,10 @@ int main(int argc, char** argv) {
                 if (ImGui::IsKeyPressed(ImGuiKey_Home)) {
                     mixer.seek(0, true);
                     playhead_seconds = 0.0f;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_L)) {
+                    loop_active = !loop_active;
+                    std::snprintf(status_toast, sizeof(status_toast), "TIMELINE LOOP: %s", loop_active ? "ENABLED" : "BYPASSED");
                 }
             }
 
@@ -1158,6 +1178,18 @@ int main(int argc, char** argv) {
                 mixer.seek(0, true);
                 playhead_seconds = 0.0f;
             }
+
+            ImGui::SameLine();
+            if (loop_active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            }
+            if (ImGui::Button("[ ⟳ LOOP ]", ImVec2(78, 32))) {
+                loop_active = !loop_active;
+                std::snprintf(status_toast, sizeof(status_toast), "TIMELINE LOOP: %s", loop_active ? "ENABLED" : "BYPASSED");
+            }
+            if (loop_active) ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Timeline Loop (Shortcut: L)");
 
             // Layout Presets & UI Scaling
             ImGui::SameLine(0, 10);
@@ -1312,8 +1344,7 @@ int main(int argc, char** argv) {
 
             // Ctrl+E: Split selected clip at playhead
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E)) {
-                constexpr int kTotalBarsShort = 16;
-                float playhead_bar = (playhead_seconds / loop_length_seconds) * static_cast<float>(kTotalBarsShort);
+                float playhead_bar = playhead_seconds / get_seconds_per_bar(bpm);
                 int t = selected_track;
                 if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
                     int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
@@ -1518,159 +1549,28 @@ int main(int argc, char** argv) {
         // ====================================================================
         ImGui::BeginChild("CenterWorkspace", ImVec2(0, zone2_h), true);
         {
+            const char* track_names[4] = { "Track 1: Kick / 808", "Track 2: Acid 303 Lead", "Track 3: Vocal Chops", "Track 4: Percussion / Hats" };
+
+            struct TrackRoutingBadge {
+                const char* bus_name;
+                ImColor bg_color;
+                ImColor text_color;
+            };
+            const TrackRoutingBadge k_track_routing_badges[4] = {
+                { "-> BUS A (DRUMS)", ImColor(217, 123, 13, 230), ImColor(255, 255, 255, 255) },
+                { "-> BUS B (MUSIC)", ImColor(14, 116, 144, 230), ImColor(255, 255, 255, 255) },
+                { "-> BUS B (MUSIC)", ImColor(14, 116, 144, 230), ImColor(255, 255, 255, 255) },
+                { "-> BUS A (DRUMS)", ImColor(217, 123, 13, 230), ImColor(255, 255, 255, 255) },
+            };
+
             if (ImGui::BeginTabBar("MainWorkspaceTabs", ImGuiTabBarFlags_None)) {
                 // ------------------------------------------------------------
-                // TAB A: TIMELINE & CLIP LAUNCHER (HYBRID ARRANGER)
+                // TAB 1: TIMELINE ARRANGER (CLEAN ZÄHL AM1 CANVAS)
                 // ------------------------------------------------------------
-                if (ImGui::BeginTabItem("  TIMELINE & CLIP LAUNCHER (HYBRID ARRANGER)  ")) {
-                    const char* track_names[4] = { "Track 1: Kick & 808", "Track 2: Acid 303 Lead", "Track 3: Vocal Slices", "Track 4: Drum Bus" };
-                    const float launcher_w = 380.0f;
+                if (ImGui::BeginTabItem("  TIMELINE ARRANGER  ")) {
                     ImVec2 avail_sz = ImGui::GetContentRegionAvail();
                     avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
 
-                    // ========================================================
-                    // LEFT COLUMN: BITWIG-STYLE CLIP / PATTERN LAUNCHER
-                    // ========================================================
-                    ImGui::BeginChild("ClipLauncherPane", ImVec2(launcher_w, avail_sz.y), true, ImGuiWindowFlags_NoScrollbar);
-                    {
-                        // Scene Launcher Row
-                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "SCENES:");
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("▶ S1")) {
-                            mixer.launch_scene(0, sequencer::LaunchQuantize::Bar);
-                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 1 (MAIN GROOVES) QUEUED FOR NEXT DOWNBEAT");
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("▶ S2")) {
-                            mixer.launch_scene(1, sequencer::LaunchQuantize::Bar);
-                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 2 (WSOLA BREAK/MOD) QUEUED FOR NEXT DOWNBEAT");
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("▶ S3")) {
-                            mixer.launch_scene(2, sequencer::LaunchQuantize::Bar);
-                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 3 (GLITCH/SUB/REV) QUEUED FOR NEXT DOWNBEAT");
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("■ ALL")) {
-                            mixer.stop_all_clips(sequencer::LaunchQuantize::Bar);
-                            std::snprintf(status_toast, sizeof(status_toast), "ALL TRACK CLIPS STOPPING AT NEXT BAR");
-                        }
-                        ImGui::Separator();
-
-                        // Track Clip Slots
-                        for (int t = 0; t < 4; ++t) {
-                            ImGui::PushID(200 + t);
-                            ImGui::BeginGroup();
-                            {
-                                // Track miniature status & selection
-                                bool is_sel = (selected_track == t);
-                                if (ImGui::Selectable(track_names[t], is_sel, 0, ImVec2(135, 18))) {
-                                    selected_track = t;
-                                }
-                                ImGui::SameLine();
-
-                                auto* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
-                                bool launcher_active = trk ? trk->is_clip_launcher_active() : false;
-
-                                // Back to Arranger button
-                                if (!launcher_active) {
-                                    ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "[ARR]");
-                                } else {
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.48f, 0.05f, 0.85f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                    if (ImGui::SmallButton("⮌ ARR")) {
-                                        if (trk) trk->clip_launcher().stop_immediate();
-                                        std::snprintf(status_toast, sizeof(status_toast), "TRACK %d RETURNED TO ARRANGER", t + 1);
-                                    }
-                                    ImGui::PopStyleColor(2);
-                                }
-
-                                // 3 Clip Slots + Stop button
-                                for (int s = 1; s <= 3; ++s) {
-                                    ImGui::SameLine();
-                                    const auto& slot_info = trk ? trk->clip_launcher().slot(s - 1) : sequencer::ClipSlot{};
-                                    auto slot_state = slot_info.state.load(std::memory_order_relaxed);
-
-                                    char slot_lbl[24];
-                                    if (slot_state == sequencer::SlotPlayState::Playing) {
-                                        std::snprintf(slot_lbl, sizeof(slot_lbl), "▶ %d##s", s);
-                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
-                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                    } else if (slot_state == sequencer::SlotPlayState::QueuedPlay) {
-                                        std::snprintf(slot_lbl, sizeof(slot_lbl), "⧗ %d##s", s);
-                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.48f, 0.05f, 1.0f));
-                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                    } else if (slot_state == sequencer::SlotPlayState::QueuedStop) {
-                                        std::snprintf(slot_lbl, sizeof(slot_lbl), "■ %d##s", s);
-                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
-                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                    } else {
-                                        std::snprintf(slot_lbl, sizeof(slot_lbl), "%d##s", s);
-                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.95f, 0.97f, 1.0f));
-                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.25f, 0.30f, 0.40f, 1.0f));
-                                    }
-
-                                    if (ImGui::Button(slot_lbl, ImVec2(28, 20))) {
-                                        mixer.launch_track_clip(t, s - 1, sequencer::LaunchQuantize::Bar, false);
-                                        std::snprintf(status_toast, sizeof(status_toast), "TRACK %d CLIP %d (%s) QUEUED FOR NEXT DOWNBEAT",
-                                                      t + 1, s, slot_info.name.c_str());
-                                    }
-                                    if (ImGui::IsItemHovered()) {
-                                        ImGui::SetTooltip("Track %d Slot %d: %s\nMode: %s\nPitch: %+.1f st",
-                                                          t + 1, s, slot_info.name.c_str(),
-                                                          (slot_info.playback_mode == sampling::PlaybackMode::BeatSyncTimeStretch) ? "BeatSync WSOLA" :
-                                                          ((slot_info.playback_mode == sampling::PlaybackMode::PitchShiftWsola) ? "PitchShift WSOLA" :
-                                                          ((slot_info.playback_mode == sampling::PlaybackMode::ReverseFree) ? "Reverse" : "Repitch")),
-                                                          slot_info.pitch_semitones);
-                                    }
-                                    ImGui::PopStyleColor(2);
-                                }
-
-                                ImGui::SameLine();
-                                if (ImGui::SmallButton("■##stp")) {
-                                    mixer.stop_track_clip(t, sequencer::LaunchQuantize::Bar);
-                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d STOPPING AT NEXT BAR", t + 1);
-                                }
-
-                                ImGui::SameLine();
-                                bool arp_on = g_track_phrase_arp_enabled[t];
-                                if (arp_on) {
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.45f, 0.05f, 1.0f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                } else {
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.45f, 0.52f, 1.0f));
-                                }
-                                char arp_lbl[24];
-                                std::snprintf(arp_lbl, sizeof(arp_lbl), arp_on ? "ARP##%d" : "arp##%d", t);
-                                if (ImGui::SmallButton(arp_lbl)) {
-                                    g_track_phrase_arp_enabled[t] = !g_track_phrase_arp_enabled[t];
-                                    if (!g_track_phrase_arp_enabled[t]) {
-                                        g_phrase_player.all_notes_off();
-                                        mod_matrix.poly_all_notes_off();
-                                    }
-                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: INSTRUMENT PHRASE ARPEGGIATOR %s",
-                                                  t + 1, g_track_phrase_arp_enabled[t] ? "ARMED (ONLINE)" : "BYPASSED");
-                                }
-                                ImGui::PopStyleColor(2);
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Track %d Phrase Arpeggiator: %s\nRoutes incoming live MIDI through Instrument Phrase Player",
-                                                      t + 1, arp_on ? "ARMED (ONLINE)" : "BYPASSED");
-                                }
-                            }
-                            ImGui::EndGroup();
-                            if (t < 3) ImGui::Separator();
-                            ImGui::PopID();
-                        }
-                    }
-                    ImGui::EndChild();
-
-                    ImGui::SameLine();
-
-                    // ========================================================
-                    // RIGHT COLUMN: MULTITRACK ARRANGER TIMELINE & STEP PATTERN MATRIX
-                    // ========================================================
-                    ImGui::BeginGroup();
                     // Arranger Toolbar: Tools (Select, Razor, Slip), Actions (Split @ Playhead, Dup, Del) & Snap Info
                     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 4));
@@ -1739,8 +1639,7 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
 
                     if (ImGui::SmallButton("SPLIT (Ctrl+E)")) {
-                        constexpr int kTotalBarsShort = 16;
-                        float playhead_bar = (playhead_seconds / loop_length_seconds) * static_cast<float>(kTotalBarsShort);
+                        float playhead_bar = playhead_seconds / get_seconds_per_bar(bpm);
                         int t = selected_track;
                         if (t >= 0 && t < 4 && !track_arranger_clips[t].empty()) {
                             int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
@@ -1863,7 +1762,7 @@ int main(int argc, char** argv) {
                                        g_arranger_visible_bars, g_arranger_scroll_bar + 1.0f, g_arranger_scroll_bar + g_arranger_visible_bars + 1.0f);
                     ImGui::PopStyleVar(2);
 
-                    const float top_pane_h = std::max(avail_sz.y * 0.44f - 24.0f, 105.0f);
+                    const float top_pane_h = std::max(avail_sz.y - 52.0f, 130.0f);
                     ImGui::BeginChild("ArrangerTimelinePane", ImVec2(0, top_pane_h), true, ImGuiWindowFlags_NoScrollbar);
                     {
                         ImDrawList* draw_list = ImGui::GetWindowDrawList();
@@ -1917,18 +1816,20 @@ int main(int argc, char** argv) {
                         }
 
                         // Loop Region Highlighting (Bars 1 to 5)
-                        if (loop_region_active) {
-                            float loop_x1 = std::max(canvas_pos.x, bar_to_x(0.0f));
-                            float loop_x2 = std::min(canvas_pos.x + canvas_size.x, bar_to_x(4.0f));
+                        if (loop_active) {
+                            float loop_x1 = std::max(canvas_pos.x, bar_to_x(loop_start_bar));
+                            float loop_x2 = std::min(canvas_pos.x + canvas_size.x, bar_to_x(loop_start_bar + loop_bars));
                             if (loop_x2 > loop_x1) {
                                 draw_list->AddRectFilled(ImVec2(loop_x1, canvas_pos.y),
-                                                         ImVec2(loop_x2, canvas_pos.y + 16.0f),
-                                                         ImColor(31, 97, 217, 35));
-                                draw_list->AddLine(ImVec2(loop_x1, canvas_pos.y + 16.0f),
-                                                   ImVec2(loop_x2, canvas_pos.y + 16.0f),
-                                                   ImColor(31, 97, 217, 200), 2.0f);
+                                                         ImVec2(loop_x2, canvas_pos.y + 18.0f),
+                                                         ImColor(31, 97, 217, 45));
+                                draw_list->AddLine(ImVec2(loop_x1, canvas_pos.y + 18.0f),
+                                                   ImVec2(loop_x2, canvas_pos.y + 18.0f),
+                                                   ImColor(31, 97, 217, 220), 2.0f);
+                                char loop_txt[32];
+                                std::snprintf(loop_txt, sizeof(loop_txt), "[ LOOP: %.0f BARS ]", loop_bars);
                                 draw_list->AddText(ImVec2(loop_x1 + 4.0f, canvas_pos.y + 2.0f),
-                                                   ImColor(31, 97, 217, 255), "[ LOOP: 4 BARS ]");
+                                                   ImColor(31, 97, 217, 255), loop_txt);
                             }
                         }
 
@@ -1936,6 +1837,22 @@ int main(int argc, char** argv) {
                         const float lane_h = (canvas_size.y - 20.0f) / 4.0f;
                         for (int t = 0; t < 4; ++t) {
                             float ly = canvas_pos.y + 20.0f + t * lane_h;
+
+                            // Track Header & Bus Destination Badge (Zähl AM1 Routing Clarity)
+                            {
+                                char trk_hdr_str[64];
+                                std::snprintf(trk_hdr_str, sizeof(trk_hdr_str), "%s", track_names[t]);
+                                draw_list->AddText(ImVec2(canvas_pos.x + 8.0f, ly + 4.0f),
+                                                   ImColor(60, 75, 95, 230), trk_hdr_str);
+
+                                const auto& badge = k_track_routing_badges[t];
+                                ImVec2 b_size = ImGui::CalcTextSize(badge.bus_name);
+                                float b_x = canvas_pos.x + 8.0f + ImGui::CalcTextSize(trk_hdr_str).x + 10.0f;
+                                float b_y = ly + 3.0f;
+                                draw_list->AddRectFilled(ImVec2(b_x - 4.0f, b_y), ImVec2(b_x + b_size.x + 4.0f, b_y + b_size.y + 2.0f),
+                                                         badge.bg_color, 3.0f);
+                                draw_list->AddText(ImVec2(b_x, b_y + 1.0f), badge.text_color, badge.bus_name);
+                            }
                             draw_list->AddLine(ImVec2(canvas_pos.x, ly),
                                                ImVec2(canvas_pos.x + canvas_size.x, ly),
                                                ImColor(230, 235, 242, 255), 1.0f);
@@ -2305,8 +2222,7 @@ int main(int argc, char** argv) {
                         }
 
                         // Playhead Needle
-                        float play_ratio = playhead_seconds / loop_length_seconds;
-                        float playhead_bar = play_ratio * 16.0f;
+                        float playhead_bar = playhead_seconds / get_seconds_per_bar(bpm);
                         float playhead_x = bar_to_x(playhead_bar);
                         if (playhead_x >= canvas_pos.x - 2.0f && playhead_x <= canvas_pos.x + canvas_size.x + 2.0f) {
                             draw_list->AddLine(ImVec2(playhead_x, canvas_pos.y),
@@ -2439,7 +2355,7 @@ int main(int argc, char** argv) {
                                 // Clicked on Timeline Ruler -> Scrub / Seek
                                 g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
                                 float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
-                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
+                                playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.start_scrub(target_sample);
                             } else {
@@ -2626,7 +2542,7 @@ int main(int argc, char** argv) {
                                     // Clicked outside clip on lane -> Seek playhead
                                     g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
                                     float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
-                                    playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
+                                playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
                                     uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                     mixer.start_scrub(target_sample);
                                 }
@@ -2738,8 +2654,9 @@ int main(int argc, char** argv) {
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
                                 float prev_sec = playhead_seconds;
-                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
+                                playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
                                 float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
+                                vel = std::clamp(vel, -4.0f, 4.0f);
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.update_scrub(target_sample, static_cast<double>(vel));
                             }
@@ -2751,9 +2668,10 @@ int main(int argc, char** argv) {
                                 g_arranger_drag_warp_pin_id = 0;
                             } else if (g_arranger_drag_mode == ArrangerDragMode::ScrubTimeline) {
                                 float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
-                                playhead_seconds = (scrub_bar / 16.0f) * loop_length_seconds;
+                                playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
                                 uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
                                 mixer.end_scrub(target_sample);
+                                if (is_playing) mixer.seek(target_sample);
                             } else if (g_arranger_drag_mode == ArrangerDragMode::MoveClip && g_arranger_drag_track >= 0) {
                                 int src_t = g_arranger_drag_track;
                                 int dst_t = g_arranger_drag_hover_track;
@@ -2961,9 +2879,175 @@ int main(int argc, char** argv) {
                     }
 
                     // ========================================================
-                    // LOWER SECTION: STEP PATTERN MATRIX & MPC AUDITION PADS
-                    // ========================================================
-                    ImGui::Spacing();
+                    ImGui::EndTabItem();
+                }
+
+                // ------------------------------------------------------------
+                // TAB 2: SESSION CLIP LAUNCHER (BITWIG / ABLETON LIVE STYLE)
+                // ------------------------------------------------------------
+                if (ImGui::BeginTabItem("  SESSION CLIP LAUNCHER  ")) {
+                    ImVec2 avail_sz = ImGui::GetContentRegionAvail();
+                    avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
+
+                    ImGui::BeginChild("SessionClipLauncherPane", ImVec2(0, 0), true);
+                    {
+                        // Master Scene Launcher Row
+                        ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "MASTER SCENES:");
+                        ImGui::SameLine();
+                        if (ImGui::Button("▶ SCENE 1 (MAIN)", ImVec2(160, 28))) {
+                            mixer.launch_scene(0, sequencer::LaunchQuantize::Bar);
+                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 1 (MAIN GROOVES) QUEUED FOR NEXT DOWNBEAT");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("▶ SCENE 2 (WSOLA BREAK)", ImVec2(185, 28))) {
+                            mixer.launch_scene(1, sequencer::LaunchQuantize::Bar);
+                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 2 (WSOLA BREAK/MOD) QUEUED FOR NEXT DOWNBEAT");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("▶ SCENE 3 (GLITCH/SUB)", ImVec2(175, 28))) {
+                            mixer.launch_scene(2, sequencer::LaunchQuantize::Bar);
+                            std::snprintf(status_toast, sizeof(status_toast), "SCENE 3 (GLITCH/SUB/REV) QUEUED FOR NEXT DOWNBEAT");
+                        }
+                        ImGui::SameLine(0, 20);
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.25f, 0.20f, 0.90f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                        if (ImGui::Button("■ STOP ALL CLIPS", ImVec2(150, 28))) {
+                            mixer.stop_all_clips(sequencer::LaunchQuantize::Bar);
+                            std::snprintf(status_toast, sizeof(status_toast), "ALL TRACK CLIPS STOPPING AT NEXT BAR");
+                        }
+                        ImGui::PopStyleColor(2);
+
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        // 4 Track Rows
+                        for (int t = 0; t < 4; ++t) {
+                            ImGui::PushID(800 + t);
+                            ImGui::BeginGroup();
+                            {
+                                bool is_sel = (selected_track == t);
+                                if (ImGui::Selectable(track_names[t], is_sel, 0, ImVec2(180, 24))) {
+                                    selected_track = t;
+                                }
+                                ImGui::SameLine();
+
+                                const auto& badge = k_track_routing_badges[t];
+                                ImGui::TextColored(badge.bg_color, "[%s]", badge.bus_name);
+                                ImGui::SameLine(0, 15);
+
+                                auto* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                bool launcher_active = trk ? trk->is_clip_launcher_active() : false;
+
+                                if (!launcher_active) {
+                                    ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.52f, 1.0f), "[STATUS: PLAYING TIMELINE ARRANGER]");
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.48f, 0.05f, 0.85f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    if (ImGui::Button("⮌ RETURN TO ARRANGER", ImVec2(180, 24))) {
+                                        if (trk) trk->clip_launcher().stop_immediate();
+                                        std::snprintf(status_toast, sizeof(status_toast), "TRACK %d RETURNED TO ARRANGER", t + 1);
+                                    }
+                                    ImGui::PopStyleColor(2);
+                                }
+
+                                ImGui::SameLine(0, 15);
+                                bool arp_on = g_track_phrase_arp_enabled[t];
+                                if (arp_on) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.45f, 0.05f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.45f, 0.52f, 1.0f));
+                                }
+                                char arp_lbl[32];
+                                std::snprintf(arp_lbl, sizeof(arp_lbl), arp_on ? "ARP: ONLINE##%d" : "ARP: BYPASS##%d", t);
+                                if (ImGui::Button(arp_lbl, ImVec2(95, 24))) {
+                                    g_track_phrase_arp_enabled[t] = !g_track_phrase_arp_enabled[t];
+                                    if (!g_track_phrase_arp_enabled[t]) {
+                                        g_phrase_player.all_notes_off();
+                                        mod_matrix.poly_all_notes_off();
+                                    }
+                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: INSTRUMENT PHRASE ARPEGGIATOR %s",
+                                                  t + 1, g_track_phrase_arp_enabled[t] ? "ARMED (ONLINE)" : "BYPASSED");
+                                }
+                                ImGui::PopStyleColor(2);
+
+                                ImGui::Spacing();
+
+                                for (int s = 1; s <= 3; ++s) {
+                                    if (s > 1) ImGui::SameLine(0, 12);
+                                    const auto& slot_info = trk ? trk->clip_launcher().slot(s - 1) : sequencer::ClipSlot{};
+                                    auto slot_state = slot_info.state.load(std::memory_order_relaxed);
+
+                                    ImGui::BeginGroup();
+                                    {
+                                        char slot_btn_lbl[64];
+                                        if (slot_state == sequencer::SlotPlayState::Playing) {
+                                            std::snprintf(slot_btn_lbl, sizeof(slot_btn_lbl), "▶ SLOT %d: PLAYING##t%ds%d", s, t, s);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                        } else if (slot_state == sequencer::SlotPlayState::QueuedPlay) {
+                                            std::snprintf(slot_btn_lbl, sizeof(slot_btn_lbl), "⧗ SLOT %d: QUEUED##t%ds%d", s, t, s);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.48f, 0.05f, 1.0f));
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                        } else if (slot_state == sequencer::SlotPlayState::QueuedStop) {
+                                            std::snprintf(slot_btn_lbl, sizeof(slot_btn_lbl), "■ SLOT %d: STOPPING##t%ds%d", s, t, s);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                        } else {
+                                            std::snprintf(slot_btn_lbl, sizeof(slot_btn_lbl), "SLOT %d##t%ds%d", s, t, s);
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.95f, 0.97f, 1.0f));
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.25f, 0.30f, 0.40f, 1.0f));
+                                        }
+
+                                        if (ImGui::Button(slot_btn_lbl, ImVec2(150, 32))) {
+                                            mixer.launch_track_clip(t, s - 1, sequencer::LaunchQuantize::Bar, false);
+                                            std::snprintf(status_toast, sizeof(status_toast), "TRACK %d CLIP %d (%s) QUEUED FOR NEXT DOWNBEAT",
+                                                          t + 1, s, slot_info.name.c_str());
+                                        }
+                                        ImGui::PopStyleColor(2);
+
+                                        ImGui::TextColored(ImVec4(0.25f, 0.30f, 0.40f, 1.0f), "%s", slot_info.name.c_str());
+                                        const char* mode_name = (slot_info.playback_mode == sampling::PlaybackMode::BeatSyncTimeStretch) ? "BeatSync" :
+                                                                ((slot_info.playback_mode == sampling::PlaybackMode::PitchShiftWsola) ? "PitchShift" :
+                                                                ((slot_info.playback_mode == sampling::PlaybackMode::ReverseFree) ? "Reverse" : "Repitch"));
+                                        ImGui::TextDisabled("%s | %+.1fst", mode_name, slot_info.pitch_semitones);
+                                    }
+                                    ImGui::EndGroup();
+                                }
+
+                                ImGui::SameLine(0, 15);
+                                ImGui::BeginGroup();
+                                {
+                                    if (ImGui::Button("■ STOP TRACK##stpt", ImVec2(100, 32))) {
+                                        mixer.stop_track_clip(t, sequencer::LaunchQuantize::Bar);
+                                        std::snprintf(status_toast, sizeof(status_toast), "TRACK %d STOPPING AT NEXT BAR", t + 1);
+                                    }
+                                    ImGui::TextDisabled("Bar-Quantized");
+                                }
+                                ImGui::EndGroup();
+                            }
+                            ImGui::EndGroup();
+                            if (t < 3) {
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    ImGui::EndTabItem();
+                }
+
+                // ------------------------------------------------------------
+                // TAB 3: STEP PATTERN & GROOVE MATRIX
+                // ------------------------------------------------------------
+                if (ImGui::BeginTabItem("  STEP PATTERN & GROOVE MATRIX  ")) {
+                    ImVec2 avail_sz = ImGui::GetContentRegionAvail();
+                    avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
+
                     ImGui::BeginChild("StepPatternMatrixPane", ImVec2(0, 0), true);
                     {
                         auto seq = track_seq[selected_track];
@@ -3476,8 +3560,6 @@ int main(int argc, char** argv) {
                         }
                     }
                     ImGui::EndChild();
-                    ImGui::EndGroup();
-
                     ImGui::EndTabItem();
                 }
 
@@ -5237,7 +5319,8 @@ int main(int argc, char** argv) {
                     // High-Resolution Waveform Display with Multi-Resolution Peak Mipmapping
                     ImVec2 wf_pos = ImGui::GetCursorScreenPos();
                     ImVec2 wf_size(ImGui::GetContentRegionAvail().x, 100);
-                    float play_ratio = playhead_seconds / loop_length_seconds;
+                    float cur_loop_len = get_loop_length_seconds(bpm);
+                    float play_ratio = (cur_loop_len > 0.001f) ? (std::fmod(playhead_seconds, cur_loop_len) / cur_loop_len) : 0.0f;
                     if (cur_clip && cur_clip->overview()) {
                         ui::DrawWaveformDisplay(ImGui::GetWindowDrawList(), wf_pos, wf_size,
                                                cur_clip->overview().get(), 0, 0, cur_clip->num_frames(),
