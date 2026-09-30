@@ -127,11 +127,16 @@
       </div>
 
       <!-- Start/Stop Big Button -->
-      <button id="btn-audio-toggle" class="w-full md:w-auto px-6 py-3.5 rounded bg-rose-500 hover:bg-rose-400 active:scale-95 text-white font-mono-tech font-bold text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-rose-500/20 shrink-0">
-        <svg id="icon-play" class="w-3.5 h-3.5 fill-current shrink-0" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>
-        <svg id="icon-pause" class="w-3.5 h-3.5 fill-current shrink-0 hidden" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-        <span id="btn-label">AUDIO STARTEN (C++20 WASM)</span>
-      </button>
+      <div class="flex flex-col items-center md:items-end gap-1.5 shrink-0 w-full md:w-auto">
+        <button type="button" id="btn-audio-toggle" class="w-full md:w-auto px-6 py-3.5 rounded bg-rose-500 hover:bg-rose-400 active:scale-95 text-white font-mono-tech font-bold text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-rose-500/20 select-none touch-manipulation">
+          <svg id="icon-play" class="w-3.5 h-3.5 fill-current shrink-0" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+          <svg id="icon-pause" class="w-3.5 h-3.5 fill-current shrink-0 hidden" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+          <span id="btn-label">AUDIO STARTEN (C++20 WASM)</span>
+        </button>
+        <span class="text-[9px] font-mono-tech text-[var(--text-muted)] text-center md:text-right">
+          📱 iOS / Mobil: Stummschalter am Gerät beachten
+        </span>
+      </div>
     </div>
 
     <!-- Visualizer Stage: Oscilloscope & VU Meters -->
@@ -484,18 +489,56 @@
 
     // 2. Audio Context Toggle
     btnToggle.addEventListener('click', async () => {
-      if (!wasmModule) return;
+      if (!wasmModule) {
+        console.warn('WASM module not yet loaded');
+        return;
+      }
 
       if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) {
+          alert('Web Audio API is not supported on this browser.');
+          return;
+        }
+
+        try {
+          audioCtx = new AudioContextClass({ sampleRate: 48000 });
+        } catch (e) {
+          console.warn('AudioContext({ sampleRate: 48000 }) fallback to default:', e);
+          audioCtx = new AudioContextClass();
+        }
+
+        // Synchronously unlock AudioContext on iOS/WebKit
+        if (audioCtx.state === 'suspended') {
+          try {
+            audioCtx.resume();
+          } catch (e) {
+            console.warn('Sync audioCtx.resume() failed:', e);
+          }
+        }
+
         wasmModule._wasm_init(audioCtx.sampleRate);
         srReadout.textContent = 'SR: ' + audioCtx.sampleRate + ' Hz';
 
-        // 512 frames buffer size for tight sub-15ms latency
-        scriptNode = audioCtx.createScriptProcessor(512, 0, 2);
+        // 1024 buffer size is universally supported across iOS Safari, Android, and Desktop
+        const bufSize = 1024;
+        scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 2);
+
+        // Dummy source prevents iOS Safari from garbage collecting or pausing ScriptProcessorNode
+        try {
+          const dummySrc = audioCtx.createBufferSource();
+          dummySrc.buffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+          dummySrc.loop = true;
+          dummySrc.connect(scriptNode);
+          dummySrc.start(0);
+        } catch (e) {
+          console.warn('Dummy source setup ignored:', e);
+        }
+
         scriptNode.onaudioprocess = (e) => {
           const outL = e.outputBuffer.getChannelData(0);
           const outR = e.outputBuffer.getChannelData(1);
+          const frames = e.outputBuffer.length;
 
           if (!isPlaying || !wasmModule) {
             outL.fill(0);
@@ -504,18 +547,22 @@
           }
 
           // Invoke C++ WASM Process
-          wasmModule._wasm_process(512);
+          wasmModule._wasm_process(frames);
 
-          const heapL = wasmModule.HEAPF32.subarray(ptrLeft >> 2, (ptrLeft >> 2) + 512);
-          const heapR = wasmModule.HEAPF32.subarray(ptrRight >> 2, (ptrRight >> 2) + 512);
+          const heapL = wasmModule.HEAPF32.subarray(ptrLeft >> 2, (ptrLeft >> 2) + frames);
+          const heapR = wasmModule.HEAPF32.subarray(ptrRight >> 2, (ptrRight >> 2) + frames);
 
           outL.set(heapL);
           outR.set(heapR);
-          scopeData.set(heapL);
+
+          const scopeLen = Math.min(512, frames);
+          for (let i = 0; i < scopeLen; i++) {
+            scopeData[i] = heapL[i];
+          }
 
           // Measure peak
           let pkL = 0, pkR = 0;
-          for (let i = 0; i < 512; i++) {
+          for (let i = 0; i < frames; i++) {
             const al = Math.abs(heapL[i]);
             const ar = Math.abs(heapR[i]);
             if (al > pkL) pkL = al;
@@ -527,7 +574,11 @@
       }
 
       if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
+        try {
+          await audioCtx.resume();
+        } catch (e) {
+          console.warn('Async audioCtx.resume() failed:', e);
+        }
       }
 
       isPlaying = !isPlaying;
@@ -538,7 +589,7 @@
         iconPlay.classList.add('hidden');
         iconPause.classList.remove('hidden');
         btnLabel.textContent = 'AUDIO STOPPEN';
-        statusText.textContent = 'C++ WASM AUDIO ACTIVE // 48 kHz';
+        statusText.textContent = 'C++ WASM AUDIO ACTIVE // ' + Math.round(audioCtx.sampleRate / 1000) + ' kHz';
         statusDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
       } else {
         btnToggle.className = btnToggle.className.replace('bg-amber-500', 'bg-rose-500').replace('hover:bg-amber-400', 'hover:bg-rose-400');
