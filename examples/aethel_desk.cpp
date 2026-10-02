@@ -439,6 +439,14 @@ int main(int argc, char** argv) {
     float loop_start_bar = 0.0f;
     float loop_bars = 4.0f;
 
+    // Punch-In / Punch-Out Overdub Engine State
+    static bool g_punch_enabled = false;
+    static bool g_punch_link_to_loop = true;
+    static float g_punch_in_bar = 0.0f;
+    static float g_punch_out_bar = 4.0f;
+    static bool g_punch_is_recording = false;
+    static uint32_t g_punch_take_counter = 1;
+
     auto get_seconds_per_bar = [](float current_bpm) noexcept -> float {
         return (60.0f / std::max(20.0f, current_bpm)) * 4.0f;
     };
@@ -489,6 +497,20 @@ int main(int argc, char** argv) {
         WarpPinDrag
     };
     static ArrangerDragMode g_arranger_drag_mode = ArrangerDragMode::None;
+    enum class ArrangerRulerDragTarget {
+        None,
+        LoopLeft,
+        LoopRight,
+        LoopBody,
+        PunchIn,
+        PunchOut,
+        Scrub
+    };
+    static ArrangerRulerDragTarget g_ruler_drag_target = ArrangerRulerDragTarget::None;
+    static float g_ruler_drag_orig_start = 0.0f;
+    static float g_ruler_drag_orig_len = 4.0f;
+    static float g_ruler_drag_orig_punch_in = 0.0f;
+    static float g_ruler_drag_orig_punch_out = 4.0f;
     static int g_arranger_drag_track = -1;
     static int g_arranger_drag_clip_idx = -1;
     static int g_arranger_drag_hover_track = -1;
@@ -562,6 +584,9 @@ int main(int argc, char** argv) {
     };
     static SequencerViewMode g_seq_view_mode = SequencerViewMode::FlChannelRack;
     static bool g_seq_show_phrase_lab = false;
+    static bool g_tracker_auto_scroll = true;
+    static int g_tracker_last_scrolled_line = -1;
+    static int g_tracker_lines_preset = 16;
 
     auto sync_step_to_phrase = [](const sequencer::Pattern& pat, sequencer::InstrumentPhrase& phr, uint32_t tpl) {
         phr.num_lines = std::clamp(pat.num_steps, 16u, 64u);
@@ -946,6 +971,113 @@ int main(int argc, char** argv) {
             playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
         }
 
+        // Punch-In / Punch-Out Automation Engine
+        float sec_per_bar = get_seconds_per_bar(bpm);
+        float current_bar = playhead_seconds / sec_per_bar;
+        float punch_in_b = g_punch_link_to_loop ? loop_start_bar : g_punch_in_bar;
+        float punch_out_b = g_punch_link_to_loop ? (loop_start_bar + loop_bars) : g_punch_out_bar;
+
+        if (is_playing && g_punch_enabled) {
+            if (!g_punch_is_recording) {
+                // Check if playhead has crossed into punch-in window
+                if (current_bar >= punch_in_b && current_bar < punch_out_b) {
+                    g_punch_is_recording = true;
+                    if (tap0) {
+                        float punch_dur_bars = punch_out_b - punch_in_b;
+                        uint32_t target_f = static_cast<uint32_t>(std::max(128.0f, punch_dur_bars * sec_per_bar * static_cast<float>(kSampleRate)));
+                        std::string take_name = "Take" + std::to_string(g_punch_take_counter++) + "_Trk" + std::to_string(selected_track + 1);
+                        tap0->arm_quantized_bounce(target_f, take_name, sampling::QuantizeSyncMode::Immediate, true);
+                        std::snprintf(status_toast, sizeof(status_toast), "⏺ PUNCH-IN: RECORDING TAKE %u (BARS %.1f-%.1f)",
+                                      g_punch_take_counter - 1, punch_in_b + 1.0f, punch_out_b + 1.0f);
+                    }
+                }
+            } else {
+                // Currently recording: check if playhead passed punch-out or wrapped
+                if (current_bar >= punch_out_b || current_bar < punch_in_b) {
+                    g_punch_is_recording = false;
+                    if (tap0) {
+                        auto take_clip = tap0->get_quantized_clip();
+                        if (!take_clip && tap0->recorded_frames() >= 256) {
+                            take_clip = tap0->capture_retroactive(tap0->recorded_frames(),
+                                                                  "Take" + std::to_string(g_punch_take_counter - 1) + "_Trk" + std::to_string(selected_track + 1),
+                                                                  true);
+                        }
+                        if (take_clip) {
+                            int t = selected_track;
+                            Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                            if (trk) {
+                                auto before_clips = trk->arranger().clips();
+                                sequencer::ArrangerClipInstance new_clip;
+                                new_clip.id = 0;
+                                new_clip.name = take_clip->name();
+                                new_clip.clip = take_clip;
+                                new_clip.source_clip = take_clip;
+                                new_clip.start_bar = punch_in_b;
+                                new_clip.len_bars = punch_out_b - punch_in_b;
+                                new_clip.base_len_bars = new_clip.len_bars;
+                                new_clip.orig_len_bars = new_clip.len_bars;
+                                new_clip.stretch_ratio = 1.0f;
+                                new_clip.fade_in_bars = 0.04f;
+                                new_clip.fade_out_bars = 0.04f;
+
+                                sampling::SampleAssetPool::instance().register_asset(take_clip, new_clip.name + ".wav");
+                                trk->arranger().add_clip(new_clip);
+                                track_arranger_clips[t] = trk->arranger().clips();
+                                g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                                g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                                    trk, before_clips, track_arranger_clips[t], "Punch Record Take '" + new_clip.name + "'"
+                                ));
+                                std::snprintf(status_toast, sizeof(status_toast), "⏺ PUNCH-OUT: COMMITTED TAKE '%s' (BARS %.1f-%.1f)",
+                                              new_clip.name.c_str(), punch_in_b + 1.0f, punch_out_b + 1.0f);
+                            }
+                            tap0->dismiss_bounce_to_rolling();
+                        }
+                    }
+                }
+            }
+        } else if (!is_playing && g_punch_is_recording) {
+            // Stopped playback while recording take: gracefully commit partial take
+            g_punch_is_recording = false;
+            if (tap0) {
+                auto take_clip = tap0->get_quantized_clip();
+                if (!take_clip && tap0->recorded_frames() >= 256) {
+                    take_clip = tap0->capture_retroactive(tap0->recorded_frames(),
+                                                          "Take" + std::to_string(g_punch_take_counter - 1) + "_Trk" + std::to_string(selected_track + 1),
+                                                          true);
+                }
+                if (take_clip) {
+                    int t = selected_track;
+                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                    if (trk) {
+                        auto before_clips = trk->arranger().clips();
+                        sequencer::ArrangerClipInstance new_clip;
+                        new_clip.id = 0;
+                        new_clip.name = take_clip->name();
+                        new_clip.clip = take_clip;
+                        new_clip.source_clip = take_clip;
+                        new_clip.start_bar = punch_in_b;
+                        float actual_dur = std::max(0.25f, (playhead_seconds - punch_in_b * sec_per_bar) / sec_per_bar);
+                        new_clip.len_bars = std::min(actual_dur, punch_out_b - punch_in_b);
+                        new_clip.base_len_bars = new_clip.len_bars;
+                        new_clip.orig_len_bars = new_clip.len_bars;
+                        new_clip.stretch_ratio = 1.0f;
+                        new_clip.fade_in_bars = 0.04f;
+                        new_clip.fade_out_bars = 0.04f;
+
+                        sampling::SampleAssetPool::instance().register_asset(take_clip, new_clip.name + ".wav");
+                        trk->arranger().add_clip(new_clip);
+                        track_arranger_clips[t] = trk->arranger().clips();
+                        g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+                        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                            trk, before_clips, track_arranger_clips[t], "Punch Record Take '" + new_clip.name + "'"
+                        ));
+                        std::snprintf(status_toast, sizeof(status_toast), "⏺ PUNCH STOPPED: COMMITTED TAKE '%s'", new_clip.name.c_str());
+                    }
+                    tap0->dismiss_bounce_to_rolling();
+                }
+            }
+        }
+
         // Determine if selected track has phrase arpeggiator enabled
         int cur_trk_idx = std::clamp(selected_track, 0, 3);
         bool cur_track_arp_on = g_track_phrase_arp_enabled[cur_trk_idx];
@@ -996,6 +1128,10 @@ int main(int argc, char** argv) {
             mod_matrix.evaluate_sample(bpm);
         }
         mod_matrix.process_synth_block(synth_sim_l, synth_sim_r, mod_sim_frames, bpm);
+
+        if (!pw_online && !desktop_online && is_playing && tap0 && tap0->is_active()) {
+            tap0->record(synth_sim_l, synth_sim_r, mod_sim_frames);
+        }
 
         // Master Clock Transmission (24 PPQN Beat Clock & MTC SMPTE Timecode):
         if (mixer.clock().authority() == clock::ClockAuthority::Master) {
@@ -1211,6 +1347,10 @@ int main(int argc, char** argv) {
                     loop_active = !loop_active;
                     std::snprintf(status_toast, sizeof(status_toast), "TIMELINE LOOP: %s", loop_active ? "ENABLED" : "BYPASSED");
                 }
+                if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+                    g_punch_enabled = !g_punch_enabled;
+                    std::snprintf(status_toast, sizeof(status_toast), "PUNCH OVERDUB: %s", g_punch_enabled ? "ARMED" : "BYPASSED");
+                }
             }
 
             // Transport Controls
@@ -1237,6 +1377,18 @@ int main(int argc, char** argv) {
             }
             if (loop_active) ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Timeline Loop (Shortcut: L)");
+
+            ImGui::SameLine(0, 4);
+            if (g_punch_enabled) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            }
+            if (ImGui::Button("[ ⏺ PUNCH ]", ImVec2(84, 32))) {
+                g_punch_enabled = !g_punch_enabled;
+                std::snprintf(status_toast, sizeof(status_toast), "PUNCH OVERDUB: %s", g_punch_enabled ? "ARMED" : "BYPASSED");
+            }
+            if (g_punch_enabled) ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Punch-In / Punch-Out Overdub Engine (Shortcut: R)");
 
             // Layout Presets & UI Scaling
             ImGui::SameLine(0, 10);
@@ -1360,6 +1512,21 @@ int main(int argc, char** argv) {
                     }
                 } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
                     perform_redo();
+                } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) {
+                    int cur_t = selected_track;
+                    if (cur_t >= 0 && cur_t < 4 && !track_arranger_clips[cur_t].empty()) {
+                        int c_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[cur_t].size() - 1));
+                        const auto& c = track_arranger_clips[cur_t][c_idx];
+                        loop_start_bar = c.start_bar;
+                        loop_bars = c.len_bars;
+                        loop_active = true;
+                        if (g_punch_link_to_loop) {
+                            g_punch_in_bar = loop_start_bar;
+                            g_punch_out_bar = loop_start_bar + loop_bars;
+                        }
+                        std::snprintf(status_toast, sizeof(status_toast), "LOOP FIT TO CLIP '%s' (BARS %.1f-%.1f)",
+                                      c.name.c_str(), loop_start_bar + 1.0f, loop_start_bar + loop_bars + 1.0f);
+                    }
                 }
             }
 
@@ -1782,6 +1949,40 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
+                    if (loop_active) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton(loop_active ? "🔁 LOOP ON" : "🔁 LOOP OFF")) {
+                        loop_active = !loop_active;
+                    }
+                    if (loop_active) ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Timeline Loop (Double-click ruler or press L).\nCtrl+L: Fit loop to selected clip.");
+
+                    ImGui::SameLine();
+                    if (g_punch_enabled) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    }
+                    if (ImGui::SmallButton(g_punch_enabled ? "⏺ PUNCH ON" : "⏺ PUNCH OFF")) {
+                        g_punch_enabled = !g_punch_enabled;
+                    }
+                    if (g_punch_enabled) ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Punch-In / Punch-Out Overdub Engine (Shortcut: R).\nRecords takes between IN and OUT flags directly into active track lane.");
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(g_punch_link_to_loop ? "🔗 PUNCH=LOOP" : "🔓 PUNCH FREE")) {
+                        g_punch_link_to_loop = !g_punch_link_to_loop;
+                        if (g_punch_link_to_loop) {
+                            g_punch_in_bar = loop_start_bar;
+                            g_punch_out_bar = loop_start_bar + loop_bars;
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Link Punch markers directly to Loop brackets (or unlock to position independently).");
+
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("|");
+                    ImGui::SameLine();
                     if (ImGui::SmallButton(" - ##arr_zm_out")) {
                         float new_v = std::min(g_arranger_max_bars, g_arranger_visible_bars * 1.25f);
                         g_arranger_visible_bars = new_v;
@@ -1862,21 +2063,96 @@ int main(int argc, char** argv) {
                             }
                         }
 
-                        // Loop Region Highlighting (Bars 1 to 5)
-                        if (loop_active) {
-                            float loop_x1 = std::max(canvas_pos.x, bar_to_x(loop_start_bar));
-                            float loop_x2 = std::min(canvas_pos.x + canvas_size.x, bar_to_x(loop_start_bar + loop_bars));
-                            if (loop_x2 > loop_x1) {
-                                draw_list->AddRectFilled(ImVec2(loop_x1, canvas_pos.y),
-                                                         ImVec2(loop_x2, canvas_pos.y + 18.0f),
-                                                         ImColor(31, 97, 217, 45));
-                                draw_list->AddLine(ImVec2(loop_x1, canvas_pos.y + 18.0f),
-                                                   ImVec2(loop_x2, canvas_pos.y + 18.0f),
-                                                   ImColor(31, 97, 217, 220), 2.0f);
-                                char loop_txt[32];
-                                std::snprintf(loop_txt, sizeof(loop_txt), "[ LOOP: %.0f BARS ]", loop_bars);
-                                draw_list->AddText(ImVec2(loop_x1 + 4.0f, canvas_pos.y + 2.0f),
-                                                   ImColor(31, 97, 217, 255), loop_txt);
+                        // Interactive Loop Region & Track Lane Tint
+                        float loop_x1 = bar_to_x(loop_start_bar);
+                        float loop_x2 = bar_to_x(loop_start_bar + loop_bars);
+                        float draw_lx1 = std::max(canvas_pos.x, loop_x1);
+                        float draw_lx2 = std::min(canvas_pos.x + canvas_size.x, loop_x2);
+
+                        if (draw_lx2 > draw_lx1) {
+                            // Subtle Loop Lane Tint across all 4 Tracks
+                            ImU32 track_tint = loop_active ? ImColor(31, 97, 217, 18) : ImColor(140, 145, 160, 10);
+                            draw_list->AddRectFilled(ImVec2(draw_lx1, canvas_pos.y + 20.0f),
+                                                     ImVec2(draw_lx2, canvas_pos.y + canvas_size.y),
+                                                     track_tint);
+
+                            // Loop Body Strip in Ruler
+                            ImU32 loop_bar_bg = loop_active ? ImColor(31, 97, 217, 65) : ImColor(120, 130, 145, 40);
+                            ImU32 loop_bar_border = loop_active ? ImColor(31, 97, 217, 230) : ImColor(120, 130, 145, 160);
+
+                            draw_list->AddRectFilled(ImVec2(draw_lx1, canvas_pos.y + 1.0f),
+                                                     ImVec2(draw_lx2, canvas_pos.y + 19.0f),
+                                                     loop_bar_bg, 2.0f);
+                            draw_list->AddLine(ImVec2(draw_lx1, canvas_pos.y + 19.0f),
+                                               ImVec2(draw_lx2, canvas_pos.y + 19.0f),
+                                               loop_bar_border, 2.0f);
+                            draw_list->AddLine(ImVec2(draw_lx1, canvas_pos.y + 1.0f),
+                                               ImVec2(draw_lx2, canvas_pos.y + 1.0f),
+                                               loop_bar_border, 1.5f);
+
+                            char loop_txt[64];
+                            std::snprintf(loop_txt, sizeof(loop_txt), "[ 🔁 LOOP: %.2f-%.2f (%.1fb) %s ]",
+                                          loop_start_bar + 1.0f, loop_start_bar + loop_bars + 1.0f, loop_bars,
+                                          loop_active ? "ON" : "OFF");
+                            draw_list->AddText(ImVec2(draw_lx1 + 10.0f, canvas_pos.y + 2.0f),
+                                               loop_active ? ImColor(31, 97, 217, 255) : ImColor(100, 110, 125, 220), loop_txt);
+                        }
+
+                        // Left Bracket Handle [L]
+                        ImU32 handle_col = loop_active ? ImColor(37, 99, 235, 255) : ImColor(100, 110, 125, 255);
+                        if (loop_x1 >= canvas_pos.x - 8.0f && loop_x1 <= canvas_pos.x + canvas_size.x + 8.0f) {
+                            draw_list->AddRectFilled(ImVec2(loop_x1 - 2.0f, canvas_pos.y + 1.0f),
+                                                     ImVec2(loop_x1 + 3.0f, canvas_pos.y + 19.0f),
+                                                     handle_col, 1.0f);
+                            draw_list->AddTriangleFilled(ImVec2(loop_x1 + 3.0f, canvas_pos.y + 3.0f),
+                                                         ImVec2(loop_x1 + 8.0f, canvas_pos.y + 7.0f),
+                                                         ImVec2(loop_x1 + 3.0f, canvas_pos.y + 11.0f),
+                                                         handle_col);
+                            draw_list->AddText(ImVec2(loop_x1 - 9.0f, canvas_pos.y + 2.0f), handle_col, "L");
+                        }
+
+                        // Right Bracket Handle [R]
+                        if (loop_x2 >= canvas_pos.x - 8.0f && loop_x2 <= canvas_pos.x + canvas_size.x + 8.0f) {
+                            draw_list->AddRectFilled(ImVec2(loop_x2 - 3.0f, canvas_pos.y + 1.0f),
+                                                     ImVec2(loop_x2 + 2.0f, canvas_pos.y + 19.0f),
+                                                     handle_col, 1.0f);
+                            draw_list->AddTriangleFilled(ImVec2(loop_x2 - 3.0f, canvas_pos.y + 3.0f),
+                                                         ImVec2(loop_x2 - 8.0f, canvas_pos.y + 7.0f),
+                                                         ImVec2(loop_x2 - 3.0f, canvas_pos.y + 11.0f),
+                                                         handle_col);
+                            draw_list->AddText(ImVec2(loop_x2 + 4.0f, canvas_pos.y + 2.0f), handle_col, "R");
+                        }
+
+                        // Punch-In / Punch-Out Region Highlighting & Crimson Ruler Flags
+                        if (g_punch_enabled) {
+                            float p_in = g_punch_link_to_loop ? loop_start_bar : g_punch_in_bar;
+                            float p_out = g_punch_link_to_loop ? (loop_start_bar + loop_bars) : g_punch_out_bar;
+                            float p_x1 = bar_to_x(p_in);
+                            float p_x2 = bar_to_x(p_out);
+                            float draw_px1 = std::max(canvas_pos.x, p_x1);
+                            float draw_px2 = std::min(canvas_pos.x + canvas_size.x, p_x2);
+
+                            ImU32 punch_flag_col = g_punch_is_recording ? ImColor(239, 68, 68, 255) : ImColor(220, 38, 38, 240);
+                            if (draw_px2 > draw_px1) {
+                                draw_list->AddLine(ImVec2(draw_px1, canvas_pos.y), ImVec2(draw_px2, canvas_pos.y), punch_flag_col, 2.5f);
+                            }
+
+                            // Punch-In Flag [▶| IN] in Ruler
+                            if (p_x1 >= canvas_pos.x - 10.0f && p_x1 <= canvas_pos.x + canvas_size.x + 10.0f) {
+                                draw_list->AddLine(ImVec2(p_x1, canvas_pos.y), ImVec2(p_x1, canvas_pos.y + 20.0f), punch_flag_col, 2.0f);
+                                draw_list->AddTriangleFilled(ImVec2(p_x1, canvas_pos.y + 10.0f),
+                                                             ImVec2(p_x1 + 7.0f, canvas_pos.y + 14.0f),
+                                                             ImVec2(p_x1, canvas_pos.y + 18.0f), punch_flag_col);
+                                draw_list->AddText(ImVec2(p_x1 + 3.0f, canvas_pos.y + 1.0f), punch_flag_col, "IN");
+                            }
+
+                            // Punch-Out Flag [|◀ OUT] in Ruler
+                            if (p_x2 >= canvas_pos.x - 10.0f && p_x2 <= canvas_pos.x + canvas_size.x + 10.0f) {
+                                draw_list->AddLine(ImVec2(p_x2, canvas_pos.y), ImVec2(p_x2, canvas_pos.y + 20.0f), punch_flag_col, 2.0f);
+                                draw_list->AddTriangleFilled(ImVec2(p_x2, canvas_pos.y + 10.0f),
+                                                             ImVec2(p_x2 - 7.0f, canvas_pos.y + 14.0f),
+                                                             ImVec2(p_x2, canvas_pos.y + 18.0f), punch_flag_col);
+                                draw_list->AddText(ImVec2(p_x2 - 24.0f, canvas_pos.y + 1.0f), punch_flag_col, "OUT");
                             }
                         }
 
@@ -1908,6 +2184,24 @@ int main(int argc, char** argv) {
                                 draw_list->AddRectFilled(ImVec2(canvas_pos.x, ly),
                                                          ImVec2(canvas_pos.x + canvas_size.x, ly + lane_h),
                                                          ImColor(31, 97, 217, 18));
+                            }
+
+                            // Punch Zone Tint on Selected Track Lane
+                            if (g_punch_enabled && selected_track == t) {
+                                float p_in = g_punch_link_to_loop ? loop_start_bar : g_punch_in_bar;
+                                float p_out = g_punch_link_to_loop ? (loop_start_bar + loop_bars) : g_punch_out_bar;
+                                float px1 = std::max(canvas_pos.x, bar_to_x(p_in));
+                                float px2 = std::min(canvas_pos.x + canvas_size.x, bar_to_x(p_out));
+                                if (px2 > px1) {
+                                    ImU32 p_bg = g_punch_is_recording ? ImColor(220, 38, 38, 55) : ImColor(220, 38, 38, 20);
+                                    ImU32 p_border = g_punch_is_recording ? ImColor(239, 68, 68, 240) : ImColor(220, 38, 38, 120);
+                                    draw_list->AddRectFilled(ImVec2(px1, ly + 1.0f), ImVec2(px2, ly + lane_h - 1.0f), p_bg);
+                                    draw_list->AddRect(ImVec2(px1, ly + 1.0f), ImVec2(px2, ly + lane_h - 1.0f), p_border, 2.0f);
+                                    char p_zone_lbl[64];
+                                    std::snprintf(p_zone_lbl, sizeof(p_zone_lbl), "[ %s ]",
+                                                  g_punch_is_recording ? "⏺ RECORDING OVERDUB TAKE..." : "⏺ PUNCH OVERDUB ZONE");
+                                    draw_list->AddText(ImVec2(px1 + 8.0f, ly + lane_h - 18.0f), ImColor(220, 38, 38, 240), p_zone_lbl);
+                                }
                             }
 
                             // If Clip Launcher is overriding this track:
@@ -2320,8 +2614,29 @@ int main(int argc, char** argv) {
                         }
 
                         // Cursor styling based on hover location
-                        if (is_hovered && g_arranger_drag_mode == ArrangerDragMode::None) {
-                            if (m.y >= canvas_pos.y + 20.0f) {
+                        if (is_hovered && g_arranger_drag_mode == ArrangerDragMode::None && g_ruler_drag_target == ArrangerRulerDragTarget::None) {
+                            if (m.y < canvas_pos.y + 20.0f) {
+                                float loop_x1 = bar_to_x(loop_start_bar);
+                                float loop_x2 = bar_to_x(loop_start_bar + loop_bars);
+                                float p_in = g_punch_link_to_loop ? loop_start_bar : g_punch_in_bar;
+                                float p_out = g_punch_link_to_loop ? (loop_start_bar + loop_bars) : g_punch_out_bar;
+                                float px1 = bar_to_x(p_in);
+                                float px2 = bar_to_x(p_out);
+
+                                if (g_punch_enabled && !g_punch_link_to_loop && std::abs(m.x - px1) <= 7.0f) {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                } else if (g_punch_enabled && !g_punch_link_to_loop && std::abs(m.x - px2) <= 7.0f) {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                } else if (std::abs(m.x - loop_x1) <= 7.0f) {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                } else if (std::abs(m.x - loop_x2) <= 7.0f) {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                                } else if (m.x > loop_x1 + 7.0f && m.x < loop_x2 - 7.0f) {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                } else {
+                                    ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+                                }
+                            } else {
                                 int hov_t = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
                                 if (hov_t >= 0 && hov_t < 4) {
                                     for (size_t i = 0; i < track_arranger_clips[hov_t].size(); ++i) {
@@ -2353,7 +2668,7 @@ int main(int argc, char** argv) {
                                                         }
                                                     }
                                                 }
-                                                if (on_pin) break;
+                                                if (!on_pin) break;
                                             }
 
                                             if (g_arranger_tool == ArrangerTool::Razor) {
@@ -2402,12 +2717,43 @@ int main(int argc, char** argv) {
                             }
 
                             if (m.y < canvas_pos.y + 20.0f) {
-                                // Clicked on Timeline Ruler -> Scrub / Seek
-                                g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
-                                float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
-                                playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
-                                uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
-                                mixer.start_scrub(target_sample);
+                                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                    loop_active = !loop_active;
+                                    std::snprintf(status_toast, sizeof(status_toast), "LOOP %s (BARS %.1f-%.1f)",
+                                                  loop_active ? "ENABLED" : "BYPASSED", loop_start_bar + 1.0f, loop_start_bar + loop_bars + 1.0f);
+                                } else {
+                                    g_ruler_drag_orig_start = loop_start_bar;
+                                    g_ruler_drag_orig_len = loop_bars;
+                                    g_ruler_drag_orig_punch_in = g_punch_in_bar;
+                                    g_ruler_drag_orig_punch_out = g_punch_out_bar;
+                                    g_arranger_drag_start_mouse_x = m.x;
+
+                                    float loop_x1 = bar_to_x(loop_start_bar);
+                                    float loop_x2 = bar_to_x(loop_start_bar + loop_bars);
+                                    float p_in = g_punch_link_to_loop ? loop_start_bar : g_punch_in_bar;
+                                    float p_out = g_punch_link_to_loop ? (loop_start_bar + loop_bars) : g_punch_out_bar;
+                                    float px1 = bar_to_x(p_in);
+                                    float px2 = bar_to_x(p_out);
+
+                                    if (g_punch_enabled && !g_punch_link_to_loop && std::abs(m.x - px1) <= 7.0f) {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::PunchIn;
+                                    } else if (g_punch_enabled && !g_punch_link_to_loop && std::abs(m.x - px2) <= 7.0f) {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::PunchOut;
+                                    } else if (std::abs(m.x - loop_x1) <= 7.0f) {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::LoopLeft;
+                                    } else if (std::abs(m.x - loop_x2) <= 7.0f) {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::LoopRight;
+                                    } else if (m.x > loop_x1 + 7.0f && m.x < loop_x2 - 7.0f) {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::LoopBody;
+                                    } else {
+                                        g_ruler_drag_target = ArrangerRulerDragTarget::Scrub;
+                                        g_arranger_drag_mode = ArrangerDragMode::ScrubTimeline;
+                                        float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
+                                        playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
+                                        uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                        mixer.start_scrub(target_sample);
+                                    }
+                                }
                             } else {
                                 int clicked_lane = static_cast<int>((m.y - (canvas_pos.y + 20.0f)) / lane_h);
                                 clicked_lane = std::clamp(clicked_lane, 0, 3);
@@ -2598,8 +2944,54 @@ int main(int argc, char** argv) {
                                 }
                             }
                         } else if (is_active) {
-                            if (g_arranger_drag_track >= 0 && g_arranger_drag_clip_idx >= 0 &&
-                                g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
+                            if (g_ruler_drag_target != ArrangerRulerDragTarget::None) {
+                                float delta_bars = (m.x - g_arranger_drag_start_mouse_x) / bar_w;
+                                if (g_ruler_drag_target == ArrangerRulerDragTarget::LoopLeft) {
+                                    float new_start = g_ruler_drag_orig_start + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) new_start = std::round(new_start * 4.0f) / 4.0f;
+                                    float end_b = g_ruler_drag_orig_start + g_ruler_drag_orig_len;
+                                    new_start = std::clamp(new_start, 0.0f, end_b - 0.25f);
+                                    loop_start_bar = new_start;
+                                    loop_bars = end_b - new_start;
+                                    if (g_punch_link_to_loop) {
+                                        g_punch_in_bar = loop_start_bar;
+                                        g_punch_out_bar = loop_start_bar + loop_bars;
+                                    }
+                                } else if (g_ruler_drag_target == ArrangerRulerDragTarget::LoopRight) {
+                                    float new_len = g_ruler_drag_orig_len + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) new_len = std::round(new_len * 4.0f) / 4.0f;
+                                    loop_bars = std::clamp(new_len, 0.25f, g_arranger_max_bars - loop_start_bar);
+                                    if (g_punch_link_to_loop) {
+                                        g_punch_in_bar = loop_start_bar;
+                                        g_punch_out_bar = loop_start_bar + loop_bars;
+                                    }
+                                } else if (g_ruler_drag_target == ArrangerRulerDragTarget::LoopBody) {
+                                    float new_start = g_ruler_drag_orig_start + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) new_start = std::round(new_start * 4.0f) / 4.0f;
+                                    loop_start_bar = std::clamp(new_start, 0.0f, g_arranger_max_bars - loop_bars);
+                                    if (g_punch_link_to_loop) {
+                                        g_punch_in_bar = loop_start_bar;
+                                        g_punch_out_bar = loop_start_bar + loop_bars;
+                                    }
+                                } else if (g_ruler_drag_target == ArrangerRulerDragTarget::PunchIn) {
+                                    float new_in = g_ruler_drag_orig_punch_in + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) new_in = std::round(new_in * 4.0f) / 4.0f;
+                                    g_punch_in_bar = std::clamp(new_in, 0.0f, g_punch_out_bar - 0.25f);
+                                } else if (g_ruler_drag_target == ArrangerRulerDragTarget::PunchOut) {
+                                    float new_out = g_ruler_drag_orig_punch_out + delta_bars;
+                                    if (!ImGui::GetIO().KeyShift) new_out = std::round(new_out * 4.0f) / 4.0f;
+                                    g_punch_out_bar = std::clamp(new_out, g_punch_in_bar + 0.25f, g_arranger_max_bars);
+                                } else if (g_ruler_drag_target == ArrangerRulerDragTarget::Scrub) {
+                                    float scrub_bar = std::clamp(x_to_bar(m.x), 0.0f, g_arranger_max_bars);
+                                    float prev_sec = playhead_seconds;
+                                    playhead_seconds = scrub_bar * get_seconds_per_bar(bpm);
+                                    float vel = (dt > 1e-4f) ? ((playhead_seconds - prev_sec) / dt) : 1.0f;
+                                    vel = std::clamp(vel, -4.0f, 4.0f);
+                                    uint64_t target_sample = static_cast<uint64_t>(playhead_seconds * kSampleRate);
+                                    mixer.update_scrub(target_sample, static_cast<double>(vel));
+                                }
+                            } else if (g_arranger_drag_track >= 0 && g_arranger_drag_clip_idx >= 0 &&
+                                       g_arranger_drag_clip_idx < static_cast<int>(track_arranger_clips[g_arranger_drag_track].size())) {
                                 auto& c = track_arranger_clips[g_arranger_drag_track][g_arranger_drag_clip_idx];
 
                                 if (g_arranger_drag_mode == ArrangerDragMode::MoveClip) {
@@ -2711,6 +3103,7 @@ int main(int argc, char** argv) {
                                 mixer.update_scrub(target_sample, static_cast<double>(vel));
                             }
                         } else if (is_deactivated) {
+                            g_ruler_drag_target = ArrangerRulerDragTarget::None;
                             ArrangerDragMode finished_mode = g_arranger_drag_mode;
 
                             if (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag) {
@@ -4012,13 +4405,63 @@ int main(int argc, char** argv) {
                             // ========================================================
                             if (g_seq_view_mode == SequencerViewMode::RenoiseMultiTracker) {
                                 ImGui::Spacing();
-                                ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.05f, 1.0f), "RENOISE MULTI-TRACKER // 4-TRACK VERTICAL MATRIX (16 LINES):");
+                                ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.05f, 1.0f), "RENOISE MULTI-TRACKER // 4-TRACK VERTICAL MATRIX:");
                                 ImGui::SameLine(0, 15);
-                                ImGui::TextDisabled("[Left-click to select/toggle step | Right-click to clear]");
+                                if (g_tracker_auto_scroll) {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.35f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    if (ImGui::SmallButton("↕ AUTO-SCROLL: CTR##tr_scr")) {
+                                        g_tracker_auto_scroll = false;
+                                    }
+                                    ImGui::PopStyleColor(2);
+                                } else {
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.38f, 0.45f, 0.8f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+                                    if (ImGui::SmallButton("↕ SCROLL: MANUAL##tr_scr")) {
+                                        g_tracker_auto_scroll = true;
+                                        g_tracker_last_scrolled_line = -1;
+                                    }
+                                    ImGui::PopStyleColor(2);
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("Continuous Center-Scroll (Renoise Tracker behavior):\nWhen enabled, keeps the active playhead row centered vertically.\nScrolling the mouse wheel inside the tracker temporarily releases to MANUAL.");
+                                }
+
+                                ImGui::SameLine(0, 10);
+                                ImGui::TextDisabled("LINES:");
+                                ImGui::SameLine(0, 4);
+                                const int line_counts[3] = { 16, 32, 64 };
+                                for (int lc : line_counts) {
+                                    char lc_lbl[16];
+                                    std::snprintf(lc_lbl, sizeof(lc_lbl), "%dL##pat", lc);
+                                    bool is_cur_lc = (g_tracker_lines_preset == lc);
+                                    if (is_cur_lc) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    }
+                                    if (ImGui::SmallButton(lc_lbl)) {
+                                        g_tracker_lines_preset = lc;
+                                        for (int t = 0; t < 4; ++t) {
+                                            if (track_seq[t]) {
+                                                track_seq[t]->pattern(pattern_editor_pat_idx).num_steps = static_cast<uint32_t>(lc);
+                                            }
+                                        }
+                                        std::snprintf(status_toast, sizeof(status_toast), "TRACKER PATTERN LENGTH: %d LINES", lc);
+                                    }
+                                    if (is_cur_lc) ImGui::PopStyleColor(2);
+                                    ImGui::SameLine(0, 3);
+                                }
+
+                                ImGui::SameLine(0, 15);
+                                ImGui::TextDisabled("[Left-click select/toggle | Right-click clear]");
 
                                 if (ImGui::BeginTable("RenoiseMultiTrackerTable", 5,
                                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                                       ImGuiTableFlags_ScrollY, ImVec2(0, 270))) {
+                                    if (ImGui::IsWindowHovered() && std::abs(ImGui::GetIO().MouseWheel) > 0.01f) {
+                                        g_tracker_auto_scroll = false;
+                                    }
+
                                     ImGui::TableSetupColumn("LN", ImGuiTableColumnFlags_WidthFixed, 36);
                                     ImGui::TableSetupColumn("TRK 1 (DRUMS)", ImGuiTableColumnFlags_WidthStretch);
                                     ImGui::TableSetupColumn("TRK 2 (BASS)", ImGuiTableColumnFlags_WidthStretch);
@@ -4027,10 +4470,27 @@ int main(int argc, char** argv) {
                                     ImGui::TableHeadersRow();
 
                                     uint32_t active_step = seq->current_step_index();
-                                    for (int l = 0; l < 16; ++l) {
+                                    uint32_t num_tracker_lines = static_cast<uint32_t>(g_tracker_lines_preset);
+                                    for (int t = 0; t < 4; ++t) {
+                                        if (track_seq[t]) {
+                                            num_tracker_lines = std::max(num_tracker_lines, track_seq[t]->pattern(pattern_editor_pat_idx).num_steps);
+                                        }
+                                    }
+                                    num_tracker_lines = std::clamp(num_tracker_lines, 16u, 64u);
+
+                                    if (!seq_running) {
+                                        g_tracker_last_scrolled_line = -1;
+                                    }
+
+                                    for (uint32_t l = 0; l < num_tracker_lines; ++l) {
                                         ImGui::TableNextRow();
-                                        bool is_cur_line = (seq_running && active_step == static_cast<uint32_t>(l));
+                                        bool is_cur_line = (seq_running && active_step == l);
                                         bool is_downbeat = (l % 4 == 0);
+
+                                        if (g_tracker_auto_scroll && is_cur_line && g_tracker_last_scrolled_line != static_cast<int>(l)) {
+                                            ImGui::SetScrollHereY(0.5f);
+                                            g_tracker_last_scrolled_line = static_cast<int>(l);
+                                        }
 
                                         if (is_cur_line) {
                                             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.95f, 0.70f, 0.10f, 0.35f)));
@@ -4041,15 +4501,15 @@ int main(int argc, char** argv) {
                                         // Col 0: Line Number
                                         ImGui::TableSetColumnIndex(0);
                                         if (is_downbeat) {
-                                            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "%02d", l);
+                                            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "%02u", l);
                                         } else {
-                                            ImGui::TextDisabled("%02d", l);
+                                            ImGui::TextDisabled("%02u", l);
                                         }
 
                                         // Cols 1..4: Track Step Cells
                                         for (int t = 0; t < 4; ++t) {
                                             ImGui::TableSetColumnIndex(t + 1);
-                                            ImGui::PushID(l * 10 + t);
+                                            ImGui::PushID(static_cast<int>(l * 10 + t));
                                             auto t_seq = track_seq[t];
                                             if (!t_seq) {
                                                 ImGui::TextDisabled("---");
@@ -4058,7 +4518,7 @@ int main(int argc, char** argv) {
                                             }
                                             auto& t_pat = t_seq->pattern(pattern_editor_pat_idx);
                                             auto& step = t_pat.steps[l];
-                                            bool is_sel_cell = (selected_track == t && pattern_editor_step_idx == l);
+                                            bool is_sel_cell = (selected_track == t && pattern_editor_step_idx == static_cast<int>(l));
 
                                             if (step.active) {
                                                 char cell_txt[48];
@@ -4083,7 +4543,7 @@ int main(int argc, char** argv) {
                                                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.95f, 0.98f, 1.0f));
                                                 if (ImGui::Button(cell_txt, ImVec2(-1, 20))) {
                                                     selected_track = t;
-                                                    pattern_editor_step_idx = l;
+                                                    pattern_editor_step_idx = static_cast<int>(l);
                                                 }
                                                 ImGui::PopStyleColor(2);
 
@@ -4092,14 +4552,14 @@ int main(int argc, char** argv) {
                                                 }
                                             } else {
                                                 char empty_lbl[24];
-                                                std::snprintf(empty_lbl, sizeof(empty_lbl), "· ··· ··##e%d_%d", l, t);
+                                                std::snprintf(empty_lbl, sizeof(empty_lbl), "· ··· ··##e%u_%d", l, t);
                                                 ImVec4 cell_col = is_sel_cell ? ImVec4(0.12f, 0.45f, 0.95f, 0.35f) : ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
                                                 ImGui::PushStyleColor(ImGuiCol_Button, cell_col);
                                                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.44f, 0.52f, 0.7f));
                                                 if (ImGui::Button(empty_lbl, ImVec2(-1, 20))) {
                                                     t_pat.set_step(l, 0, 0.9f);
                                                     selected_track = t;
-                                                    pattern_editor_step_idx = l;
+                                                    pattern_editor_step_idx = static_cast<int>(l);
                                                 }
                                                 ImGui::PopStyleColor(2);
                                             }
