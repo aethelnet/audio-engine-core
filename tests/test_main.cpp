@@ -5308,9 +5308,89 @@ void test_step_sequencer_midi_pattern_clips_and_arranger() {
     trk->enable_sequencer(false);
     TEST_CHECK(!trk->is_sequencer_enabled());
 
+    // 9. Test Direct Arranger Track Pattern Clip Sequencing
+    // Place Pattern 0 at Bar 0 (len 1 bar) and Pattern 1 at Bar 2 (len 1 bar)
+    ArrangerClipInstance pat_c0;
+    pat_c0.type = ArrangerClipType::Pattern;
+    pat_c0.pattern_index = 0;
+    pat_c0.clip = clip;
+    pat_c0.name = "ArrangerPat0";
+    pat_c0.start_bar = 0.0f;
+    pat_c0.len_bars = 1.0f;
+
+    ArrangerClipInstance pat_c1;
+    pat_c1.type = ArrangerClipType::Pattern;
+    pat_c1.pattern_index = 1;
+    pat_c1.clip = clip;
+    pat_c1.name = "ArrangerPat1";
+    pat_c1.start_bar = 2.0f;
+    pat_c1.len_bars = 1.0f;
+
+    uint32_t id0 = trk->arranger().add_clip(pat_c0);
+    uint32_t id1 = trk->arranger().add_clip(pat_c1);
+    TEST_CHECK(id0 > 0 && id1 > 0);
+    TEST_CHECK(trk->arranger().num_clips() == 2);
+    TEST_CHECK(trk->arranger().find_clip(id0)->type == ArrangerClipType::Pattern);
+
+    // Arranger is enabled, sequencer is disabled (Arranger is Master)
+    TEST_CHECK(!trk->is_sequencer_enabled());
+    TEST_CHECK(trk->arranger().is_enabled());
+
+    // Seek to Bar 0.0 (sample 0)
+    mixer.clock().set_sample_position(0);
+    float pat0_timeline_energy = 0.0f;
+    // Render Bar 0 (96000 samples = 375 blocks of 256)
+    for (int i = 0; i < 375; ++i) {
+        mixer.render(master_view);
+        for (uint32_t s = 0; s < 256; ++s) {
+            pat0_timeline_energy += std::abs(master_buf.channel(0)[s]);
+        }
+    }
+    // Pattern 0 rendered audio into arranger!
+    TEST_CHECK(pat0_timeline_energy > 1.0f);
+
+    // Render Bar 1 (sample 96000 to 192000): GAP SILENCE (no clips between bar 1.0 and 2.0)
+    // Wait for voice tail to decay then check silence
+    for (int i = 0; i < 20; ++i) mixer.render(master_view);
+    float gap_energy = 0.0f;
+    for (int i = 0; i < 50; ++i) {
+        mixer.render(master_view);
+        for (uint32_t s = 0; s < 256; ++s) {
+            gap_energy += std::abs(master_buf.channel(0)[s]);
+        }
+    }
+    TEST_CHECK(gap_energy < 1e-4f);
+
+    // Render Bar 2 (sample 192000): Pattern 1 triggers!
+    mixer.clock().set_sample_position(192000);
+    float pat1_timeline_energy = 0.0f;
+    for (int i = 0; i < 375; ++i) {
+        mixer.render(master_view);
+        for (uint32_t s = 0; s < 256; ++s) {
+            pat1_timeline_energy += std::abs(master_buf.channel(0)[s]);
+        }
+    }
+    TEST_CHECK(pat1_timeline_energy > 1.0f);
+
+    // 10. Test Razor Split of Pattern Clip at Bar 2.5
+    auto split_res = trk->arranger().split_clip_at_bar(id1, 2.5f);
+    TEST_CHECK(split_res.first != 0 && split_res.second != 0);
+    auto* split_left = trk->arranger().find_clip(split_res.first);
+    auto* split_right = trk->arranger().find_clip(split_res.second);
+    TEST_CHECK(split_left != nullptr && split_right != nullptr);
+    TEST_CHECK(split_left->type == ArrangerClipType::Pattern);
+    TEST_CHECK(split_right->type == ArrangerClipType::Pattern);
+    TEST_CHECK(split_left->pattern_index == 1);
+    TEST_CHECK(split_right->pattern_index == 1);
+    TEST_CHECK(std::abs(split_left->len_bars - 0.5f) < 1e-4f);
+    TEST_CHECK(std::abs(split_right->len_bars - 0.5f) < 1e-4f);
+
+    trk->arranger().clear_clips();
+
     std::cout << "  -> Step-Sequencer MIDI Pattern Clips & Arranger: PASSED ("
               << "Bar-quantized pattern switch verified | Live step grid toggling verified | "
-              << "Micro-fade choke voice active | Manual MPC trigger verified)" << std::endl;
+              << "Micro-fade choke voice active | Manual MPC trigger verified | "
+              << "Pattern Clips Arranger Sequencing & Razor Split verified)" << std::endl;
 }
 
 void test_ptp_boundary_clock_and_master_sync_daemon() {

@@ -171,6 +171,18 @@ struct Pattern {
 };
 
 // ============================================================================
+// TimelinePatternClip: Container for Arranger Track Pattern Clips
+// Binds musical bars on the timeline to pattern steps and slices.
+// ============================================================================
+struct TimelinePatternClip {
+    uint32_t pattern_index{0};
+    float start_bar{0.0f};
+    float len_bars{4.0f};
+    float offset_bars{0.0f};
+    float gain{1.0f};
+};
+
+// ============================================================================
 // StepSequencer: Clock-Synchronized Slice Step-Sequencer & Pad Trigger Engine
 // - 16/32/64-step grid synced to TimelineClock
 // - Immediate & Quantized (Beat/Bar) pattern switching
@@ -654,6 +666,149 @@ public:
             if (ext_send_a_r) ext_send_a_r[i] = sa_r;
             if (ext_send_b_l) ext_send_b_l[i] = sb_l;
             if (ext_send_b_r) ext_send_b_r[i] = sb_r;
+        }
+    }
+
+    // Real-Time Timeline Pattern Clip Renderer:
+    // Sample-accurate polyphonic pattern step dispatch for Arranger Track Pattern clips.
+    // Seamlessly handles pattern looping, swing, micro-timing, parameter locks and voice decay tails.
+    void render_timeline_clips(Sample* out_l, Sample* out_r, uint32_t frames,
+                               uint32_t session_sr, double session_bpm, bool is_playing,
+                               double transport_total_beats,
+                               const TimelinePatternClip* clips, size_t num_clips) noexcept {
+        if (!out_l || !out_r || frames == 0) return;
+        if (!m_clip) return;
+
+        const uint32_t engine_sr = (session_sr > 0) ? session_sr : 48000;
+        const uint32_t clip_sr = (m_clip->sample_rate() > 0) ? m_clip->sample_rate() : engine_sr;
+        const double rate_ratio = static_cast<double>(clip_sr) / static_cast<double>(engine_sr);
+
+        if (!is_playing) {
+            return;
+        }
+
+        const double beats_per_sec = (session_bpm > 1.0) ? (session_bpm / 60.0) : 2.0;
+        const double beats_per_sample = beats_per_sec / static_cast<double>(engine_sr);
+        const double bars_per_sample = beats_per_sample * 0.25;
+        const double spb = static_cast<double>(engine_sr) / beats_per_sec;
+        const double samples_per_bar = spb * 4.0;
+
+        const double block_start_bar = transport_total_beats * 0.25;
+        const double block_end_bar = block_start_bar + bars_per_sample * static_cast<double>(frames);
+
+        struct PendingTrigger {
+            uint32_t frame_offset{0};
+            uint32_t slice_id{0};
+            float velocity{1.0f};
+            float pitch_ratio{1.0f};
+            float pan{0.0f};
+            uint8_t choke_group{0};
+            float filter_cutoff{20000.0f};
+            float filter_res{0.707f};
+            dsp::FilterType filter_type{dsp::FilterType::Lowpass};
+            float decay_ms{0.0f};
+            float drive{0.0f};
+            float send_a{0.0f};
+            float send_b{0.0f};
+            bool reverse{false};
+        };
+
+        static constexpr size_t kMaxPending = 32;
+        PendingTrigger pending[kMaxPending];
+        size_t num_pending = 0;
+
+        if (clips && num_clips > 0) {
+            for (size_t c_idx = 0; c_idx < num_clips && num_pending < kMaxPending; ++c_idx) {
+                const auto& clip = clips[c_idx];
+                float clip_end_b = clip.start_bar + clip.len_bars;
+                if (clip_end_b <= static_cast<float>(block_start_bar) || clip.start_bar >= static_cast<float>(block_end_bar)) {
+                    continue;
+                }
+
+                const auto& pat = m_patterns[clip.pattern_index % kMaxPatterns];
+                if (pat.num_steps == 0) continue;
+
+                const double step_dur = calculate_step_duration(pat.subdivision, spb);
+                if (step_dur <= 1.0) continue;
+
+                const uint32_t N = pat.num_steps;
+                const float pat_swing = std::clamp(pat.swing, 0.0f, 1.0f);
+
+                double rel_start_smp = (block_start_bar - static_cast<double>(clip.start_bar) + static_cast<double>(clip.offset_bars)) * samples_per_bar;
+                double rel_end_smp = (block_end_bar - static_cast<double>(clip.start_bar) + static_cast<double>(clip.offset_bars)) * samples_per_bar;
+                double clip_total_smp = static_cast<double>(clip.len_bars + clip.offset_bars) * samples_per_bar;
+
+                const double min_s_flt = (rel_start_smp / step_dur) - 1.0;
+                const double max_s_flt = (rel_end_smp / step_dur) + 0.5;
+
+                const int64_t s_min = std::max<int64_t>(0, static_cast<int64_t>(std::floor(min_s_flt)));
+                const int64_t s_max = static_cast<int64_t>(std::ceil(max_s_flt));
+
+                for (int64_t S = s_min; S <= s_max && num_pending < kMaxPending; ++S) {
+                    const uint32_t step_idx = static_cast<uint32_t>(S % N);
+                    const auto& step = pat.steps[step_idx];
+                    if (!step.active) continue;
+
+                    const float effective_micro = step.micro_timing * (1.0f - step.quantize_pct);
+                    const float swing_offset = (step_idx % 2 == 1) ? (pat_swing * 0.5f) : 0.0f;
+                    const double total_offset = static_cast<double>(effective_micro + swing_offset);
+
+                    double trig_rel_smp = (static_cast<double>(S) + total_offset) * step_dur;
+                    if (trig_rel_smp >= 0.0 && trig_rel_smp < clip_total_smp &&
+                        trig_rel_smp >= rel_start_smp && trig_rel_smp < rel_end_smp) {
+
+                        bool fire = true;
+                        if (step.probability < 100) {
+                            uint32_t hash = static_cast<uint32_t>(S * 2654435761u + clip.pattern_index * 1013904223u);
+                            fire = (hash % 100) < step.probability;
+                        }
+
+                        if (fire) {
+                            uint32_t f_idx = static_cast<uint32_t>(std::clamp(std::round(trig_rel_smp - rel_start_smp), 0.0, static_cast<double>(frames - 1)));
+                            pending[num_pending++] = PendingTrigger{
+                                .frame_offset = f_idx,
+                                .slice_id = step.slice_id,
+                                .velocity = step.velocity * clip.gain,
+                                .pitch_ratio = step.pitch_ratio,
+                                .pan = step.pan,
+                                .choke_group = step.choke_group,
+                                .filter_cutoff = step.filter_cutoff,
+                                .filter_res = step.filter_res,
+                                .filter_type = step.filter_type,
+                                .decay_ms = step.decay_ms,
+                                .drive = step.drive,
+                                .send_a = step.send_a,
+                                .send_b = step.send_b,
+                                .reverse = step.reverse
+                            };
+                            m_current_step.store(step_idx, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (num_pending == 0 && !is_voice_active()) {
+            return;
+        }
+
+        for (uint32_t i = 0; i < frames; ++i) {
+            for (size_t p = 0; p < num_pending; ++p) {
+                if (pending[p].frame_offset == i) {
+                    start_slice_voice(pending[p].slice_id, pending[p].velocity,
+                                      pending[p].pitch_ratio, pending[p].reverse,
+                                      pending[p].pan, pending[p].choke_group,
+                                      pending[p].filter_cutoff, pending[p].filter_res,
+                                      pending[p].filter_type, pending[p].decay_ms,
+                                      pending[p].drive, pending[p].send_a, pending[p].send_b,
+                                      engine_sr);
+                }
+            }
+
+            float sl = 0.0f, sr = 0.0f, sa_l = 0.0f, sa_r = 0.0f, sb_l = 0.0f, sb_r = 0.0f;
+            render_sample(sl, sr, sa_l, sa_r, sb_l, sb_r, rate_ratio);
+            out_l[i] += sl;
+            out_r[i] += sr;
         }
     }
 

@@ -6,6 +6,7 @@
 #include "audio_core/dsp/resampler.hpp"
 #include "audio_core/dsp/time_stretcher.hpp"
 #include "audio_core/analysis/transient_detector.hpp"
+#include "audio_core/sequencer/step_sequencer.hpp"
 
 #include <vector>
 #include <memory>
@@ -22,6 +23,14 @@
 #endif
 
 namespace audio_core::sequencer {
+
+// ============================================================================
+// ArrangerClipType: Clip Medium Type (Prismatic Audio vs Renoise Tracker Pattern)
+// ============================================================================
+enum class ArrangerClipType : uint8_t {
+    Audio = 0,    // Pure audio sample asset with elastic WSOLA/Hermite playback
+    Pattern = 1   // Renoise/Tracker/Step pattern dispatching polyphonic slice voices
+};
 
 // ============================================================================
 // WarpPin: Non-Linear Elastic Time-Warping Anchor Point
@@ -45,6 +54,8 @@ struct ArrangerClipInstance {
     std::string name{""};
     std::shared_ptr<sampling::AudioClip> clip{nullptr};
     std::shared_ptr<sampling::AudioClip> source_clip{nullptr}; // Pristine un-stretched master asset
+    ArrangerClipType type{ArrangerClipType::Audio};            // Audio sample or Renoise/Tracker pattern
+    uint32_t pattern_index{0};                                 // Pattern index in track's sequencer [0..15]
 
     float start_bar{0.0f};           // Absolute timeline position in musical bars
     float len_bars{4.0f};            // Timeline duration in musical bars
@@ -322,6 +333,8 @@ struct ArrangerClipInstance {
                name == o.name &&
                clip == o.clip &&
                source_clip == o.source_clip &&
+               type == o.type &&
+               pattern_index == o.pattern_index &&
                start_bar == o.start_bar &&
                len_bars == o.len_bars &&
                base_len_bars == o.base_len_bars &&
@@ -586,6 +599,8 @@ public:
         c2.name = orig.name + "_split";
         c2.clip = orig.clip;
         c2.source_clip = orig.source_clip ? orig.source_clip : orig.clip;
+        c2.type = orig.type;
+        c2.pattern_index = orig.pattern_index;
         c2.start_bar = split_bar;
         c2.len_bars = len2;
         c2.base_len_bars = orig.base_len_bars;
@@ -730,6 +745,7 @@ public:
         const double end_bar = start_bar + bars_per_sample * static_cast<double>(frames);
 
         for (const auto& c : *snap) {
+            if (c.type == ArrangerClipType::Pattern) continue;
             if (!c.clip || c.len_bars <= 0.0f) continue;
             if (c.end_bar() <= static_cast<float>(start_bar) || c.start_bar >= static_cast<float>(end_bar)) {
                 continue;
@@ -771,6 +787,29 @@ public:
                 }
             }
         }
+
+        // 2. Render Pattern Clips via Associated StepSequencer
+        if (m_associated_sequencer) {
+            TimelinePatternClip pat_clips[16];
+            size_t num_pat_clips = 0;
+            for (const auto& c : *snap) {
+                if (c.type == ArrangerClipType::Pattern && num_pat_clips < 16) {
+                    pat_clips[num_pat_clips++] = TimelinePatternClip{
+                        .pattern_index = c.pattern_index,
+                        .start_bar = c.start_bar,
+                        .len_bars = c.len_bars,
+                        .offset_bars = c.offset_bars,
+                        .gain = c.evaluate_gain_at_bar(static_cast<float>(start_bar))
+                    };
+                }
+            }
+            if (num_pat_clips > 0 || m_associated_sequencer->is_voice_active()) {
+                m_associated_sequencer->render_timeline_clips(dst_l, dst_r, frames,
+                                                              session_sr, session_bpm, is_playing,
+                                                              transport_total_beats,
+                                                              pat_clips, num_pat_clips);
+            }
+        }
     }
 
     [[nodiscard]] bool is_empty() const noexcept {
@@ -785,11 +824,18 @@ public:
         return m_enabled.load(std::memory_order_relaxed);
     }
 
+    void set_associated_sequencer(StepSequencer* seq) noexcept {
+        m_associated_sequencer = seq;
+    }
+    [[nodiscard]] StepSequencer* associated_sequencer() noexcept { return m_associated_sequencer; }
+    [[nodiscard]] const StepSequencer* associated_sequencer() const noexcept { return m_associated_sequencer; }
+
 private:
     std::vector<ArrangerClipInstance> m_clips{};
     uint32_t m_next_clip_id{1};
     std::atomic<bool> m_enabled{true};
     std::atomic<std::shared_ptr<ArrangerSnapshot>> m_snapshot{nullptr};
+    StepSequencer* m_associated_sequencer{nullptr};
 };
 
 } // namespace audio_core::sequencer

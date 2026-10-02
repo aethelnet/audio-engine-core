@@ -158,6 +158,7 @@ public:
         m_pdc_buffer.clear();
         m_pdc_write_pos = 0;
         m_pdc_delay_samples.store(0, std::memory_order_relaxed);
+        m_arranger.set_associated_sequencer(nullptr);
         m_has_previous_gain = false;
     }
 
@@ -512,6 +513,7 @@ public:
         m_sequencer = std::move(seq);
         m_sequencer_enabled.store(m_sequencer != nullptr, std::memory_order_relaxed);
         m_launcher.set_associated_sequencer(m_sequencer.get());
+        m_arranger.set_associated_sequencer(m_sequencer.get());
     }
 
     void enable_sequencer(bool enable) noexcept {

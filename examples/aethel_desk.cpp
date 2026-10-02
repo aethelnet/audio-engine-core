@@ -473,6 +473,7 @@ int main(int argc, char** argv) {
     static std::vector<sequencer::ArrangerClipInstance> track_arranger_clips[4];
     static int g_selected_clip_idx = 0;
     static bool g_arranger_initialized = false;
+    static int g_switch_to_main_tab = -1; // -1 = none, 0 = Arranger, 2 = Tracker
 
     enum class ArrangerTool {
         Select = 0,
@@ -676,21 +677,40 @@ int main(int argc, char** argv) {
 
     if (!g_arranger_initialized) {
         g_arranger_initialized = true;
+        // Track 0 (Drums): Audio Clip (Bars 0-4) + Pattern Clip (Bars 4-8)
         track_arranger_clips[0].push_back(sequencer::ArrangerClipInstance{
             .id = 1, .name = "Kick / 808 Sub", .clip = drum_clip,
+            .type = sequencer::ArrangerClipType::Audio,
             .start_bar = 0.0f, .len_bars = 4.0f, .offset_bars = 0.0f
         });
-        track_arranger_clips[1].push_back(sequencer::ArrangerClipInstance{
-            .id = 2, .name = "Acid 303 Lead", .clip = acid_clip,
-            .start_bar = 2.0f, .len_bars = 4.0f, .offset_bars = 0.0f
-        });
-        track_arranger_clips[2].push_back(sequencer::ArrangerClipInstance{
-            .id = 3, .name = "Vocal Chops", .clip = vocal_clip,
+        track_arranger_clips[0].push_back(sequencer::ArrangerClipInstance{
+            .id = 5, .name = "PAT 1: Straight Beat", .clip = drum_clip,
+            .type = sequencer::ArrangerClipType::Pattern,
+            .pattern_index = 0,
             .start_bar = 4.0f, .len_bars = 4.0f, .offset_bars = 0.0f
         });
+
+        // Track 1 (Bass): Tracker Pattern Clip (Bars 2-8)
+        track_arranger_clips[1].push_back(sequencer::ArrangerClipInstance{
+            .id = 2, .name = "PAT 1: Acid Groove", .clip = acid_clip,
+            .type = sequencer::ArrangerClipType::Pattern,
+            .pattern_index = 0,
+            .start_bar = 2.0f, .len_bars = 6.0f, .offset_bars = 0.0f
+        });
+
+        // Track 2 (Vocals): Audio Vocal Chop Take (Bars 4-8)
+        track_arranger_clips[2].push_back(sequencer::ArrangerClipInstance{
+            .id = 3, .name = "Vocal Chops", .clip = vocal_clip,
+            .type = sequencer::ArrangerClipType::Audio,
+            .start_bar = 4.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+        });
+
+        // Track 3 (Perc): Tracker Pattern Clip (Bars 0-8)
         track_arranger_clips[3].push_back(sequencer::ArrangerClipInstance{
-            .id = 4, .name = "Percussion Loop", .clip = perc_clip,
-            .start_bar = 6.0f, .len_bars = 4.0f, .offset_bars = 0.0f
+            .id = 4, .name = "PAT 1: HiHat Roll", .clip = perc_clip,
+            .type = sequencer::ArrangerClipType::Pattern,
+            .pattern_index = 0,
+            .start_bar = 0.0f, .len_bars = 8.0f, .offset_bars = 0.0f
         });
 
         for (int t = 0; t < 4; ++t) {
@@ -724,6 +744,41 @@ int main(int argc, char** argv) {
                 slice_points = { 0.0f, 0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f };
             }
         }
+    };
+
+    auto stamp_pattern_to_arranger = [&](int t, int p_idx) {
+        if (t < 0 || t >= 4) return;
+        auto seq = track_seq[t];
+        if (!seq || p_idx < 0 || p_idx >= 4) return;
+        float cur_p_bar = playhead_seconds / get_seconds_per_bar(bpm);
+        float snap_bar = std::floor(cur_p_bar * 4.0f) * 0.25f;
+        Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+        if (!trk) return;
+
+        auto before = trk->arranger().clips();
+        sequencer::ArrangerClipInstance pat_inst;
+        pat_inst.type = sequencer::ArrangerClipType::Pattern;
+        pat_inst.pattern_index = static_cast<uint32_t>(p_idx);
+        pat_inst.clip = seq->clip() ? seq->clip() : track_clips[t];
+        pat_inst.name = "PAT " + std::to_string(p_idx + 1) + ": " + seq->pattern(p_idx).name;
+        pat_inst.start_bar = snap_bar;
+        float dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 16.0f;
+        if (seq->pattern(p_idx).subdivision == sequencer::StepSubdivision::ThirtySecond)
+            dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 32.0f;
+        else if (seq->pattern(p_idx).subdivision == sequencer::StepSubdivision::Eighth)
+            dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 8.0f;
+        pat_inst.len_bars = std::max(dur_bars, 0.25f);
+        pat_inst.base_len_bars = pat_inst.len_bars;
+        pat_inst.orig_len_bars = pat_inst.len_bars;
+
+        trk->arranger().add_clip(pat_inst);
+        track_arranger_clips[t] = trk->arranger().clips();
+        g_selected_clip_idx = static_cast<int>(track_arranger_clips[t].size() - 1);
+        g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+            trk, before, track_arranger_clips[t], "Stamp Pattern Clip '" + pat_inst.name + "'"
+        ));
+        std::snprintf(status_toast, sizeof(status_toast), "STAMPED PATTERN %d TO TRACK %d AT BAR %.2f",
+                      p_idx + 1, t + 1, snap_bar + 1.0f);
     };
 
     // SampleTap Recorder & Quantized Bouncer State
@@ -1527,6 +1582,8 @@ int main(int argc, char** argv) {
                         std::snprintf(status_toast, sizeof(status_toast), "LOOP FIT TO CLIP '%s' (BARS %.1f-%.1f)",
                                       c.name.c_str(), loop_start_bar + 1.0f, loop_start_bar + loop_bars + 1.0f);
                     }
+                } else if (ImGui::GetIO().KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
+                    stamp_pattern_to_arranger(selected_track, pattern_editor_pat_idx);
                 }
             }
 
@@ -1781,7 +1838,9 @@ int main(int argc, char** argv) {
                 // ------------------------------------------------------------
                 // TAB 1: TIMELINE ARRANGER (CLEAN ZÄHL AM1 CANVAS)
                 // ------------------------------------------------------------
-                if (ImGui::BeginTabItem("  TIMELINE ARRANGER  ")) {
+                ImGuiTabItemFlags t1_flags = (g_switch_to_main_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem("  TIMELINE ARRANGER  ", nullptr, t1_flags)) {
+                    if (g_switch_to_main_tab == 0) g_switch_to_main_tab = -1;
                     ImVec2 avail_sz = ImGui::GetContentRegionAvail();
                     avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
 
@@ -1914,6 +1973,32 @@ int main(int argc, char** argv) {
                                 std::snprintf(status_toast, sizeof(status_toast), "DELETED CLIP (TRACK %d)", t + 1);
                             }
                         }
+                    }
+
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                    if (ImGui::SmallButton("+ PAT CLIP")) {
+                        ImGui::OpenPopup("AddPatternClipPopup");
+                    }
+                    ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Insert Tracker Pattern as Arranger Clip at playhead.");
+
+                    if (ImGui::BeginPopup("AddPatternClipPopup")) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.60f, 0.20f, 1.0f), "INSERT TRACKER PATTERN CLIP (TRK %d):", selected_track + 1);
+                        ImGui::Separator();
+                        auto seq = track_seq[selected_track];
+                        if (seq) {
+                            for (int p = 0; p < 4; ++p) {
+                                char pat_btn[64];
+                                std::snprintf(pat_btn, sizeof(pat_btn), "PAT %d: %s (%d Steps)",
+                                              p + 1, seq->pattern(p).name.c_str(), seq->pattern(p).num_steps);
+                                if (ImGui::Selectable(pat_btn)) {
+                                    stamp_pattern_to_arranger(selected_track, p);
+                                }
+                            }
+                        }
+                        ImGui::EndPopup();
                     }
 
                     ImGui::SameLine();
@@ -2239,249 +2324,363 @@ int main(int argc, char** argv) {
                                     }
                                     bool is_sel = (selected_track == t && static_cast<int>(c_idx) == g_selected_clip_idx);
 
-                                    // Main Clip Body Box
-                                    draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                             ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
-                                                             is_sel ? ImColor(220, 235, 255, 245) : ImColor(240, 245, 252, 230),
-                                                             3.0f);
-                                    draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                       ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
-                                                       is_sel ? ImColor(31, 97, 217, 255) : ImColor(160, 180, 210, 200),
-                                                       3.0f, 0, is_sel ? 2.0f : 1.0f);
+                                    bool is_pat_clip = (c.type == sequencer::ArrangerClipType::Pattern);
 
-                                    // Mini Waveform preview inside clip with Slip-Editing Sliding Window
-                                    auto clip_ptr = c.clip ? c.clip : track_clips[t];
-                                    if (clip_ptr && clip_ptr->num_frames() > 0 && clip_ptr->channel(0)) {
-                                        const float* ch0 = clip_ptr->channel(0);
-                                        const uint32_t total_f = clip_ptr->num_frames();
-                                        float wf_mid_y = ly + lane_h * 0.58f;
-                                        float max_h = (lane_h - 18.0f) * 0.42f;
-                                        float vis_x1 = std::max(clip_x1 + 3.0f, canvas_pos.x);
-                                        float vis_x2 = std::min(clip_x2 - 3.0f, canvas_pos.x + canvas_size.x);
-                                        const float* ch1 = (clip_ptr->num_channels() > 1 && clip_ptr->channel(1)) ? clip_ptr->channel(1) : nullptr;
+                                    if (is_pat_clip) {
+                                        // Pattern Clip Box (Warm Amber)
+                                        draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                                 ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                                 is_sel ? ImColor(254, 243, 199, 250) : ImColor(255, 251, 235, 235),
+                                                                 3.0f);
+                                        draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                           ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                           is_sel ? ImColor(217, 119, 6, 255) : ImColor(245, 158, 11, 200),
+                                                           3.0f, 0, is_sel ? 2.0f : 1.0f);
 
-                                        if (vis_x1 < vis_x2) {
-                                            constexpr float step_px = 2.0f;
-                                            for (float px = vis_x1; px < vis_x2; px += step_px) {
-                                                float bar_s = x_to_bar(px);
-                                                float bar_e = x_to_bar(px + step_px);
-                                                float rel_b_s = std::clamp(bar_s - c.start_bar, 0.0f, c.len_bars);
-                                                float rel_b_e = std::clamp(bar_e - c.start_bar, 0.0f, c.len_bars);
-                                                if (rel_b_e <= rel_b_s) continue;
+                                        // Pattern Header Ribbon
+                                        draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                                 ImVec2(clip_x2 - 1.0f, ly + 14.0f),
+                                                                 is_sel ? ImColor(245, 158, 11, 140) : ImColor(217, 119, 6, 70),
+                                                                 3.0f, ImDrawFlags_RoundCornersTop);
 
-                                                double raw_s = c.evaluate_warped_frame(rel_b_s, total_f);
-                                                double raw_e = c.evaluate_warped_frame(rel_b_e, total_f);
-                                                double frame_s = std::fmod(raw_s, static_cast<double>(total_f));
-                                                if (frame_s < 0.0) frame_s += total_f;
-                                                double frame_e = std::fmod(raw_e, static_cast<double>(total_f));
-                                                if (frame_e < 0.0) frame_e += total_f;
+                                        // Tracker Step Matrix
+                                        if (track_seq[t] && c.pattern_index < sequencer::StepSequencer::kMaxPatterns) {
+                                            const auto& pat = track_seq[t]->pattern(c.pattern_index);
+                                            uint32_t num_st = (pat.num_steps > 0) ? pat.num_steps : 16;
+                                            float step_dur_bars = (pat.subdivision == sequencer::StepSubdivision::ThirtySecond) ? (1.0f / 32.0f) :
+                                                                  ((pat.subdivision == sequencer::StepSubdivision::Eighth) ? (1.0f / 8.0f) : (1.0f / 16.0f));
+                                            float pat_dur_bars = static_cast<float>(num_st) * step_dur_bars;
+                                            if (pat_dur_bars <= 0.0001f) pat_dur_bars = 1.0f;
 
-                                                uint32_t f_start = static_cast<uint32_t>(std::clamp(frame_s, 0.0, static_cast<double>(total_f - 1)));
-                                                uint32_t f_end = static_cast<uint32_t>(std::clamp(frame_e, 0.0, static_cast<double>(total_f)));
-                                                if (f_end <= f_start) f_end = total_f;
+                                            float vis_x1 = std::max(clip_x1 + 2.0f, canvas_pos.x);
+                                            float vis_x2 = std::min(clip_x2 - 2.0f, canvas_pos.x + canvas_size.x);
 
-                                                float peak_val = 0.0f;
-                                                uint32_t span = f_end - f_start;
-                                                uint32_t stride = std::max(1u, span / 32u);
-                                                for (uint32_t fi = f_start; fi < f_end; fi += stride) {
-                                                    float s = std::abs(ch0[fi]);
-                                                    if (ch1) s = std::max(s, std::abs(ch1[fi]));
-                                                    if (s > peak_val) peak_val = s;
-                                                }
+                                            float grid_top = ly + 16.0f;
+                                            float grid_bottom = ly + lane_h - 4.0f;
+                                            float grid_h = grid_bottom - grid_top;
 
-                                                float col_bar = 0.5f * (bar_s + bar_e);
-                                                peak_val *= c.evaluate_gain_at_bar(col_bar);
+                                            float cur_rel_b = 0.0f;
+                                            while (cur_rel_b < c.len_bars - 0.0001f) {
+                                                float pat_time = std::fmod(cur_rel_b + c.offset_bars, pat_dur_bars);
+                                                if (pat_time < 0.0f) pat_time += pat_dur_bars;
+                                                uint32_t st = static_cast<uint32_t>(pat_time / step_dur_bars);
+                                                if (st >= num_st) st = num_st - 1;
 
-                                                float h = std::clamp(peak_val * max_h, 1.0f, max_h);
-                                                draw_list->AddLine(ImVec2(px, wf_mid_y - h),
-                                                                   ImVec2(px, wf_mid_y + h),
-                                                                   is_sel ? ImColor(31, 97, 217, 160) : ImColor(100, 130, 170, 130), 1.5f);
-                                            }
-                                        }
+                                                float next_step_time = (static_cast<float>(st) + 1.0f) * step_dur_bars;
+                                                float step_rem_in_pat = next_step_time - pat_time;
+                                                float cur_step_len = std::min(step_rem_in_pat, c.len_bars - cur_rel_b);
+                                                cur_step_len = std::max(cur_step_len, 0.0005f);
 
-                                        // Transient Markers (Unpinned ticks)
-                                        for (const auto& span : c.detected_transients) {
-                                            float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, total_f));
-                                            float tx = bar_to_x(c.start_bar + rel_b);
-                                            if (tx >= clip_x1 + 3.0f && tx <= clip_x2 - 3.0f) {
-                                                bool is_pinned = false;
-                                                for (const auto& pin : c.warp_pins) {
-                                                    if (pin.source_frame >= span.start_frame && pin.source_frame <= span.decay_end_frame) {
-                                                        is_pinned = true;
-                                                        break;
+                                                float sx1 = bar_to_x(c.start_bar + cur_rel_b);
+                                                float sx2 = bar_to_x(c.start_bar + cur_rel_b + cur_step_len);
+
+                                                if (sx2 >= vis_x1 && sx1 <= vis_x2) {
+                                                    bool is_beat = (st % 4 == 0);
+                                                    draw_list->AddLine(ImVec2(sx1, grid_top), ImVec2(sx1, grid_bottom),
+                                                                       is_beat ? ImColor(217, 119, 6, 80) : ImColor(217, 119, 6, 30),
+                                                                       is_beat ? 1.0f : 0.5f);
+
+                                                    const auto& step_trig = pat.steps[st];
+                                                    if (step_trig.active) {
+                                                        float vel = std::clamp(step_trig.velocity, 0.1f, 1.0f);
+                                                        float bar_h = vel * (grid_h - 4.0f);
+                                                        float bx1 = sx1 + 1.0f;
+                                                        float bx2 = std::max(bx1 + 2.0f, sx2 - 1.0f);
+                                                        float by2 = grid_bottom - 2.0f;
+                                                        float by1 = by2 - bar_h;
+
+                                                        ImColor trig_col;
+                                                        if (t == 0) {
+                                                            if (step_trig.slice_id == 0) trig_col = ImColor(239, 68, 68, 230);
+                                                            else if (step_trig.slice_id == 1) trig_col = ImColor(245, 158, 11, 230);
+                                                            else trig_col = ImColor(14, 165, 233, 230);
+                                                        } else if (t == 1) {
+                                                            trig_col = ImColor(16, 185, 129, 230);
+                                                        } else if (t == 2) {
+                                                            trig_col = ImColor(168, 85, 247, 230);
+                                                        } else {
+                                                            trig_col = ImColor(249, 115, 22, 230);
+                                                        }
+
+                                                        draw_list->AddRectFilled(ImVec2(bx1, by1), ImVec2(bx2, by2), trig_col, 1.5f);
+                                                        draw_list->AddLine(ImVec2(bx1, by1), ImVec2(bx2, by1), ImColor(255, 255, 255, 220), 1.0f);
+                                                    }
+
+                                                    float playhead_bar = playhead_seconds / get_seconds_per_bar(bpm);
+                                                    if (playhead_bar >= (c.start_bar + cur_rel_b) && playhead_bar < (c.start_bar + cur_rel_b + cur_step_len)) {
+                                                        draw_list->AddRectFilled(ImVec2(sx1, grid_top), ImVec2(sx2, grid_bottom), ImColor(245, 158, 11, 55));
+                                                        draw_list->AddRect(ImVec2(sx1, grid_top), ImVec2(sx2, grid_bottom), ImColor(251, 191, 36, 220), 1.0f);
                                                     }
                                                 }
-                                                if (!is_pinned) {
-                                                    ImColor tick_col = (span.band == analysis::TransientBand::SubBass) ? ImColor(239, 68, 68, 160) :
-                                                                       ((span.band == analysis::TransientBand::MidPunch) ? ImColor(59, 130, 246, 170) :
-                                                                       ImColor(16, 185, 129, 170));
-                                                    draw_list->AddLine(ImVec2(tx, wf_mid_y - max_h * 0.75f),
-                                                                       ImVec2(tx, wf_mid_y + max_h * 0.75f),
-                                                                       tick_col, 1.0f);
-                                                    if (g_arranger_tool == ArrangerTool::Warp || is_sel) {
-                                                        draw_list->AddTriangleFilled(ImVec2(tx - 3.0f, ly + 2.0f),
-                                                                                     ImVec2(tx + 3.0f, ly + 2.0f),
-                                                                                     ImVec2(tx, ly + 6.0f),
-                                                                                     tick_col);
+
+                                                cur_rel_b += cur_step_len;
+                                            }
+                                        }
+                                    } else {
+                                        // Main Clip Body Box (Audio pastel blue)
+                                        draw_list->AddRectFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                                 ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                                 is_sel ? ImColor(220, 235, 255, 245) : ImColor(240, 245, 252, 230),
+                                                                 3.0f);
+                                        draw_list->AddRect(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                           ImVec2(clip_x2 - 1.0f, ly + lane_h - 2.0f),
+                                                           is_sel ? ImColor(31, 97, 217, 255) : ImColor(160, 180, 210, 200),
+                                                           3.0f, 0, is_sel ? 2.0f : 1.0f);
+
+                                        // Mini Waveform preview inside clip with Slip-Editing Sliding Window
+                                        auto clip_ptr = c.clip ? c.clip : track_clips[t];
+                                        if (clip_ptr && clip_ptr->num_frames() > 0 && clip_ptr->channel(0)) {
+                                            const float* ch0 = clip_ptr->channel(0);
+                                            const uint32_t total_f = clip_ptr->num_frames();
+                                            float wf_mid_y = ly + lane_h * 0.58f;
+                                            float max_h = (lane_h - 18.0f) * 0.42f;
+                                            float vis_x1 = std::max(clip_x1 + 3.0f, canvas_pos.x);
+                                            float vis_x2 = std::min(clip_x2 - 3.0f, canvas_pos.x + canvas_size.x);
+                                            const float* ch1 = (clip_ptr->num_channels() > 1 && clip_ptr->channel(1)) ? clip_ptr->channel(1) : nullptr;
+
+                                            if (vis_x1 < vis_x2) {
+                                                constexpr float step_px = 2.0f;
+                                                for (float px = vis_x1; px < vis_x2; px += step_px) {
+                                                    float bar_s = x_to_bar(px);
+                                                    float bar_e = x_to_bar(px + step_px);
+                                                    float rel_b_s = std::clamp(bar_s - c.start_bar, 0.0f, c.len_bars);
+                                                    float rel_b_e = std::clamp(bar_e - c.start_bar, 0.0f, c.len_bars);
+                                                    if (rel_b_e <= rel_b_s) continue;
+
+                                                    double raw_s = c.evaluate_warped_frame(rel_b_s, total_f);
+                                                    double raw_e = c.evaluate_warped_frame(rel_b_e, total_f);
+                                                    double frame_s = std::fmod(raw_s, static_cast<double>(total_f));
+                                                    if (frame_s < 0.0) frame_s += total_f;
+                                                    double frame_e = std::fmod(raw_e, static_cast<double>(total_f));
+                                                    if (frame_e < 0.0) frame_e += total_f;
+
+                                                    uint32_t f_start = static_cast<uint32_t>(std::clamp(frame_s, 0.0, static_cast<double>(total_f - 1)));
+                                                    uint32_t f_end = static_cast<uint32_t>(std::clamp(frame_e, 0.0, static_cast<double>(total_f)));
+                                                    if (f_end <= f_start) f_end = total_f;
+
+                                                    float peak_val = 0.0f;
+                                                    uint32_t span = f_end - f_start;
+                                                    uint32_t stride = std::max(1u, span / 32u);
+                                                    for (uint32_t fi = f_start; fi < f_end; fi += stride) {
+                                                        float s = std::abs(ch0[fi]);
+                                                        if (ch1) s = std::max(s, std::abs(ch1[fi]));
+                                                        if (s > peak_val) peak_val = s;
+                                                    }
+
+                                                    float col_bar = 0.5f * (bar_s + bar_e);
+                                                    peak_val *= c.evaluate_gain_at_bar(col_bar);
+
+                                                    float h = std::clamp(peak_val * max_h, 1.0f, max_h);
+                                                    draw_list->AddLine(ImVec2(px, wf_mid_y - h),
+                                                                       ImVec2(px, wf_mid_y + h),
+                                                                       is_sel ? ImColor(31, 97, 217, 160) : ImColor(100, 130, 170, 130), 1.5f);
+                                                }
+                                            }
+
+                                            // Transient Markers (Unpinned ticks)
+                                            for (const auto& span : c.detected_transients) {
+                                                float rel_b = static_cast<float>(c.frame_to_bar(span.peak_frame, total_f));
+                                                float tx = bar_to_x(c.start_bar + rel_b);
+                                                if (tx >= clip_x1 + 3.0f && tx <= clip_x2 - 3.0f) {
+                                                    bool is_pinned = false;
+                                                    for (const auto& pin : c.warp_pins) {
+                                                        if (pin.source_frame >= span.start_frame && pin.source_frame <= span.decay_end_frame) {
+                                                            is_pinned = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (!is_pinned) {
+                                                        ImColor tick_col = (span.band == analysis::TransientBand::SubBass) ? ImColor(239, 68, 68, 160) :
+                                                                           ((span.band == analysis::TransientBand::MidPunch) ? ImColor(59, 130, 246, 170) :
+                                                                           ImColor(16, 185, 129, 170));
+                                                        draw_list->AddLine(ImVec2(tx, wf_mid_y - max_h * 0.75f),
+                                                                           ImVec2(tx, wf_mid_y + max_h * 0.75f),
+                                                                           tick_col, 1.0f);
+                                                        if (g_arranger_tool == ArrangerTool::Warp || is_sel) {
+                                                            draw_list->AddTriangleFilled(ImVec2(tx - 3.0f, ly + 2.0f),
+                                                                                         ImVec2(tx + 3.0f, ly + 2.0f),
+                                                                                         ImVec2(tx, ly + 6.0f),
+                                                                                         tick_col);
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        // Pinned Warp-Pins (prominent amber diamond flags)
-                                        for (const auto& pin : c.warp_pins) {
-                                            float px = bar_to_x(c.start_bar + pin.pinned_bar);
-                                            if (px >= clip_x1 && px <= clip_x2) {
-                                                bool is_dragged = (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag &&
-                                                                  g_arranger_drag_warp_pin_id == pin.id);
-                                                ImColor pin_col = is_dragged ? ImColor(251, 191, 36, 255) : ImColor(245, 158, 11, 230);
-                                                draw_list->AddLine(ImVec2(px, ly + 2.0f), ImVec2(px, ly + lane_h - 2.0f),
-                                                                   pin_col, is_dragged ? 2.5f : 1.8f);
-                                                draw_list->AddQuadFilled(ImVec2(px, ly + 2.0f),
-                                                                         ImVec2(px + 4.5f, ly + 7.0f),
-                                                                         ImVec2(px, ly + 12.0f),
-                                                                         ImVec2(px - 4.5f, ly + 7.0f),
-                                                                         pin_col);
-                                                draw_list->AddQuad(ImVec2(px, ly + 2.0f),
-                                                                   ImVec2(px + 4.5f, ly + 7.0f),
-                                                                   ImVec2(px, ly + 12.0f),
-                                                                   ImVec2(px - 4.5f, ly + 7.0f),
-                                                                   ImColor(255, 255, 255, 230), 1.0f);
+                                            // Pinned Warp-Pins (prominent amber diamond flags)
+                                            for (const auto& pin : c.warp_pins) {
+                                                float px = bar_to_x(c.start_bar + pin.pinned_bar);
+                                                if (px >= clip_x1 && px <= clip_x2) {
+                                                    bool is_dragged = (g_arranger_drag_mode == ArrangerDragMode::WarpPinDrag &&
+                                                                      g_arranger_drag_warp_pin_id == pin.id);
+                                                    ImColor pin_col = is_dragged ? ImColor(251, 191, 36, 255) : ImColor(245, 158, 11, 230);
+                                                    draw_list->AddLine(ImVec2(px, ly + 2.0f), ImVec2(px, ly + lane_h - 2.0f),
+                                                                      pin_col, is_dragged ? 2.5f : 1.8f);
+                                                    draw_list->AddQuadFilled(ImVec2(px, ly + 2.0f),
+                                                                            ImVec2(px + 4.5f, ly + 7.0f),
+                                                                            ImVec2(px, ly + 12.0f),
+                                                                            ImVec2(px - 4.5f, ly + 7.0f),
+                                                                            pin_col);
+                                                    draw_list->AddQuad(ImVec2(px, ly + 2.0f),
+                                                                      ImVec2(px + 4.5f, ly + 7.0f),
+                                                                      ImVec2(px, ly + 12.0f),
+                                                                      ImVec2(px - 4.5f, ly + 7.0f),
+                                                                      ImColor(255, 255, 255, 230), 1.0f);
+                                                }
                                             }
                                         }
                                     }
 
-                                    constexpr float kPiOver2 = 1.5707963267948966f;
+                                    if (!is_pat_clip) {
+                                        constexpr float kPiOver2 = 1.5707963267948966f;
 
-                                    // Fade In Shaded Polygon & Grab Handle
-                                    float fin_b = c.fade_in_bars;
-                                    if (fin_b > 0.01f) {
-                                        float fin_w = fin_b * bar_w;
-                                        fin_w = std::min(fin_w, (clip_x2 - clip_x1) * 0.95f);
-                                        float hx = clip_x1 + fin_w;
+                                        // Fade In Shaded Polygon & Grab Handle
+                                        float fin_b = c.fade_in_bars;
+                                        if (fin_b > 0.01f) {
+                                            float fin_w = fin_b * bar_w;
+                                            fin_w = std::min(fin_w, (clip_x2 - clip_x1) * 0.95f);
+                                            float hx = clip_x1 + fin_w;
 
-                                        constexpr int kRampSteps = 16;
-                                        ImVec2 poly_pts[kRampSteps + 2];
-                                        poly_pts[0] = ImVec2(clip_x1 + 1.0f, ly + 2.0f);
-                                        for (int si = 0; si <= kRampSteps; ++si) {
-                                            float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
-                                            float px = clip_x1 + 1.0f + u * fin_w;
-                                            float gain = u;
-                                            switch (c.fade_in_shape) {
-                                                case sampling::FadeShape::Linear:      gain = u; break;
-                                                case sampling::FadeShape::Exponential: gain = std::pow(u, 2.8f); break;
-                                                case sampling::FadeShape::Logarithmic: gain = 1.0f - std::pow(1.0f - u, 2.8f); break;
-                                                case sampling::FadeShape::SCurve:      gain = u * u * (3.0f - 2.0f * u); break;
-                                                case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * u); break;
+                                            constexpr int kRampSteps = 16;
+                                            ImVec2 poly_pts[kRampSteps + 2];
+                                            poly_pts[0] = ImVec2(clip_x1 + 1.0f, ly + 2.0f);
+                                            for (int si = 0; si <= kRampSteps; ++si) {
+                                                float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
+                                                float px = clip_x1 + 1.0f + u * fin_w;
+                                                float gain = u;
+                                                switch (c.fade_in_shape) {
+                                                    case sampling::FadeShape::Linear:      gain = u; break;
+                                                    case sampling::FadeShape::Exponential: gain = std::pow(u, 2.8f); break;
+                                                    case sampling::FadeShape::Logarithmic: gain = 1.0f - std::pow(1.0f - u, 2.8f); break;
+                                                    case sampling::FadeShape::SCurve:      gain = u * u * (3.0f - 2.0f * u); break;
+                                                    case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * u); break;
+                                                }
+                                                float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
+                                                poly_pts[si + 1] = ImVec2(px, py);
                                             }
-                                            float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
-                                            poly_pts[si + 1] = ImVec2(px, py);
-                                        }
-                                        ImColor poly_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
-                                        ImColor line_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
-                                        draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
+                                            ImColor poly_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
+                                            ImColor line_col = c.is_auto_crossfade_in ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
+                                            draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
 
-                                        for (int si = 0; si < kRampSteps; ++si) {
-                                            draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
-                                        }
-
-                                        draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
-                                                                     ImVec2(hx + 4.0f, ly + 2.0f),
-                                                                     ImVec2(hx, ly + 9.0f),
-                                                                     line_col);
-                                    } else {
-                                        draw_list->AddTriangleFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
-                                                                     ImVec2(clip_x1 + 8.0f, ly + 2.0f),
-                                                                     ImVec2(clip_x1 + 1.0f, ly + 9.0f),
-                                                                     ImColor(180, 190, 205, 180));
-                                    }
-
-                                    // Fade Out Shaded Polygon & Grab Handle
-                                    float fout_b = c.fade_out_bars;
-                                    if (fout_b > 0.01f) {
-                                        float fout_w = fout_b * bar_w;
-                                        fout_w = std::min(fout_w, (clip_x2 - clip_x1) * 0.95f);
-                                        float hx = clip_x2 - fout_w;
-
-                                        constexpr int kRampSteps = 16;
-                                        ImVec2 poly_pts[kRampSteps + 2];
-                                        poly_pts[0] = ImVec2(clip_x2 - 1.0f, ly + 2.0f);
-                                        for (int si = 0; si <= kRampSteps; ++si) {
-                                            float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
-                                            float px = clip_x2 - 1.0f - (1.0f - u) * fout_w;
-                                            float gain = 1.0f - u;
-                                            switch (c.fade_out_shape) {
-                                                case sampling::FadeShape::Linear:      gain = 1.0f - u; break;
-                                                case sampling::FadeShape::Exponential: gain = std::pow(1.0f - u, 2.8f); break;
-                                                case sampling::FadeShape::Logarithmic: gain = 1.0f - (1.0f - std::pow(u, 2.8f)); break;
-                                                case sampling::FadeShape::SCurve:      gain = 1.0f - (u * u * (3.0f - 2.0f * u)); break;
-                                                case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * (1.0f - u)); break;
+                                            for (int si = 0; si < kRampSteps; ++si) {
+                                                draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
                                             }
-                                            float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
-                                            poly_pts[si + 1] = ImVec2(px, py);
-                                        }
-                                        ImColor poly_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
-                                        ImColor line_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
-                                        draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
 
-                                        for (int si = 0; si < kRampSteps; ++si) {
-                                            draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
+                                            draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
+                                                                         ImVec2(hx + 4.0f, ly + 2.0f),
+                                                                         ImVec2(hx, ly + 9.0f),
+                                                                         line_col);
+                                        } else {
+                                            draw_list->AddTriangleFilled(ImVec2(clip_x1 + 1.0f, ly + 2.0f),
+                                                                         ImVec2(clip_x1 + 8.0f, ly + 2.0f),
+                                                                         ImVec2(clip_x1 + 1.0f, ly + 9.0f),
+                                                                         ImColor(180, 190, 205, 180));
                                         }
 
-                                        draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
-                                                                     ImVec2(hx + 4.0f, ly + 2.0f),
-                                                                     ImVec2(hx, ly + 9.0f),
-                                                                     line_col);
-                                    } else {
-                                        draw_list->AddTriangleFilled(ImVec2(clip_x2 - 8.0f, ly + 2.0f),
-                                                                     ImVec2(clip_x2 - 1.0f, ly + 2.0f),
-                                                                     ImVec2(clip_x2 - 1.0f, ly + 9.0f),
-                                                                     ImColor(180, 190, 205, 180));
+                                        // Fade Out Shaded Polygon & Grab Handle
+                                        float fout_b = c.fade_out_bars;
+                                        if (fout_b > 0.01f) {
+                                            float fout_w = fout_b * bar_w;
+                                            fout_w = std::min(fout_w, (clip_x2 - clip_x1) * 0.95f);
+                                            float hx = clip_x2 - fout_w;
+
+                                            constexpr int kRampSteps = 16;
+                                            ImVec2 poly_pts[kRampSteps + 2];
+                                            poly_pts[0] = ImVec2(clip_x2 - 1.0f, ly + 2.0f);
+                                            for (int si = 0; si <= kRampSteps; ++si) {
+                                                float u = static_cast<float>(si) / static_cast<float>(kRampSteps);
+                                                float px = clip_x2 - 1.0f - (1.0f - u) * fout_w;
+                                                float gain = 1.0f - u;
+                                                switch (c.fade_out_shape) {
+                                                    case sampling::FadeShape::Linear:      gain = 1.0f - u; break;
+                                                    case sampling::FadeShape::Exponential: gain = std::pow(1.0f - u, 2.8f); break;
+                                                    case sampling::FadeShape::Logarithmic: gain = 1.0f - (1.0f - std::pow(u, 2.8f)); break;
+                                                    case sampling::FadeShape::SCurve:      gain = 1.0f - (u * u * (3.0f - 2.0f * u)); break;
+                                                    case sampling::FadeShape::EqualPower:  gain = std::sin(kPiOver2 * (1.0f - u)); break;
+                                                }
+                                                float py = ly + 2.0f + (1.0f - gain) * (lane_h - 4.0f);
+                                                poly_pts[si + 1] = ImVec2(px, py);
+                                            }
+                                            ImColor poly_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 55) : ImColor(245, 158, 11, 45);
+                                            ImColor line_col = c.is_auto_crossfade_out ? ImColor(168, 85, 247, 220) : ImColor(217, 119, 6, 220);
+                                            draw_list->AddConvexPolyFilled(poly_pts, kRampSteps + 2, poly_col);
+
+                                            for (int si = 0; si < kRampSteps; ++si) {
+                                                draw_list->AddLine(poly_pts[si + 1], poly_pts[si + 2], line_col, 1.8f);
+                                            }
+
+                                            draw_list->AddTriangleFilled(ImVec2(hx - 4.0f, ly + 2.0f),
+                                                                         ImVec2(hx + 4.0f, ly + 2.0f),
+                                                                         ImVec2(hx, ly + 9.0f),
+                                                                         line_col);
+                                        } else {
+                                            draw_list->AddTriangleFilled(ImVec2(clip_x2 - 8.0f, ly + 2.0f),
+                                                                         ImVec2(clip_x2 - 1.0f, ly + 2.0f),
+                                                                         ImVec2(clip_x2 - 1.0f, ly + 9.0f),
+                                                                         ImColor(180, 190, 205, 180));
+                                        }
                                     }
 
                                     // Clip Title, Sononym Key & Slip/Fade Info
                                     char clip_label[160];
-                                    auto desc = sampling::SampleAssetPool::instance().get_descriptor(
-                                        clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
-                                    const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
-
-                                    char extra_meta[80] = "";
-                                    if (std::abs(c.stretch_ratio - 1.0f) > 0.01f || std::abs(c.pitch_semitones) > 0.01f) {
-                                        const char* algo_str = (c.stretch_algo == dsp::PitchAlgorithm::TransientWarpWsola) ? "T-WARP" :
-                                                               ((c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
-                                                               ((c.stretch_algo == dsp::PitchAlgorithm::SovereignOde) ? "ODE" :
-                                                               ((c.stretch_algo == dsp::PitchAlgorithm::VintageMpc) ? "MPC12" :
-                                                               ((c.stretch_algo == dsp::PitchAlgorithm::DeRezSampler) ? "DEREZ" : "VINYL"))));
-                                        if (std::abs(c.pitch_semitones) > 0.01f) {
-                                            std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s %+.1fst]", c.stretch_ratio, algo_str, c.pitch_semitones);
-                                        } else {
-                                            std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s]", c.stretch_ratio, algo_str);
+                                    if (is_pat_clip) {
+                                        std::string pat_name = "Pattern";
+                                        if (track_seq[t] && c.pattern_index < sequencer::StepSequencer::kMaxPatterns) {
+                                            pat_name = track_seq[t]->pattern(c.pattern_index).name;
                                         }
-                                    } else if (c.offset_bars > 0.05f) {
-                                        std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", c.offset_bars);
-                                    }
-
-                                    if (std::strlen(key_str) > 0) {
-                                        std::snprintf(clip_label, sizeof(clip_label), "%s [%s]%s (%.1f-%.1fb)",
-                                                      c.name.c_str(), key_str, extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                        char extra_meta[80] = "";
+                                        if (c.offset_bars > 0.05f) {
+                                            std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", c.offset_bars);
+                                        }
+                                        std::snprintf(clip_label, sizeof(clip_label), "[ %s ] #%d%s (%.1f-%.1fb)",
+                                                      pat_name.c_str(), c.pattern_index + 1, extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                        draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
+                                                           is_sel ? ImColor(120, 53, 15, 255) : ImColor(180, 83, 9, 255),
+                                                           clip_label);
                                     } else {
-                                        std::snprintf(clip_label, sizeof(clip_label), "%s%s (%.1f-%.1fb)",
-                                                      c.name.c_str(), extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                        auto clip_ptr = c.clip ? c.clip : track_clips[t];
+                                        auto desc = sampling::SampleAssetPool::instance().get_descriptor(
+                                            clip_ptr ? sampling::SampleAnalyzer::analyze(*clip_ptr).asset_id : "");
+                                        const char* key_str = (desc && !desc->musical_key.empty() && desc->musical_key != "--") ? desc->musical_key.c_str() : "";
+
+                                        char extra_meta[80] = "";
+                                        if (std::abs(c.stretch_ratio - 1.0f) > 0.01f || std::abs(c.pitch_semitones) > 0.01f) {
+                                            const char* algo_str = (c.stretch_algo == dsp::PitchAlgorithm::TransientWarpWsola) ? "T-WARP" :
+                                                                   ((c.stretch_algo == dsp::PitchAlgorithm::RubberbandWsola) ? "WSOLA" :
+                                                                   ((c.stretch_algo == dsp::PitchAlgorithm::SovereignOde) ? "ODE" :
+                                                                   ((c.stretch_algo == dsp::PitchAlgorithm::VintageMpc) ? "MPC12" :
+                                                                   ((c.stretch_algo == dsp::PitchAlgorithm::DeRezSampler) ? "DEREZ" : "VINYL"))));
+                                            if (std::abs(c.pitch_semitones) > 0.01f) {
+                                                std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s %+.1fst]", c.stretch_ratio, algo_str, c.pitch_semitones);
+                                            } else {
+                                                std::snprintf(extra_meta, sizeof(extra_meta), " [%.2fx %s]", c.stretch_ratio, algo_str);
+                                            }
+                                        } else if (c.offset_bars > 0.05f) {
+                                            std::snprintf(extra_meta, sizeof(extra_meta), " [slip: +%.1fb]", c.offset_bars);
+                                        }
+
+                                        if (std::strlen(key_str) > 0) {
+                                            std::snprintf(clip_label, sizeof(clip_label), "%s [%s]%s (%.1f-%.1fb)",
+                                                          c.name.c_str(), key_str, extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                        } else {
+                                            std::snprintf(clip_label, sizeof(clip_label), "%s%s (%.1f-%.1fb)",
+                                                          c.name.c_str(), extra_meta, c.start_bar + 1.0f, c.end_bar() + 1.0f);
+                                        }
+                                        draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
+                                                           is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
+                                                           clip_label);
                                     }
-                                    draw_list->AddText(ImVec2(clip_x1 + 6.0f, ly + 3.0f),
-                                                       is_sel ? ImColor(10, 30, 80, 255) : ImColor(60, 75, 100, 255),
-                                                       clip_label);
 
                                     // Trim / Stretch Handles visual indicators on edges
                                     ImColor edge_col = (g_arranger_tool == ArrangerTool::Stretch) ? ImColor(245, 158, 11, 230) :
-                                                       (is_sel ? ImColor(31, 97, 217, 200) : ImColor(160, 180, 205, 160));
+                                                       (is_sel ? (is_pat_clip ? ImColor(217, 119, 6, 220) : ImColor(31, 97, 217, 200)) :
+                                                                 (is_pat_clip ? ImColor(245, 158, 11, 160) : ImColor(160, 180, 205, 160)));
                                     draw_list->AddLine(ImVec2(clip_x1 + 4.0f, ly + 5.0f), ImVec2(clip_x1 + 4.0f, ly + lane_h - 5.0f),
                                                        edge_col, 2.0f);
                                     draw_list->AddLine(ImVec2(clip_x2 - 4.0f, ly + 5.0f), ImVec2(clip_x2 - 4.0f, ly + lane_h - 5.0f),
                                                        edge_col, 2.0f);
 
                                     // Auto-Crossfade Overlap Box with Adjacent Clip
-                                    if (c_idx + 1 < track_arranger_clips[t].size()) {
+                                    if (!is_pat_clip && c_idx + 1 < track_arranger_clips[t].size()) {
                                         const auto& next_c = track_arranger_clips[t][c_idx + 1];
                                         if (c.end_bar() > next_c.start_bar + 0.005f) {
                                             float xf_x1 = bar_to_x(next_c.start_bar);
@@ -2777,7 +2976,16 @@ int main(int argc, char** argv) {
                                         sync_track_clip(selected_track, c.clip);
                                     }
 
-                                    if (g_arranger_tool == ArrangerTool::Razor) {
+                                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                        if (c.type == sequencer::ArrangerClipType::Pattern) {
+                                            selected_track = clicked_lane;
+                                            pattern_editor_pat_idx = static_cast<int>(c.pattern_index);
+                                            g_switch_to_main_tab = 2; // Jump to Tab 3 (PATTERN SEQUENCER // STEP GRID & TRACKER)
+                                            std::string p_name = (track_seq[clicked_lane]) ? track_seq[clicked_lane]->pattern(c.pattern_index).name : "Pattern";
+                                            std::snprintf(status_toast, sizeof(status_toast), "OPENED PATTERN %d '%s' IN TRACKER EDITOR",
+                                                          c.pattern_index + 1, p_name.c_str());
+                                        }
+                                    } else if (g_arranger_tool == ArrangerTool::Razor) {
                                         // Razor split at mouse position
                                         float click_bar = x_to_bar(m.x);
                                         if (!ImGui::GetIO().KeyShift) {
@@ -3489,7 +3697,9 @@ int main(int argc, char** argv) {
                 // ------------------------------------------------------------
                 // TAB 3: PATTERN SEQUENCER // STEP GRID & TRACKER STUDIO
                 // ------------------------------------------------------------
-                if (ImGui::BeginTabItem("  PATTERN SEQUENCER // STEP GRID & TRACKER  ")) {
+                ImGuiTabItemFlags t3_flags = (g_switch_to_main_tab == 2) ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem("  PATTERN SEQUENCER // STEP GRID & TRACKER  ", nullptr, t3_flags)) {
+                    if (g_switch_to_main_tab == 2) g_switch_to_main_tab = -1;
                     ImVec2 avail_sz = ImGui::GetContentRegionAvail();
                     avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
                     const char* rack_trk_names[4] = { "TRK 1 (DRUMS)", "TRK 2 (BASS)", "TRK 3 (LEAD)", "TRK 4 (PERC)" };
@@ -4078,6 +4288,15 @@ int main(int argc, char** argv) {
                                 seq->auto_chop_and_groove(0.5f, pattern_editor_pat_idx);
                             }
                             ImGui::PopStyleColor(2);
+
+                            ImGui::SameLine(0, 10);
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            if (ImGui::SmallButton("⤓ STAMP TO ARRANGER (Ctrl+Enter)##pat_stamp")) {
+                                stamp_pattern_to_arranger(selected_track, pattern_editor_pat_idx);
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Instantiate current pattern into Timeline Arranger at playhead.");
 
                             // Pattern Swing Slider
                             ImGui::SameLine(0, 10);
