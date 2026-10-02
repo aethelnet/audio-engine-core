@@ -555,6 +555,65 @@ int main(int argc, char** argv) {
     static bool g_track_phrase_arp_enabled[4] = { false, true, false, false }; // Default Track 2 (Acid Lead) armed with phrase arp
     static int g_track_phrase_assigned[4] = { 0, 0, 1, 0 }; // Phrase index mapped to track
 
+    // Unified Pattern Studio Mode (FL Studio Channel Rack vs Renoise Multi-Tracker)
+    enum class SequencerViewMode : uint8_t {
+        FlChannelRack = 0,      // Horizontal Multi-Track Step Rack (FL Studio style)
+        RenoiseMultiTracker = 1 // Vertical Multi-Track Pattern Matrix (Renoise style)
+    };
+    static SequencerViewMode g_seq_view_mode = SequencerViewMode::FlChannelRack;
+    static bool g_seq_show_phrase_lab = false;
+
+    auto sync_step_to_phrase = [](const sequencer::Pattern& pat, sequencer::InstrumentPhrase& phr, uint32_t tpl) {
+        phr.num_lines = std::clamp(pat.num_steps, 16u, 64u);
+        phr.resize(phr.num_lines);
+        for (size_t i = 0; i < phr.num_lines && i < pat.kMaxSteps; ++i) {
+            const auto& step = pat.steps[i];
+            auto& col = phr.lines[i].columns[0];
+            col.active = step.active;
+            if (step.active) {
+                col.slice_id = static_cast<uint16_t>(step.slice_id);
+                col.velocity = static_cast<uint8_t>(std::clamp(std::round(step.velocity * 127.0f), 1.0f, 127.0f));
+                col.probability = step.probability;
+                col.pan = static_cast<int8_t>(std::clamp(std::round(step.pan * 63.0f), -64.0f, 63.0f));
+                float norm_delay = std::clamp(step.micro_timing + 0.5f, 0.0f, 0.999f);
+                col.delay_ticks = static_cast<uint8_t>(std::floor(norm_delay * static_cast<float>(tpl)));
+                col.cutoff_offset = (step.filter_cutoff < 19999.0f) ? std::clamp((step.filter_cutoff - 10000.0f) / 10000.0f, -1.0f, 1.0f) : 0.0f;
+                col.res_offset = std::clamp((step.filter_res - 0.707f) / 5.0f, -1.0f, 1.0f);
+                if (step.pitch_ratio > 0.01f && std::abs(step.pitch_ratio - 1.0f) > 1e-3f) {
+                    col.note_offset = static_cast<int8_t>(std::clamp(std::round(12.0f * std::log2(step.pitch_ratio)), -60.0f, 60.0f));
+                } else {
+                    col.note_offset = 0;
+                }
+                col.is_slice = true;
+            }
+        }
+    };
+
+    auto sync_phrase_to_step = [](const sequencer::InstrumentPhrase& phr, sequencer::Pattern& pat, uint32_t tpl) {
+        pat.num_steps = std::clamp(phr.num_lines, 16u, static_cast<uint32_t>(pat.kMaxSteps));
+        for (size_t i = 0; i < pat.num_steps && i < phr.lines.size(); ++i) {
+            const auto& col = phr.lines[i].columns[0];
+            auto& step = pat.steps[i];
+            step.active = col.active;
+            if (col.active) {
+                step.slice_id = col.slice_id;
+                step.velocity = static_cast<float>(col.velocity) / 127.0f;
+                step.probability = col.probability;
+                step.pan = static_cast<float>(col.pan) / 63.0f;
+                step.micro_timing = (static_cast<float>(col.delay_ticks) / static_cast<float>(std::max(1u, tpl))) - 0.5f;
+                if (col.cutoff_offset != 0.0f) {
+                    step.filter_cutoff = std::clamp(10000.0f + col.cutoff_offset * 10000.0f, 20.0f, 20000.0f);
+                }
+                if (col.res_offset != 0.0f) {
+                    step.filter_res = std::clamp(0.707f + col.res_offset * 5.0f, 0.1f, 10.0f);
+                }
+                if (col.note_offset != 0) {
+                    step.pitch_ratio = std::pow(2.0f, static_cast<float>(col.note_offset) / 12.0f);
+                }
+            }
+        }
+    };
+
     // Arranger Viewport Navigation State (Continuous Zoom & Pan)
     static float g_arranger_visible_bars = 16.0f; // Default 16 visible bars
     static float g_arranger_scroll_bar = 0.0f;    // Leftmost visible bar
@@ -3035,25 +3094,535 @@ int main(int argc, char** argv) {
                 }
 
                 // ------------------------------------------------------------
-                // TAB 3: STEP PATTERN & GROOVE MATRIX
+                // TAB 3: PATTERN SEQUENCER // STEP GRID & TRACKER STUDIO
                 // ------------------------------------------------------------
-                if (ImGui::BeginTabItem("  STEP PATTERN & GROOVE MATRIX  ")) {
+                if (ImGui::BeginTabItem("  PATTERN SEQUENCER // STEP GRID & TRACKER  ")) {
                     ImVec2 avail_sz = ImGui::GetContentRegionAvail();
                     avail_sz.y = std::max(avail_sz.y - 4.0f, 130.0f);
+                    const char* rack_trk_names[4] = { "TRK 1 (DRUMS)", "TRK 2 (BASS)", "TRK 3 (LEAD)", "TRK 4 (PERC)" };
 
-                    ImGui::BeginChild("StepPatternMatrixPane", ImVec2(0, 0), true);
+                    // Reusable Phrase & Scales Lab Drawer Renderer
+                    auto render_instrument_phrase_and_scales_lab = [&](ImVec2 lab_avail) {
+                        float left_col_w = 420.0f;
+                        float right_col_w = std::max(lab_avail.x - left_col_w - 20.0f, 400.0f);
+
+                        // ========================================================
+                        // LEFT COLUMN: TRACKER TIMING & SCALES / TUNING ENGINE
+                        // ========================================================
+                        ImGui::BeginChild("LeftTimingAndScalesCol", ImVec2(left_col_w, 460.0f), true);
+                        {
+                            // 1. Renoise Tracker Timing Engine
+                            ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "RENOISE TRACKER TIMING ENGINE");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            ImGui::TextDisabled("Lines Per Beat (LPB):");
+                            ImGui::SameLine();
+                            const char* lpb_names[] = { "4 (16th notes)", "8 (32nd notes)", "12 (triplets)", "16 (64ths)", "32 (high-res)" };
+                            ImGui::SetNextItemWidth(160);
+                            if (ImGui::Combo("##TimingLPB", &g_tracker_lpb_idx, lpb_names, 5)) {
+                                g_tracker_timing.lpb = g_lpb_options[g_tracker_lpb_idx];
+                            }
+
+                            ImGui::TextDisabled("Ticks Per Line (TPL):");
+                            ImGui::SameLine();
+                            const char* tpl_names[] = { "8 Ticks", "12 Ticks", "16 Ticks", "24 Ticks" };
+                            ImGui::SetNextItemWidth(160);
+                            if (ImGui::Combo("##TimingTPL", &g_tracker_tpl_idx, tpl_names, 4)) {
+                                g_tracker_timing.tpl = g_tpl_options[g_tracker_tpl_idx];
+                            }
+
+                            int lines_pat = static_cast<int>(g_tracker_timing.lines_per_pattern);
+                            ImGui::TextDisabled("Pattern Length (Lines):");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(150);
+                            if (ImGui::SliderInt("##PatLen", &lines_pat, 16, 256, "%d Lines")) {
+                                g_tracker_timing.lines_per_pattern = static_cast<uint32_t>(lines_pat);
+                            }
+
+                            // Realtime Timing Metrics
+                            g_tracker_timing.bpm = bpm;
+                            double line_ms = g_tracker_timing.line_duration_seconds() * 1000.0;
+                            double tick_ms = g_tracker_timing.tick_duration_seconds() * 1000.0;
+                            double spl = g_tracker_timing.samples_per_line(kSampleRate);
+                            double spt = g_tracker_timing.samples_per_tick(kSampleRate);
+
+                            uint64_t cur_sample = mixer.clock().sample_position();
+                            auto trk_pos = g_tracker_timing.position_at_sample(cur_sample, kSampleRate);
+
+                            ImGui::Spacing();
+                            ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.45f, 1.0f),
+                                               "LINE: %.2f ms (%.0f smp) | TICK: %.2f ms (%.0f smp)",
+                                               line_ms, spl, tick_ms, spt);
+                            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.20f, 1.0f),
+                                               "TRACKER POS: PAT %02u | LINE %02u | TICK %02u (+%.2f)",
+                                               trk_pos.pattern_index, trk_pos.line_in_pattern,
+                                               trk_pos.tick_in_line, trk_pos.tick_fraction);
+
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            // 2. Musical Scale Catalog & Snap
+                            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.15f, 1.0f), "MUSICAL SCALE & QUANTIZE ENGINE");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            const char* root_names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+                            ImGui::TextDisabled("Root Note:");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(70);
+                            ImGui::Combo("##ScaleRoot", &g_scale_root, root_names, 12);
+
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("Mode:");
+                            ImGui::SameLine();
+                            const char* scale_names[] = {
+                                "Chromatic", "Major (Ionian)", "Natural Minor", "Harmonic Minor",
+                                "Melodic Minor", "Dorian", "Phrygian", "Lydian", "Mixolydian",
+                                "Locrian", "Pentatonic Major", "Pentatonic Minor", "Blues",
+                                "Arabic Hijaz", "Japanese Insen", "Whole Tone",
+                                "Diminished (W-H)", "Diminished (H-W)", "Hungarian Minor", "Bhairav"
+                            };
+                            ImGui::SetNextItemWidth(170);
+                            if (ImGui::Combo("##ScaleType", &g_scale_type_idx, scale_names, 20)) {
+                                g_selected_scale = static_cast<tuning::ScaleType>(g_scale_type_idx);
+                            }
+
+                            const char* snap_names[] = { "Nearest", "Floor (Down)", "Ceil (Up)" };
+                            ImGui::TextDisabled("Snap Mode:");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(130);
+                            if (ImGui::Combo("##SnapMode", &g_scale_snap_mode_idx, snap_names, 3)) {
+                                g_scale_snap_mode = static_cast<tuning::SnapMode>(g_scale_snap_mode_idx);
+                            }
+
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Snap Active", &g_scale_snap_enabled)) {
+                                if (g_scale_snap_enabled) {
+                                    std::snprintf(status_toast, sizeof(status_toast), "SCALE SNAP: %s %s (%s)",
+                                                  root_names[g_scale_root], scale_names[g_scale_type_idx], snap_names[g_scale_snap_mode_idx]);
+                                }
+                            }
+                            if (g_scale_snap_enabled) {
+                                uint8_t test_snap = tuning::ScaleDictionary::snap_to_scale(
+                                    61, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale, g_scale_snap_mode);
+                                ImGui::TextDisabled("Preview: C#4 -> %s", tuning::ScaleDictionary::note_name(test_snap).c_str());
+                            }
+
+                            // Visual 12-Tone Scale Degree Display
+                            ImGui::Spacing();
+                            ImGui::TextDisabled("Active Scale Tones:");
+                            for (int k = 0; k < 12; ++k) {
+                                uint8_t note_cand = static_cast<uint8_t>(60 + k);
+                                bool in_scale = tuning::ScaleDictionary::is_note_in_scale(note_cand, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale);
+                                int deg = tuning::ScaleDictionary::get_degree(note_cand, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale);
+
+                                ImVec4 col = in_scale ? ImVec4(0.20f, 0.90f, 0.45f, 1.0f) : ImVec4(0.25f, 0.28f, 0.35f, 0.6f);
+                                ImGui::PushStyleColor(ImGuiCol_Button, col);
+                                char k_lbl[16];
+                                if (in_scale) {
+                                    std::snprintf(k_lbl, sizeof(k_lbl), "%s%d", root_names[k], deg + 1);
+                                } else {
+                                    std::snprintf(k_lbl, sizeof(k_lbl), "%s", root_names[k]);
+                                }
+                                ImGui::Button(k_lbl, ImVec2(28, 24));
+                                ImGui::PopStyleColor();
+                                if (k < 11) ImGui::SameLine(0, 3);
+                            }
+
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            // 3. Microtonal Tuning & Scala Parser
+                            ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.95f, 1.0f), "MICROTONAL TUNING & SCALA (.SCL)");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            const char* tuning_presets[] = {
+                                "12-TET Standard (Concert A4=440Hz)",
+                                "Just Intonation (5-Limit)",
+                                "24-EDO (Quarter-Tone Scale)",
+                                "Pythagorean (Pure 3:2 Fifths)",
+                                "Werckmeister III (Baroque Well-Temp)",
+                                "Bohlen-Pierce (3:1 Tritave, 13 steps)",
+                                "Arabic Maqam Rast (Neutral 3rd/7th)"
+                            };
+                            ImGui::TextDisabled("Preset:");
+                            ImGui::SetNextItemWidth(left_col_w - 30);
+                            if (ImGui::Combo("##TuningPreset", &g_tuning_preset_idx, tuning_presets, 7)) {
+                                switch (g_tuning_preset_idx) {
+                                    case 0: g_tuning_table.make_12tet(440.0); break;
+                                    case 1: g_tuning_table.make_just_intonation(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
+                                    case 2: g_tuning_table.make_24edo(440.0); break;
+                                    case 3: g_tuning_table.make_pythagorean(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
+                                    case 4: g_tuning_table.make_werckmeister_iii(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
+                                    case 5: g_tuning_table.make_bohlen_pierce(220.0); break;
+                                    case 6: g_tuning_table.make_arabic_rast(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
+                                }
+                                std::snprintf(status_toast, sizeof(status_toast), "TUNING APPLIED: %s", g_tuning_table.name.c_str());
+                            }
+
+                            ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.95f, 1.0f), "Active: %s", g_tuning_table.name.c_str());
+                            ImGui::TextDisabled("Ref: %s (Note %u) = %.2f Hz",
+                                                tuning::ScaleDictionary::note_name(g_tuning_table.reference_note).c_str(),
+                                                g_tuning_table.reference_note, g_tuning_table.reference_frequency);
+
+                            ImGui::Spacing();
+                            ImGui::TextDisabled("Import Huygens-Fokker Scala (.scl):");
+                            ImGui::InputTextMultiline("##SclImport", g_scl_import_buffer, sizeof(g_scl_import_buffer),
+                                                       ImVec2(left_col_w - 30, 75));
+                            if (ImGui::Button("PARSE SCALA STRING")) {
+                                if (g_scl_import_buffer[0] != 0) {
+                                    if (g_tuning_table.parse_scl(g_scl_import_buffer, static_cast<uint8_t>(60 + g_scale_root), 261.625565)) {
+                                        std::snprintf(status_toast, sizeof(status_toast), "SCALA IMPORTED: %s", g_tuning_table.name.c_str());
+                                    } else {
+                                        std::snprintf(status_toast, sizeof(status_toast), "ERROR: Failed to parse Scala (.scl) format!");
+                                    }
+                                }
+                            }
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::SameLine();
+
+                        // ========================================================
+                        // RIGHT COLUMN: INSTRUMENT PHRASES & ARPEGGIATOR
+                        // ========================================================
+                        ImGui::BeginChild("RightPhraseArpCol", ImVec2(right_col_w, 460.0f), true);
+                        {
+                            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.45f, 1.0f), "INSTRUMENT-OWNED PHRASES & ARPEGGIATOR");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            // Realtime Arp Track Target & Status
+                            ImGui::TextDisabled("Target Track:");
+                            ImGui::SameLine();
+                            const char* trk_targets[] = { "Track 1 (TRK 1)", "Track 2 (TRK 2)", "Track 3 (TRK 3)", "Track 4 (TRK 4)" };
+                            ImGui::SetNextItemWidth(140);
+                            if (ImGui::Combo("##PhraseTargetTrackCombo", &selected_track, trk_targets, 4)) {
+                                g_active_phrase_idx = g_track_phrase_assigned[selected_track];
+                            }
+                            ImGui::SameLine();
+                            bool cur_arp = g_track_phrase_arp_enabled[selected_track];
+                            if (cur_arp) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.05f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.25f, 0.35f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
+                            }
+                            char arp_btn_lbl[48];
+                            std::snprintf(arp_btn_lbl, sizeof(arp_btn_lbl), "ARP: %s##Tab7Arp", cur_arp ? "ACTIVE [ON]" : "OFF");
+                            if (ImGui::Button(arp_btn_lbl)) {
+                                g_track_phrase_arp_enabled[selected_track] = !cur_arp;
+                                if (g_track_phrase_arp_enabled[selected_track]) {
+                                    g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
+                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: LIVE PHRASE ARP ROUTING ENABLED", selected_track + 1);
+                                } else {
+                                    g_phrase_player.all_notes_off();
+                                    for (int v = 0; v < 16; ++v) mod_matrix.poly_note_off(v);
+                                    std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: ARP ROUTING DISABLED", selected_track + 1);
+                                }
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::SetTooltip("When ACTIVE, incoming MIDI notes on Track %d trigger tracker-timed phrase playback through PolySynth.", selected_track + 1);
+                            }
+
+                            ImGui::Spacing();
+
+                            // Phrase Selector & Header Controls
+                            ImGui::TextDisabled("Active Phrase:");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(180);
+                            std::vector<std::string> phrase_names;
+                            for (size_t p = 0; p < g_phrase_bank.phrases.size(); ++p) {
+                                phrase_names.push_back(std::to_string(p + 1) + ": " + g_phrase_bank.phrases[p].name);
+                            }
+                            std::vector<const char*> phrase_ptrs;
+                            for (const auto& nm : phrase_names) phrase_ptrs.push_back(nm.c_str());
+
+                            if (ImGui::Combo("##ActivePhraseCombo", &g_active_phrase_idx, phrase_ptrs.data(), static_cast<int>(phrase_ptrs.size()))) {
+                                g_phrase_bank.active_phrase_index = static_cast<size_t>(g_active_phrase_idx);
+                                g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
+                            }
+
+                            ImGui::SameLine();
+                            if (ImGui::Button("+ ADD PHRASE")) {
+                                g_phrase_bank.add_phrase("New Phrase", 16);
+                                g_active_phrase_idx = static_cast<int>(g_phrase_bank.phrases.size() - 1);
+                                g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
+                            }
+
+                            auto* phrase = g_phrase_bank.get_phrase(static_cast<size_t>(g_active_phrase_idx));
+                            if (phrase) {
+                                g_phrase_player.set_phrase(phrase);
+
+                                // Mode Selector
+                                ImGui::Spacing();
+                                const char* mode_labels[] = {
+                                    "Transposed (Melodic Root)",
+                                    "Direct (Absolute Notes)",
+                                    "Keymap (Drum Kit / Slices)",
+                                    "Arp Up (Ascending Chord)",
+                                    "Arp Down (Descending)",
+                                    "Arp Up-Down (Ping-Pong)",
+                                    "Arp Random (Generative)",
+                                    "Arp Chord (Simultaneous)"
+                                };
+                                int cur_mode = static_cast<int>(phrase->playback_mode);
+                                ImGui::TextDisabled("Playback Mode:");
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(200);
+                                if (ImGui::Combo("##PhraseMode", &cur_mode, mode_labels, 8)) {
+                                    phrase->playback_mode = static_cast<sequencer::PhraseArpMode>(cur_mode);
+                                }
+
+                                ImGui::SameLine();
+                                int p_lines = static_cast<int>(phrase->num_lines);
+                                ImGui::TextDisabled("Lines:");
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(90);
+                                if (ImGui::SliderInt("##PhraseLines", &p_lines, 4, 64)) {
+                                    phrase->resize(static_cast<uint32_t>(p_lines));
+                                }
+
+                                ImGui::SameLine();
+                                ImGui::Checkbox("Loop", &phrase->loop);
+
+                                // Quick Generator Buttons
+                                ImGui::Spacing();
+                                ImGui::TextDisabled("Quick Builders:");
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Triad Arp")) {
+                                    phrase->playback_mode = sequencer::PhraseArpMode::ArpUp;
+                                    phrase->build_arpeggiator_pattern({0, 4, 7, 12, 16, 12, 7, 4}, 115);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Minor 9th Arp")) {
+                                    phrase->playback_mode = sequencer::PhraseArpMode::ArpUp;
+                                    phrase->build_arpeggiator_pattern({0, 3, 7, 10, 14, 12, 7, 3}, 110);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Jungle Break (Ratchet)")) {
+                                    phrase->playback_mode = sequencer::PhraseArpMode::Keymap;
+                                    phrase->build_drum_break_variation(0, 1, 2, true);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Clear")) {
+                                    phrase->clear();
+                                }
+
+                                // Interactive Audition Buttons
+                                ImGui::SameLine(0, 20);
+                                if (ImGui::Button("[ AUDITION C-4 ]")) {
+                                    g_phrase_player.all_notes_off();
+                                    g_phrase_player.note_on(60, 110);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("[ AUDITION CHORD ]")) {
+                                    g_phrase_player.all_notes_off();
+                                    g_phrase_player.note_on(60, 110);
+                                    g_phrase_player.note_on(64, 105);
+                                    g_phrase_player.note_on(67, 100);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("[ STOP ]")) {
+                                    g_phrase_player.all_notes_off();
+                                    mod_matrix.poly_all_notes_off();
+                                }
+
+                                // Matrix Table
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+
+                                if (ImGui::BeginTable("PhraseLinesTable", 8,
+                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                      ImGuiTableFlags_ScrollY, ImVec2(0, 250))) {
+                                    ImGui::TableSetupColumn("LN", ImGuiTableColumnFlags_WidthFixed, 32);
+                                    ImGui::TableSetupColumn("Trig / Type", ImGuiTableColumnFlags_WidthFixed, 85);
+                                    ImGui::TableSetupColumn("Note / Slice", ImGuiTableColumnFlags_WidthFixed, 100);
+                                    ImGui::TableSetupColumn("Vel", ImGuiTableColumnFlags_WidthFixed, 55);
+                                    ImGui::TableSetupColumn("Delay (Ticks)", ImGuiTableColumnFlags_WidthFixed, 75);
+                                    ImGui::TableSetupColumn("Gate (Ticks)", ImGuiTableColumnFlags_WidthFixed, 75);
+                                    ImGui::TableSetupColumn("Ratchet (Roll)", ImGuiTableColumnFlags_WidthFixed, 85);
+                                    ImGui::TableSetupColumn("Prob %", ImGuiTableColumnFlags_WidthFixed, 60);
+                                    ImGui::TableHeadersRow();
+
+                                    const uint32_t cur_line = g_phrase_player.current_line();
+                                    for (uint32_t l = 0; l < phrase->num_lines && l < phrase->lines.size(); ++l) {
+                                        auto& line = phrase->lines[l];
+                                        auto& note_col = line.columns[0];
+
+                                        ImGui::TableNextRow();
+                                        bool is_current = (g_phrase_player.is_playing() && cur_line == l);
+                                        if (is_current) {
+                                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.85f, 0.45f, 0.05f, 0.35f)));
+                                        }
+
+                                        // Col 0: Line #
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::Text("%02u", l);
+
+                                        // Col 1: Trig / Type
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::PushID(static_cast<int>(l));
+                                        if (ImGui::Checkbox("##Act", &note_col.active)) {
+                                            if (note_col.active && note_col.velocity == 0) note_col.velocity = 100;
+                                        }
+                                        ImGui::SameLine();
+                                        if (note_col.active) {
+                                            if (ImGui::SmallButton(note_col.is_slice ? "SLICE" : "NOTE")) {
+                                                note_col.is_slice = !note_col.is_slice;
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        // Col 2: Note / Slice
+                                        ImGui::TableSetColumnIndex(2);
+                                        if (note_col.active) {
+                                            if (note_col.is_slice) {
+                                                int s_id = static_cast<int>(note_col.slice_id);
+                                                ImGui::SetNextItemWidth(90);
+                                                if (ImGui::InputInt("##SliceId", &s_id, 1, 4)) {
+                                                    note_col.slice_id = static_cast<uint16_t>(std::clamp(s_id, 0, 65535));
+                                                }
+                                            } else {
+                                                int n_off = static_cast<int>(note_col.note_offset);
+                                                ImGui::SetNextItemWidth(90);
+                                                if (ImGui::InputInt("##NoteOff", &n_off, 1, 12)) {
+                                                    note_col.note_offset = static_cast<int8_t>(std::clamp(n_off, -60, 60));
+                                                }
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("...");
+                                        }
+
+                                        // Col 3: Velocity
+                                        ImGui::TableSetColumnIndex(3);
+                                        if (note_col.active) {
+                                            int vel = static_cast<int>(note_col.velocity);
+                                            ImGui::SetNextItemWidth(50);
+                                            if (ImGui::SliderInt("##Vel", &vel, 1, 127)) {
+                                                note_col.velocity = static_cast<uint8_t>(vel);
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        // Col 4: Delay Ticks
+                                        ImGui::TableSetColumnIndex(4);
+                                        if (note_col.active) {
+                                            int del = static_cast<int>(note_col.delay_ticks);
+                                            ImGui::SetNextItemWidth(65);
+                                            if (ImGui::SliderInt("##Del", &del, 0, 15)) {
+                                                note_col.delay_ticks = static_cast<uint8_t>(del);
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        // Col 5: Gate Ticks
+                                        ImGui::TableSetColumnIndex(5);
+                                        if (note_col.active) {
+                                            int gate = static_cast<int>(note_col.gate_ticks);
+                                            ImGui::SetNextItemWidth(65);
+                                            if (ImGui::SliderInt("##Gate", &gate, 1, 48)) {
+                                                note_col.gate_ticks = static_cast<uint16_t>(gate);
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        // Col 6: Ratchet Drill (Retrigger)
+                                        ImGui::TableSetColumnIndex(6);
+                                        if (note_col.active) {
+                                            int ratch = static_cast<int>(note_col.retrigger_ticks);
+                                            ImGui::SetNextItemWidth(75);
+                                            if (ImGui::SliderInt("##Ratch", &ratch, 0, 8, ratch == 0 ? "OFF" : "Every %d")) {
+                                                note_col.retrigger_ticks = static_cast<uint8_t>(ratch);
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        // Col 7: Probability
+                                        ImGui::TableSetColumnIndex(7);
+                                        if (note_col.active) {
+                                            int prob = static_cast<int>(note_col.probability);
+                                            ImGui::SetNextItemWidth(55);
+                                            if (ImGui::SliderInt("##Prob", &prob, 0, 100)) {
+                                                note_col.probability = static_cast<uint8_t>(prob);
+                                            }
+                                        } else {
+                                            ImGui::TextDisabled("--");
+                                        }
+
+                                        ImGui::PopID();
+                                    }
+                                    ImGui::EndTable();
+                                }
+                            }
+                        }
+                        ImGui::EndChild();
+                    };
+
+                    ImGui::BeginChild("UnifiedPatternStudioPane", ImVec2(0, 0), true);
                     {
                         auto seq = track_seq[selected_track];
                         if (seq) {
                             auto& pat = seq->pattern(pattern_editor_pat_idx);
 
-                            // Row 1: Header & Pattern Selector
-                            ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "STEP PATTERN MATRIX // %s // PAT %d (%s):",
-                                               track_names[selected_track], pattern_editor_pat_idx + 1, pat.name.c_str());
-                            ImGui::SameLine();
+                            // Row 1: Dual Perspective Selector & Unified Studio Header
+                            bool is_fl_view = (g_seq_view_mode == SequencerViewMode::FlChannelRack);
+                            if (is_fl_view) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
+                            }
+                            if (ImGui::SmallButton(" [■] FL CHANNEL RACK (HORIZONTAL) ")) {
+                                g_seq_view_mode = SequencerViewMode::FlChannelRack;
+                            }
+                            ImGui::PopStyleColor(2);
+
+                            ImGui::SameLine(0, 4);
+                            bool is_trk_view = (g_seq_view_mode == SequencerViewMode::RenoiseMultiTracker);
+                            if (is_trk_view) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.05f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
+                            }
+                            if (ImGui::SmallButton(" [≡] RENOISE MULTI-TRACKER (VERTICAL) ")) {
+                                g_seq_view_mode = SequencerViewMode::RenoiseMultiTracker;
+                            }
+                            ImGui::PopStyleColor(2);
+
+                            ImGui::SameLine(0, 10);
+                            if (g_seq_show_phrase_lab) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.35f, 0.45f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.25f, 0.32f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.75f, 0.85f, 1.0f));
+                            }
+                            if (ImGui::SmallButton(g_seq_show_phrase_lab ? "[ ♫ PHRASE & SCALES LAB: OPEN ]" : "[ ♫ PHRASE & SCALES LAB ]")) {
+                                g_seq_show_phrase_lab = !g_seq_show_phrase_lab;
+                            }
+                            ImGui::PopStyleColor(2);
+
+                            ImGui::SameLine(0, 16);
+                            // Pattern Selectors
                             for (int p = 0; p < 4; ++p) {
                                 char p_lbl[32];
-                                std::snprintf(p_lbl, sizeof(p_lbl), "PAT %d (S%d)##p", p + 1, p + 1);
+                                std::snprintf(p_lbl, sizeof(p_lbl), "PAT %d##p", p + 1);
                                 bool is_active_p = (pattern_editor_pat_idx == p);
                                 if (is_active_p) {
                                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
@@ -3066,7 +3635,7 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine();
                             }
 
-                            // Voice Mode: Monophonic (all-choke classic) vs Polyphonic 16-Voice with Choke Groups
+                            // Voice Mode: Monophonic vs Polyphonic
                             bool is_poly = (seq->voice_mode() == sequencer::VoiceMode::Polyphonic);
                             if (is_poly) {
                                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.58f, 0.32f, 1.0f));
@@ -3083,14 +3652,13 @@ int main(int argc, char** argv) {
                             ImGui::SameLine(0, 6);
                             ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[%u/16 VOICES]", seq->active_voice_count());
 
-                            ImGui::SameLine(0, 12);
-                            // Pattern Switch Mode (Quantized)
+                            ImGui::SameLine(0, 10);
                             auto cur_mode = seq->switch_mode();
                             const char* mode_str = (cur_mode == sequencer::PatternSwitchMode::BarQuantized) ? "BAR-SYNC" :
                                                    ((cur_mode == sequencer::PatternSwitchMode::BeatQuantized) ? "BEAT-SYNC" : "IMMEDIATE");
                             ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "[SYNC: %s]", mode_str);
 
-                            ImGui::SameLine(0, 15);
+                            ImGui::SameLine(0, 12);
                             if (ImGui::SmallButton("CLEAR##pat")) {
                                 pat.clear();
                             }
@@ -3110,7 +3678,7 @@ int main(int argc, char** argv) {
                             }
 
                             // Auto-Chop & Slice-to-MIDI Groove Action
-                            ImGui::SameLine(0, 12);
+                            ImGui::SameLine(0, 10);
                             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.35f, 0.08f, 0.90f));
                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                             if (ImGui::SmallButton("⚡ AUTO-CHOP & GROOVE##pat")) {
@@ -3119,15 +3687,15 @@ int main(int argc, char** argv) {
                             ImGui::PopStyleColor(2);
 
                             // Pattern Swing Slider
-                            ImGui::SameLine(0, 12);
-                            ImGui::SetNextItemWidth(75);
+                            ImGui::SameLine(0, 10);
+                            ImGui::SetNextItemWidth(70);
                             int swing_pct = static_cast<int>(std::round(pat.swing * 100.0f));
                             if (ImGui::SliderInt("Swing##pat", &swing_pct, 0, 100, "%d%%")) {
                                 pat.swing = static_cast<float>(swing_pct) / 100.0f;
                             }
 
                             // Whole-Pattern Quick Quantize
-                            ImGui::SameLine(0, 8);
+                            ImGui::SameLine(0, 6);
                             if (ImGui::SmallButton("SNAP 100%##all")) {
                                 pat.quantize_all(1.0f);
                             }
@@ -3136,227 +3704,420 @@ int main(int argc, char** argv) {
                                 pat.quantize_all(0.0f);
                             }
 
-                            // Parameter Automation Lane Selector (Elektron / Bitwig Style)
-                            static int s_seq_auto_lane_target = 0; // 0=Vel, 1=Cutoff, 2=Decay, 3=Drive, 4=Rev A, 5=Dly B, 6=Pitch, 7=Pan, 8=Micro, 9=Prob
-                            ImGui::Spacing();
-                            ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "AUTOMATION LANE:");
-                            ImGui::SameLine(0, 8);
-                            const char* auto_lane_names[] = { "Vel", "Cutoff", "Decay", "Drive", "Rev A", "Dly B", "Pitch", "Pan", "Micro", "Prob" };
-                            for (int al = 0; al < 10; ++al) {
-                                if (al > 0) ImGui::SameLine(0, 4);
-                                bool is_al_sel = (s_seq_auto_lane_target == al);
-                                if (is_al_sel) {
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                } else {
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.94f, 0.96f, 1.0f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
-                                }
-                                if (ImGui::SmallButton(auto_lane_names[al])) {
-                                    s_seq_auto_lane_target = al;
-                                }
-                                ImGui::PopStyleColor(2);
-                            }
-
-                            // Row 2: 16-Step Button Grid with Live Step Playhead LED
-                            uint32_t active_step = seq->current_step_index();
                             bool seq_running = is_playing && (trk0->is_sequencer_enabled() || trk1->is_sequencer_enabled() ||
                                                               trk2->is_sequencer_enabled() || trk3->is_sequencer_enabled());
 
-                            ImGui::Spacing();
-                            for (int st = 0; st < 16; ++st) {
-                                if (st > 0 && (st % 4 == 0)) {
-                                    ImGui::SameLine(0, 12); // Beat separator gap
-                                } else if (st > 0) {
-                                    ImGui::SameLine(0, 4);
-                                }
+                            // ========================================================
+                            // PERSPECTIVE 1: FL STUDIO CHANNEL RACK (HORIZONTAL MATRIX)
+                            // ========================================================
+                            if (g_seq_view_mode == SequencerViewMode::FlChannelRack) {
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "FL STUDIO MULTI-TRACK CHANNEL RACK // 4 TRACKS x 16 STEPS:");
+                                ImGui::Separator();
+                                ImGui::Spacing();
 
-                                ImGui::BeginGroup();
-                                // Step Playhead LED
-                                bool is_cur_step = (seq_running && active_step == static_cast<uint32_t>(st));
-                                ImVec4 led_col = is_cur_step ? ImVec4(0.95f, 0.70f, 0.10f, 1.0f) : ImVec4(0.80f, 0.83f, 0.88f, 0.5f);
-                                ImGui::PushStyleColor(ImGuiCol_Text, led_col);
-                                ImGui::Text(is_cur_step ? " ● " : " · ");
-                                ImGui::PopStyleColor();
-
-                                // Step Button
-                                bool st_active = pat.is_step_active(st);
-                                char st_lbl[24];
-                                if (st_active) {
-                                    std::snprintf(st_lbl, sizeof(st_lbl), "%d##st%d", st + 1, st);
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 0.95f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                                } else {
-                                    std::snprintf(st_lbl, sizeof(st_lbl), "%d##st%d", st + 1, st);
-                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.95f, 0.97f, 1.0f));
-                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.50f, 0.58f, 1.0f));
-                                }
-
-                                if (ImGui::Button(st_lbl, ImVec2(34, 26))) {
-                                    pat.toggle_step(st, 0, 0.9f);
-                                    pattern_editor_step_idx = st;
-                                }
-                                ImGui::PopStyleColor(2);
-
-                                // 16-Step Interactive Parameter Automation Bar (Elektron / Bitwig style)
-                                ImDrawList* dlist = ImGui::GetWindowDrawList();
-                                ImVec2 bar_sz(34.0f, 26.0f);
-                                ImVec2 b_p0 = ImGui::GetCursorScreenPos();
-                                ImVec2 b_p1 = ImVec2(b_p0.x + bar_sz.x, b_p0.y + bar_sz.y);
-
-                                char bar_btn_id[32];
-                                std::snprintf(bar_btn_id, sizeof(bar_btn_id), "##al_bar_%d", st);
-                                ImGui::InvisibleButton(bar_btn_id, bar_sz);
-
-                                bool b_hovered = ImGui::IsItemHovered();
-                                bool b_active = ImGui::IsItemActive();
-
-                                auto& sref = pat.steps[st];
-                                if (b_active) {
-                                    pattern_editor_step_idx = st;
-                                    float my = ImGui::GetIO().MousePos.y;
-                                    float drag_norm = std::clamp(1.0f - (my - b_p0.y) / bar_sz.y, 0.0f, 1.0f);
-
-                                    if (s_seq_auto_lane_target == 0) { // Velocity
-                                        sref.velocity = drag_norm;
-                                        if (!sref.active && drag_norm > 0.05f) sref.active = true;
-                                    } else if (s_seq_auto_lane_target == 1) { // Cutoff
-                                        sref.filter_cutoff = (drag_norm >= 0.98f) ? 20000.0f : 40.0f * std::pow(500.0f, drag_norm);
-                                    } else if (s_seq_auto_lane_target == 2) { // Decay
-                                        sref.decay_ms = (drag_norm >= 0.98f) ? 0.0f : drag_norm * 1500.0f;
-                                    } else if (s_seq_auto_lane_target == 3) { // Drive
-                                        sref.drive = drag_norm;
-                                    } else if (s_seq_auto_lane_target == 4) { // Rev A
-                                        sref.send_a = drag_norm;
-                                    } else if (s_seq_auto_lane_target == 5) { // Dly B
-                                        sref.send_b = drag_norm;
-                                    } else if (s_seq_auto_lane_target == 6) { // Pitch
-                                        float bi = (drag_norm - 0.5f) * 2.0f;
-                                        sref.pitch_ratio = std::pow(2.0f, bi);
-                                    } else if (s_seq_auto_lane_target == 7) { // Pan
-                                        sref.pan = (drag_norm - 0.5f) * 2.0f;
-                                    } else if (s_seq_auto_lane_target == 8) { // Micro
-                                        sref.micro_timing = (drag_norm - 0.5f);
-                                    } else if (s_seq_auto_lane_target == 9) { // Prob
-                                        sref.probability = static_cast<uint8_t>(std::round(drag_norm * 100.0f));
+                                for (int t = 0; t < 4; ++t) {
+                                    ImGui::PushID(t);
+                                    auto t_seq = track_seq[t];
+                                    Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                    if (!t_seq || !trk) {
+                                        ImGui::PopID();
+                                        continue;
                                     }
-                                }
+                                    auto& t_pat = t_seq->pattern(pattern_editor_pat_idx);
+                                    bool is_sel_trk = (selected_track == t);
 
-                                // Background
-                                dlist->AddRectFilled(b_p0, b_p1, IM_COL32(236, 239, 244, 255), 2.0f);
-
-                                // Compute display values & color
-                                float norm_fill = 0.0f;
-                                float bi_fill = 0.0f;
-                                bool is_bi = false;
-                                ImU32 fill_col = IM_COL32(31, 97, 217, 220); // Default Blue
-                                char val_txt[16] = "";
-
-                                const auto& cur_s = pat.steps[st];
-                                if (s_seq_auto_lane_target == 0) { // Velocity
-                                    norm_fill = cur_s.active ? cur_s.velocity : 0.0f;
-                                    fill_col = IM_COL32(31, 97, 217, 220);
-                                    std::snprintf(val_txt, sizeof(val_txt), "%d", static_cast<int>(std::round(cur_s.velocity * 100.0f)));
-                                } else if (s_seq_auto_lane_target == 1) { // Cutoff
-                                    norm_fill = std::clamp(std::log(cur_s.filter_cutoff / 40.0f) / std::log(20000.0f / 40.0f), 0.0f, 1.0f);
-                                    fill_col = IM_COL32(217, 123, 13, 220);
-                                    if (cur_s.filter_cutoff >= 19900.0f) std::snprintf(val_txt, sizeof(val_txt), "BYP");
-                                    else if (cur_s.filter_cutoff >= 1000.0f) std::snprintf(val_txt, sizeof(val_txt), "%.1fk", cur_s.filter_cutoff * 0.001f);
-                                    else std::snprintf(val_txt, sizeof(val_txt), "%.0f", cur_s.filter_cutoff);
-                                } else if (s_seq_auto_lane_target == 2) { // Decay
-                                    norm_fill = (cur_s.decay_ms <= 0.01f) ? 1.0f : std::clamp(cur_s.decay_ms / 1500.0f, 0.0f, 1.0f);
-                                    fill_col = IM_COL32(16, 163, 127, 220);
-                                    if (cur_s.decay_ms <= 0.01f) std::snprintf(val_txt, sizeof(val_txt), "FULL");
-                                    else std::snprintf(val_txt, sizeof(val_txt), "%.0fm", cur_s.decay_ms);
-                                } else if (s_seq_auto_lane_target == 3) { // Drive
-                                    norm_fill = cur_s.drive;
-                                    fill_col = IM_COL32(220, 53, 69, 220);
-                                    if (cur_s.drive < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
-                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.drive * 100.0f)));
-                                } else if (s_seq_auto_lane_target == 4) { // Rev A
-                                    norm_fill = cur_s.send_a;
-                                    fill_col = IM_COL32(138, 75, 232, 220);
-                                    if (cur_s.send_a < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
-                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_a * 100.0f)));
-                                } else if (s_seq_auto_lane_target == 5) { // Dly B
-                                    norm_fill = cur_s.send_b;
-                                    fill_col = IM_COL32(14, 165, 233, 220);
-                                    if (cur_s.send_b < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
-                                    else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_b * 100.0f)));
-                                } else if (s_seq_auto_lane_target == 6) { // Pitch
-                                    is_bi = true;
-                                    bi_fill = std::clamp(std::log2(cur_s.pitch_ratio), -1.0f, 1.0f);
-                                    fill_col = IM_COL32(99, 102, 241, 220);
-                                    std::snprintf(val_txt, sizeof(val_txt), "%.2fx", cur_s.pitch_ratio);
-                                } else if (s_seq_auto_lane_target == 7) { // Pan
-                                    is_bi = true;
-                                    bi_fill = cur_s.pan;
-                                    fill_col = IM_COL32(249, 115, 22, 220);
-                                    if (std::abs(cur_s.pan) < 0.05f) std::snprintf(val_txt, sizeof(val_txt), "C");
-                                    else if (cur_s.pan < 0.0f) std::snprintf(val_txt, sizeof(val_txt), "L%.0f", -cur_s.pan * 100.0f);
-                                    else std::snprintf(val_txt, sizeof(val_txt), "R%.0f", cur_s.pan * 100.0f);
-                                } else if (s_seq_auto_lane_target == 8) { // Micro
-                                    is_bi = true;
-                                    bi_fill = cur_s.micro_timing * 2.0f;
-                                    fill_col = IM_COL32(234, 88, 12, 220);
-                                    std::snprintf(val_txt, sizeof(val_txt), "%+.0f%%", cur_s.micro_timing * 100.0f);
-                                } else if (s_seq_auto_lane_target == 9) { // Prob
-                                    norm_fill = static_cast<float>(cur_s.probability) / 100.0f;
-                                    fill_col = IM_COL32(100, 116, 139, 220);
-                                    std::snprintf(val_txt, sizeof(val_txt), "%d%%", cur_s.probability);
-                                }
-
-                                // Inactive step dimming
-                                if (!cur_s.active) {
-                                    fill_col = (fill_col & 0x00FFFFFF) | 0x40000000; // 25% alpha
-                                }
-
-                                // Draw bar geometry
-                                if (is_bi) {
-                                    float mid_y = b_p0.y + bar_sz.y * 0.5f;
-                                    dlist->AddLine(ImVec2(b_p0.x, mid_y), ImVec2(b_p1.x, mid_y), IM_COL32(180, 185, 195, 255), 1.0f);
-                                    float h = -bi_fill * (bar_sz.y * 0.45f);
-                                    if (bi_fill > 0.01f) {
-                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y + h), ImVec2(b_p1.x - 2, mid_y), fill_col, 1.0f);
-                                    } else if (bi_fill < -0.01f) {
-                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y), ImVec2(b_p1.x - 2, mid_y + h), fill_col, 1.0f);
+                                    // Track Header Controls
+                                    ImGui::BeginGroup();
+                                    if (is_sel_trk) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 0.95f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 0.90f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.75f, 0.85f, 1.0f));
                                     }
-                                } else {
-                                    float fill_h = norm_fill * (bar_sz.y - 2.0f);
-                                    if (fill_h > 1.0f) {
-                                        dlist->AddRectFilled(ImVec2(b_p0.x + 2, b_p1.y - 1.0f - fill_h), ImVec2(b_p1.x - 2, b_p1.y - 1.0f), fill_col, 1.0f);
+                                    if (ImGui::Button(rack_trk_names[t], ImVec2(102, 26))) {
+                                        selected_track = t;
                                     }
+                                    ImGui::PopStyleColor(2);
+
+                                    ImGui::SameLine(0, 3);
+                                    bool is_muted = trk->is_muted();
+                                    if (is_muted) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.25f, 0.32f, 0.8f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.65f, 0.75f, 1.0f));
+                                    }
+                                    if (ImGui::Button(is_muted ? "M##m" : "M##m", ImVec2(22, 26))) {
+                                        trk->set_mute(!is_muted);
+                                    }
+                                    ImGui::PopStyleColor(2);
+
+                                    ImGui::SameLine(0, 2);
+                                    bool is_solo = trk->is_solo();
+                                    if (is_solo) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.95f, 0.75f, 0.15f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.1f, 0.1f, 0.1f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.25f, 0.32f, 0.8f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.65f, 0.75f, 1.0f));
+                                    }
+                                    if (ImGui::Button(is_solo ? "S##s" : "S##s", ImVec2(22, 26))) {
+                                        trk->set_solo(!is_solo);
+                                    }
+                                    ImGui::PopStyleColor(2);
+
+                                    ImGui::SameLine(0, 2);
+                                    bool seq_on = trk->is_sequencer_enabled();
+                                    if (seq_on) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.58f, 0.32f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.25f, 0.32f, 0.8f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.65f, 1.0f));
+                                    }
+                                    if (ImGui::Button(seq_on ? "ON##seq" : "--##seq", ImVec2(28, 26))) {
+                                        trk->enable_sequencer(!seq_on);
+                                    }
+                                    ImGui::PopStyleColor(2);
+                                    ImGui::EndGroup();
+
+                                    // 16 Step Buttons for Track t
+                                    uint32_t t_cur_step = t_seq->current_step_index();
+                                    for (int st = 0; st < 16; ++st) {
+                                        if (st > 0 && (st % 4 == 0)) {
+                                            ImGui::SameLine(0, 10); // Beat separator gap
+                                        } else {
+                                            ImGui::SameLine(0, 3);
+                                        }
+
+                                        bool is_cur = (seq_running && t_cur_step == static_cast<uint32_t>(st));
+                                        bool st_act = t_pat.is_step_active(st);
+                                        int beat_idx = st / 4;
+                                        bool is_beat_even = (beat_idx % 2 == 0);
+
+                                        char st_lbl[24];
+                                        if (st_act) {
+                                            std::snprintf(st_lbl, sizeof(st_lbl), "S%u##%d_%d", t_pat.steps[st].slice_id, t, st);
+                                            ImVec4 active_col;
+                                            if (t == 0) active_col = ImVec4(0.15f, 0.45f, 0.90f, 0.95f);      // Drum Blue
+                                            else if (t == 1) active_col = ImVec4(0.12f, 0.65f, 0.45f, 0.95f); // Acid Green
+                                            else if (t == 2) active_col = ImVec4(0.85f, 0.40f, 0.10f, 0.95f); // Vocal Orange
+                                            else active_col = ImVec4(0.70f, 0.30f, 0.85f, 0.95f);             // Perc Purple
+
+                                            if (is_cur) {
+                                                active_col = ImVec4(1.0f, 0.85f, 0.20f, 1.0f); // Playhead hit
+                                            }
+                                            ImGui::PushStyleColor(ImGuiCol_Button, active_col);
+                                            ImGui::PushStyleColor(ImGuiCol_Text, is_cur ? ImVec4(0.1f, 0.1f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                        } else {
+                                            std::snprintf(st_lbl, sizeof(st_lbl), "%d##%d_%d", st + 1, t, st);
+                                            ImVec4 inactive_col = is_beat_even ? ImVec4(0.88f, 0.90f, 0.93f, 1.0f) : ImVec4(0.94f, 0.95f, 0.97f, 1.0f);
+                                            if (is_cur) {
+                                                inactive_col = ImVec4(0.95f, 0.80f, 0.40f, 1.0f);
+                                            }
+                                            ImGui::PushStyleColor(ImGuiCol_Button, inactive_col);
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.62f, 1.0f));
+                                        }
+
+                                        if (ImGui::Button(st_lbl, ImVec2(34, 26))) {
+                                            t_pat.toggle_step(st, 0, 0.9f);
+                                            pattern_editor_step_idx = st;
+                                            selected_track = t;
+                                        }
+                                        ImGui::PopStyleColor(2);
+                                    }
+                                    ImGui::PopID();
                                 }
 
-                                // Border highlight
-                                ImU32 brd_col = b_hovered ? IM_COL32(31, 97, 217, 255) :
-                                               (pattern_editor_step_idx == st ? IM_COL32(217, 123, 13, 255) : IM_COL32(200, 205, 215, 255));
-                                dlist->AddRect(b_p0, b_p1, brd_col, 2.0f);
-
-                                // Centered value text
-                                ImVec2 txt_sz = ImGui::CalcTextSize(val_txt);
-                                ImVec2 txt_pos(b_p0.x + (bar_sz.x - txt_sz.x) * 0.5f, b_p0.y + (bar_sz.y - txt_sz.y) * 0.5f);
-                                ImU32 txt_col = cur_s.active ? IM_COL32(26, 30, 40, 255) : IM_COL32(140, 145, 155, 255);
-                                dlist->AddText(txt_pos, txt_col, val_txt);
-
-                                // Slice & micro info under step
-                                if (cur_s.active) {
-                                    ImGui::TextColored(ImVec4(0.20f, 0.45f, 0.85f, 0.9f), "S%u", cur_s.slice_id);
-                                } else {
-                                    ImGui::TextDisabled(" -- ");
+                                // Interactive Parameter Automation Drag Bars (for selected_track)
+                                static int s_seq_auto_lane_target = 0; // 0=Vel, 1=Cutoff, 2=Decay, 3=Drive, 4=Rev A, 5=Dly B, 6=Pitch, 7=Pan, 8=Micro, 9=Prob
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.48f, 1.0f), "AUTOMATION LANE (%s):", rack_trk_names[selected_track]);
+                                ImGui::SameLine(0, 8);
+                                const char* auto_lane_names[] = { "Vel", "Cutoff", "Decay", "Drive", "Rev A", "Dly B", "Pitch", "Pan", "Micro", "Prob" };
+                                for (int al = 0; al < 10; ++al) {
+                                    if (al > 0) ImGui::SameLine(0, 4);
+                                    bool is_al_sel = (s_seq_auto_lane_target == al);
+                                    if (is_al_sel) {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    } else {
+                                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.94f, 0.96f, 1.0f));
+                                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+                                    }
+                                    if (ImGui::SmallButton(auto_lane_names[al])) {
+                                        s_seq_auto_lane_target = al;
+                                    }
+                                    ImGui::PopStyleColor(2);
                                 }
 
-                                ImGui::EndGroup();
+                                ImGui::Spacing();
+                                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 185.0f);
+                                for (int st = 0; st < 16; ++st) {
+                                    if (st > 0 && (st % 4 == 0)) {
+                                        ImGui::SameLine(0, 10);
+                                    } else if (st > 0) {
+                                        ImGui::SameLine(0, 3);
+                                    }
+
+                                    ImGui::BeginGroup();
+                                    ImDrawList* dlist = ImGui::GetWindowDrawList();
+                                    ImVec2 bar_sz(34.0f, 26.0f);
+                                    ImVec2 b_p0 = ImGui::GetCursorScreenPos();
+                                    ImVec2 b_p1 = ImVec2(b_p0.x + bar_sz.x, b_p0.y + bar_sz.y);
+
+                                    char bar_btn_id[32];
+                                    std::snprintf(bar_btn_id, sizeof(bar_btn_id), "##al_bar_%d", st);
+                                    ImGui::InvisibleButton(bar_btn_id, bar_sz);
+
+                                    bool b_hovered = ImGui::IsItemHovered();
+                                    bool b_active = ImGui::IsItemActive();
+
+                                    auto& sref = pat.steps[st];
+                                    if (b_active) {
+                                        pattern_editor_step_idx = st;
+                                        float my = ImGui::GetIO().MousePos.y;
+                                        float drag_norm = std::clamp(1.0f - (my - b_p0.y) / bar_sz.y, 0.0f, 1.0f);
+
+                                        if (s_seq_auto_lane_target == 0) {
+                                            sref.velocity = drag_norm;
+                                            if (!sref.active && drag_norm > 0.05f) sref.active = true;
+                                        } else if (s_seq_auto_lane_target == 1) {
+                                            sref.filter_cutoff = (drag_norm >= 0.98f) ? 20000.0f : 40.0f * std::pow(500.0f, drag_norm);
+                                        } else if (s_seq_auto_lane_target == 2) {
+                                            sref.decay_ms = (drag_norm >= 0.98f) ? 0.0f : drag_norm * 1500.0f;
+                                        } else if (s_seq_auto_lane_target == 3) {
+                                            sref.drive = drag_norm;
+                                        } else if (s_seq_auto_lane_target == 4) {
+                                            sref.send_a = drag_norm;
+                                        } else if (s_seq_auto_lane_target == 5) {
+                                            sref.send_b = drag_norm;
+                                        } else if (s_seq_auto_lane_target == 6) {
+                                            float bi = (drag_norm - 0.5f) * 2.0f;
+                                            sref.pitch_ratio = std::pow(2.0f, bi);
+                                        } else if (s_seq_auto_lane_target == 7) {
+                                            sref.pan = (drag_norm - 0.5f) * 2.0f;
+                                        } else if (s_seq_auto_lane_target == 8) {
+                                            sref.micro_timing = (drag_norm - 0.5f);
+                                        } else if (s_seq_auto_lane_target == 9) {
+                                            sref.probability = static_cast<uint8_t>(std::round(drag_norm * 100.0f));
+                                        }
+                                    }
+
+                                    dlist->AddRectFilled(b_p0, b_p1, IM_COL32(236, 239, 244, 255), 2.0f);
+
+                                    float norm_fill = 0.0f;
+                                    float bi_fill = 0.0f;
+                                    bool is_bi = false;
+                                    ImU32 fill_col = IM_COL32(31, 97, 217, 220);
+                                    char val_txt[16] = "";
+
+                                    const auto& cur_s = pat.steps[st];
+                                    if (s_seq_auto_lane_target == 0) {
+                                        norm_fill = cur_s.active ? cur_s.velocity : 0.0f;
+                                        fill_col = IM_COL32(31, 97, 217, 220);
+                                        std::snprintf(val_txt, sizeof(val_txt), "%d", static_cast<int>(std::round(cur_s.velocity * 100.0f)));
+                                    } else if (s_seq_auto_lane_target == 1) {
+                                        norm_fill = std::clamp(std::log(cur_s.filter_cutoff / 40.0f) / std::log(20000.0f / 40.0f), 0.0f, 1.0f);
+                                        fill_col = IM_COL32(217, 123, 13, 220);
+                                        if (cur_s.filter_cutoff >= 19900.0f) std::snprintf(val_txt, sizeof(val_txt), "BYP");
+                                        else if (cur_s.filter_cutoff >= 1000.0f) std::snprintf(val_txt, sizeof(val_txt), "%.1fk", cur_s.filter_cutoff * 0.001f);
+                                        else std::snprintf(val_txt, sizeof(val_txt), "%.0f", cur_s.filter_cutoff);
+                                    } else if (s_seq_auto_lane_target == 2) {
+                                        norm_fill = (cur_s.decay_ms <= 0.01f) ? 1.0f : std::clamp(cur_s.decay_ms / 1500.0f, 0.0f, 1.0f);
+                                        fill_col = IM_COL32(16, 163, 127, 220);
+                                        if (cur_s.decay_ms <= 0.01f) std::snprintf(val_txt, sizeof(val_txt), "FULL");
+                                        else std::snprintf(val_txt, sizeof(val_txt), "%.0fm", cur_s.decay_ms);
+                                    } else if (s_seq_auto_lane_target == 3) {
+                                        norm_fill = cur_s.drive;
+                                        fill_col = IM_COL32(220, 53, 69, 220);
+                                        if (cur_s.drive < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                        else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.drive * 100.0f)));
+                                    } else if (s_seq_auto_lane_target == 4) {
+                                        norm_fill = cur_s.send_a;
+                                        fill_col = IM_COL32(138, 75, 232, 220);
+                                        if (cur_s.send_a < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                        else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_a * 100.0f)));
+                                    } else if (s_seq_auto_lane_target == 5) {
+                                        norm_fill = cur_s.send_b;
+                                        fill_col = IM_COL32(14, 165, 233, 220);
+                                        if (cur_s.send_b < 0.01f) std::snprintf(val_txt, sizeof(val_txt), "--");
+                                        else std::snprintf(val_txt, sizeof(val_txt), "%d%%", static_cast<int>(std::round(cur_s.send_b * 100.0f)));
+                                    } else if (s_seq_auto_lane_target == 6) {
+                                        is_bi = true;
+                                        bi_fill = std::clamp(std::log2(cur_s.pitch_ratio), -1.0f, 1.0f);
+                                        fill_col = IM_COL32(99, 102, 241, 220);
+                                        std::snprintf(val_txt, sizeof(val_txt), "%.2fx", cur_s.pitch_ratio);
+                                    } else if (s_seq_auto_lane_target == 7) {
+                                        is_bi = true;
+                                        bi_fill = cur_s.pan;
+                                        fill_col = IM_COL32(249, 115, 22, 220);
+                                        if (std::abs(cur_s.pan) < 0.05f) std::snprintf(val_txt, sizeof(val_txt), "C");
+                                        else if (cur_s.pan < 0.0f) std::snprintf(val_txt, sizeof(val_txt), "L%.0f", -cur_s.pan * 100.0f);
+                                        else std::snprintf(val_txt, sizeof(val_txt), "R%.0f", cur_s.pan * 100.0f);
+                                    } else if (s_seq_auto_lane_target == 8) {
+                                        is_bi = true;
+                                        bi_fill = cur_s.micro_timing * 2.0f;
+                                        fill_col = IM_COL32(234, 88, 12, 220);
+                                        std::snprintf(val_txt, sizeof(val_txt), "%+.0f%%", cur_s.micro_timing * 100.0f);
+                                    } else if (s_seq_auto_lane_target == 9) {
+                                        norm_fill = static_cast<float>(cur_s.probability) / 100.0f;
+                                        fill_col = IM_COL32(100, 116, 139, 220);
+                                        std::snprintf(val_txt, sizeof(val_txt), "%d%%", cur_s.probability);
+                                    }
+
+                                    if (!cur_s.active) {
+                                        fill_col = (fill_col & 0x00FFFFFF) | 0x40000000;
+                                    }
+
+                                    if (is_bi) {
+                                        float mid_y = b_p0.y + bar_sz.y * 0.5f;
+                                        dlist->AddLine(ImVec2(b_p0.x, mid_y), ImVec2(b_p1.x, mid_y), IM_COL32(180, 185, 195, 255), 1.0f);
+                                        float h = -bi_fill * (bar_sz.y * 0.45f);
+                                        if (bi_fill > 0.01f) {
+                                            dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y + h), ImVec2(b_p1.x - 2, mid_y), fill_col, 1.0f);
+                                        } else if (bi_fill < -0.01f) {
+                                            dlist->AddRectFilled(ImVec2(b_p0.x + 2, mid_y), ImVec2(b_p1.x - 2, mid_y + h), fill_col, 1.0f);
+                                        }
+                                    } else {
+                                        float fill_h = norm_fill * (bar_sz.y - 2.0f);
+                                        if (fill_h > 1.0f) {
+                                            dlist->AddRectFilled(ImVec2(b_p0.x + 2, b_p1.y - 1.0f - fill_h), ImVec2(b_p1.x - 2, b_p1.y - 1.0f), fill_col, 1.0f);
+                                        }
+                                    }
+
+                                    ImU32 brd_col = b_hovered ? IM_COL32(31, 97, 217, 255) :
+                                                   (pattern_editor_step_idx == st ? IM_COL32(217, 123, 13, 255) : IM_COL32(200, 205, 215, 255));
+                                    dlist->AddRect(b_p0, b_p1, brd_col, 2.0f);
+
+                                    ImVec2 txt_sz = ImGui::CalcTextSize(val_txt);
+                                    ImVec2 txt_pos(b_p0.x + (bar_sz.x - txt_sz.x) * 0.5f, b_p0.y + (bar_sz.y - txt_sz.y) * 0.5f);
+                                    ImU32 txt_col = cur_s.active ? IM_COL32(26, 30, 40, 255) : IM_COL32(140, 145, 155, 255);
+                                    dlist->AddText(txt_pos, txt_col, val_txt);
+
+                                    if (cur_s.active) {
+                                        ImGui::TextColored(ImVec4(0.20f, 0.45f, 0.85f, 0.9f), "S%u", cur_s.slice_id);
+                                    } else {
+                                        ImGui::TextDisabled(" -- ");
+                                    }
+                                    ImGui::EndGroup();
+                                }
                             }
 
-                            // Row 3: Step Parameters Inspector & MPC Live Jam Trigger Pads
+                            // ========================================================
+                            // PERSPECTIVE 2: RENOISE MULTI-TRACKER (VERTICAL MATRIX)
+                            // ========================================================
+                            if (g_seq_view_mode == SequencerViewMode::RenoiseMultiTracker) {
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.05f, 1.0f), "RENOISE MULTI-TRACKER // 4-TRACK VERTICAL MATRIX (16 LINES):");
+                                ImGui::SameLine(0, 15);
+                                ImGui::TextDisabled("[Left-click to select/toggle step | Right-click to clear]");
+
+                                if (ImGui::BeginTable("RenoiseMultiTrackerTable", 5,
+                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                      ImGuiTableFlags_ScrollY, ImVec2(0, 270))) {
+                                    ImGui::TableSetupColumn("LN", ImGuiTableColumnFlags_WidthFixed, 36);
+                                    ImGui::TableSetupColumn("TRK 1 (DRUMS)", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("TRK 2 (BASS)", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("TRK 3 (LEAD)", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("TRK 4 (PERC)", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableHeadersRow();
+
+                                    uint32_t active_step = seq->current_step_index();
+                                    for (int l = 0; l < 16; ++l) {
+                                        ImGui::TableNextRow();
+                                        bool is_cur_line = (seq_running && active_step == static_cast<uint32_t>(l));
+                                        bool is_downbeat = (l % 4 == 0);
+
+                                        if (is_cur_line) {
+                                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.95f, 0.70f, 0.10f, 0.35f)));
+                                        } else if (is_downbeat) {
+                                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.15f, 0.22f, 0.35f, 0.30f)));
+                                        }
+
+                                        // Col 0: Line Number
+                                        ImGui::TableSetColumnIndex(0);
+                                        if (is_downbeat) {
+                                            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "%02d", l);
+                                        } else {
+                                            ImGui::TextDisabled("%02d", l);
+                                        }
+
+                                        // Cols 1..4: Track Step Cells
+                                        for (int t = 0; t < 4; ++t) {
+                                            ImGui::TableSetColumnIndex(t + 1);
+                                            ImGui::PushID(l * 10 + t);
+                                            auto t_seq = track_seq[t];
+                                            if (!t_seq) {
+                                                ImGui::TextDisabled("---");
+                                                ImGui::PopID();
+                                                continue;
+                                            }
+                                            auto& t_pat = t_seq->pattern(pattern_editor_pat_idx);
+                                            auto& step = t_pat.steps[l];
+                                            bool is_sel_cell = (selected_track == t && pattern_editor_step_idx == l);
+
+                                            if (step.active) {
+                                                char cell_txt[48];
+                                                int hex_vel = static_cast<int>(std::round(step.velocity * 127.0f));
+                                                if (step.pitch_ratio > 0.01f && std::abs(step.pitch_ratio - 1.0f) > 1e-3f) {
+                                                    int semi = static_cast<int>(std::round(12.0f * std::log2(step.pitch_ratio)));
+                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u %+2d %02X##c", step.slice_id, semi, hex_vel);
+                                                } else {
+                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u -- %02X##c", step.slice_id, hex_vel);
+                                                }
+
+                                                ImVec4 cell_col;
+                                                if (is_sel_cell) {
+                                                    cell_col = ImVec4(0.12f, 0.45f, 0.95f, 1.0f);
+                                                } else {
+                                                    if (t == 0) cell_col = ImVec4(0.15f, 0.25f, 0.45f, 0.9f);
+                                                    else if (t == 1) cell_col = ImVec4(0.12f, 0.35f, 0.30f, 0.9f);
+                                                    else if (t == 2) cell_col = ImVec4(0.40f, 0.25f, 0.15f, 0.9f);
+                                                    else cell_col = ImVec4(0.35f, 0.18f, 0.40f, 0.9f);
+                                                }
+                                                ImGui::PushStyleColor(ImGuiCol_Button, cell_col);
+                                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.95f, 0.98f, 1.0f));
+                                                if (ImGui::Button(cell_txt, ImVec2(-1, 20))) {
+                                                    selected_track = t;
+                                                    pattern_editor_step_idx = l;
+                                                }
+                                                ImGui::PopStyleColor(2);
+
+                                                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                                                    step.active = false;
+                                                }
+                                            } else {
+                                                char empty_lbl[24];
+                                                std::snprintf(empty_lbl, sizeof(empty_lbl), "· ··· ··##e%d_%d", l, t);
+                                                ImVec4 cell_col = is_sel_cell ? ImVec4(0.12f, 0.45f, 0.95f, 0.35f) : ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+                                                ImGui::PushStyleColor(ImGuiCol_Button, cell_col);
+                                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.44f, 0.52f, 0.7f));
+                                                if (ImGui::Button(empty_lbl, ImVec2(-1, 20))) {
+                                                    t_pat.set_step(l, 0, 0.9f);
+                                                    selected_track = t;
+                                                    pattern_editor_step_idx = l;
+                                                }
+                                                ImGui::PopStyleColor(2);
+                                            }
+                                            ImGui::PopID();
+                                        }
+                                    }
+                                    ImGui::EndTable();
+                                }
+                            }
+
+                            // Shared Note Inspector & MPC Audition Pads (for selected_track and pattern_editor_step_idx)
                             ImGui::Spacing();
                             ImGui::Separator();
 
-                            // Left sub-pane: Comprehensive Note Inspector for pattern_editor_step_idx
                             ImGui::BeginGroup();
                             {
-                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "NOTE INSPECTOR [Step %d]:", pattern_editor_step_idx + 1);
+                                ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "NOTE INSPECTOR [%s // Step %d]:",
+                                                   rack_trk_names[selected_track], pattern_editor_step_idx + 1);
                                 ImGui::SameLine();
                                 auto& step_ref = pat.steps[pattern_editor_step_idx];
                                 bool s_act = step_ref.active;
@@ -3395,7 +4156,7 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine(0, 10);
                                 ImGui::Checkbox("Rev##StepProp", &step_ref.reverse);
 
-                                // Second line in Inspector: Micro-Timing Offset & Per-Note Quantization
+                                // Second line: Micro-Timing & Quantize
                                 ImGui::Spacing();
                                 ImGui::TextColored(ImVec4(0.40f, 0.45f, 0.55f, 1.0f), "Micro-Timing:");
                                 ImGui::SameLine(0, 6);
@@ -3434,12 +4195,11 @@ int main(int argc, char** argv) {
                                     step_ref.quantize_pct = 1.0f;
                                 }
 
-                                // Third line in Inspector: Per-Step Parameter Locks (Filter, Envelope, Saturation, Choke Group)
+                                // Third line: Parameter Locks
                                 ImGui::Spacing();
                                 ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.15f, 1.0f), "P-LOCKS:");
                                 ImGui::SameLine(0, 8);
 
-                                // Choke Group selector: 0=Poly/Off, 1..4=Group 1..4
                                 ImGui::SetNextItemWidth(88);
                                 const char* choke_labels[] = { "Choke: Off", "Choke: G1", "Choke: G2", "Choke: G3", "Choke: G4" };
                                 int cur_cg = static_cast<int>(step_ref.choke_group);
@@ -3449,7 +4209,6 @@ int main(int argc, char** argv) {
                                 }
 
                                 ImGui::SameLine(0, 8);
-                                // Filter Cutoff Slider (20 Hz - 20000 Hz, logarithmic feel)
                                 ImGui::SetNextItemWidth(95);
                                 char cut_str[24];
                                 if (step_ref.filter_cutoff >= 19900.0f) {
@@ -3458,16 +4217,13 @@ int main(int argc, char** argv) {
                                     std::snprintf(cut_str, sizeof(cut_str), "Cut: %.0fHz", step_ref.filter_cutoff);
                                 }
                                 if (ImGui::SliderFloat("##CutoffLock", &step_ref.filter_cutoff, 40.0f, 20000.0f, cut_str, ImGuiSliderFlags_Logarithmic)) {
-                                    // Cutoff updated
                                 }
 
                                 ImGui::SameLine(0, 6);
-                                // Filter Resonance Q (0.1 - 8.0)
                                 ImGui::SetNextItemWidth(65);
                                 ImGui::SliderFloat("##ResLock", &step_ref.filter_res, 0.1f, 8.0f, "Q: %.2f");
 
                                 ImGui::SameLine(0, 6);
-                                // Filter Type (LP, HP, BP, Notch)
                                 ImGui::SetNextItemWidth(65);
                                 const char* ftype_names[] = { "LP", "HP", "BP", "Notch" };
                                 int ftype_idx = static_cast<int>(step_ref.filter_type);
@@ -3477,7 +4233,6 @@ int main(int argc, char** argv) {
                                 }
 
                                 ImGui::SameLine(0, 8);
-                                // Decay Envelope Slider (0 ms = Full, up to 1500 ms)
                                 ImGui::SetNextItemWidth(90);
                                 char decay_str[24];
                                 if (step_ref.decay_ms <= 0.01f) {
@@ -3486,11 +4241,9 @@ int main(int argc, char** argv) {
                                     std::snprintf(decay_str, sizeof(decay_str), "Dec: %.0fms", step_ref.decay_ms);
                                 }
                                 if (ImGui::SliderFloat("##DecayLock", &step_ref.decay_ms, 0.0f, 1500.0f, decay_str)) {
-                                    // Decay updated
                                 }
 
                                 ImGui::SameLine(0, 8);
-                                // Analog Drive / Soft Saturation Slider (0% - 100%)
                                 ImGui::SetNextItemWidth(80);
                                 int drive_pct = static_cast<int>(std::round(step_ref.drive * 100.0f));
                                 char drive_str[24];
@@ -3504,7 +4257,6 @@ int main(int argc, char** argv) {
                                 }
 
                                 ImGui::SameLine(0, 8);
-                                // Aux Send A (Reverb) Slider (0% - 100%)
                                 ImGui::SetNextItemWidth(75);
                                 int send_a_pct = static_cast<int>(std::round(step_ref.send_a * 100.0f));
                                 char send_a_str[24];
@@ -3518,7 +4270,6 @@ int main(int argc, char** argv) {
                                 }
 
                                 ImGui::SameLine(0, 8);
-                                // Aux Send B (Delay) Slider (0% - 100%)
                                 ImGui::SetNextItemWidth(75);
                                 int send_b_pct = static_cast<int>(std::round(step_ref.send_b * 100.0f));
                                 char send_b_str[24];
@@ -3535,10 +4286,10 @@ int main(int argc, char** argv) {
 
                             ImGui::SameLine(0, 25);
 
-                            // Right sub-pane: 4 Tactile MPC Trigger Pads for immediate auditioning
+                            // Right sub-pane: MPC Audition Pads for selected_track
                             ImGui::BeginGroup();
                             {
-                                ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MPC AUDITION PADS:");
+                                ImGui::TextColored(ImVec4(0.85f, 0.48f, 0.05f, 1.0f), "MPC AUDITION PADS (%s):", rack_trk_names[selected_track]);
                                 ImGui::SameLine();
                                 for (int p = 0; p < 4; ++p) {
                                     char pad_lbl[32];
@@ -3550,6 +4301,46 @@ int main(int argc, char** argv) {
                                 }
                             }
                             ImGui::EndGroup();
+
+                            // ========================================================
+                            // COLLAPSIBLE DRAWER: PHRASE & SCALES LAB
+                            // ========================================================
+                            if (g_seq_show_phrase_lab) {
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+
+                                ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.15f, 1.0f), "[ ♫ INSTRUMENT PHRASE & ARPEGGIATOR LAB // SCALES & TUNING ]");
+                                ImGui::SameLine(0, 15);
+                                ImGui::TextColored(ImVec4(0.20f, 0.75f, 0.95f, 1.0f), "BIDIRECTIONAL SYNC (TRK %d <-> PHRASE %d):",
+                                                   selected_track + 1, g_active_phrase_idx + 1);
+                                ImGui::SameLine(0, 8);
+                                auto* cur_phrase = g_phrase_bank.get_phrase(static_cast<size_t>(g_active_phrase_idx));
+                                if (ImGui::SmallButton("⇄ PUSH TRK -> PHRASE##SyncPush")) {
+                                    if (cur_phrase) {
+                                        sync_step_to_phrase(pat, *cur_phrase, g_tracker_timing.tpl);
+                                        std::snprintf(status_toast, sizeof(status_toast), "SYNC: Pushed Track %d Pat %d -> Phrase %d (%s)",
+                                                      selected_track + 1, pattern_editor_pat_idx + 1, g_active_phrase_idx + 1, cur_phrase->name.c_str());
+                                    }
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("Copies steps, velocity, micro-timing, and filter locks from Track %d to the active instrument phrase arpeggiator.", selected_track + 1);
+                                }
+                                ImGui::SameLine(0, 6);
+                                if (ImGui::SmallButton("⇄ PULL PHRASE -> TRK##SyncPull")) {
+                                    if (cur_phrase) {
+                                        sync_phrase_to_step(*cur_phrase, pat, g_tracker_timing.tpl);
+                                        std::snprintf(status_toast, sizeof(status_toast), "SYNC: Pulled Phrase %d (%s) -> Track %d Pat %d",
+                                                      g_active_phrase_idx + 1, cur_phrase->name.c_str(), selected_track + 1, pattern_editor_pat_idx + 1);
+                                    }
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("Copies instrument phrase lines and notes into Track %d step pattern.", selected_track + 1);
+                                }
+
+                                ImGui::Spacing();
+                                render_instrument_phrase_and_scales_lab(ImGui::GetContentRegionAvail());
+                            }
                         }
                     }
                     ImGui::EndChild();
@@ -7764,481 +8555,6 @@ int main(int argc, char** argv) {
                                 ImGui::PopID();
                             }
                             ImGui::EndTable();
-                        }
-                    }
-                    ImGui::EndChild();
-
-                    ImGui::EndTabItem();
-                }
-
-                // ------------------------------------------------------------
-                // TAB 7: PHRASE PATTERN & ARPEGGIATOR // SCALES & TUNING
-                // ------------------------------------------------------------
-                if (ImGui::BeginTabItem("  PHRASE PATTERN & ARPEGGIATOR // SCALES & TUNING  ")) {
-                    ImVec2 avail = ImGui::GetContentRegionAvail();
-                    const float left_col_w = 420.0f;
-                    const float right_col_w = std::max(avail.x - left_col_w - 20.0f, 400.0f);
-
-                    // ========================================================
-                    // LEFT COLUMN: TRACKER TIMING & SCALES / TUNING ENGINE
-                    // ========================================================
-                    ImGui::BeginChild("LeftTimingAndScalesCol", ImVec2(left_col_w, avail.y), true);
-                    {
-                        // 1. Renoise Tracker Timing Engine
-                        ImGui::TextColored(ImVec4(0.12f, 0.45f, 0.95f, 1.0f), "RENOISE TRACKER TIMING ENGINE");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        ImGui::TextDisabled("Lines Per Beat (LPB):");
-                        ImGui::SameLine();
-                        const char* lpb_names[] = { "4 (16th notes)", "8 (32nd notes)", "12 (triplets)", "16 (64ths)", "32 (high-res)" };
-                        ImGui::SetNextItemWidth(160);
-                        if (ImGui::Combo("##TimingLPB", &g_tracker_lpb_idx, lpb_names, 5)) {
-                            g_tracker_timing.lpb = g_lpb_options[g_tracker_lpb_idx];
-                        }
-
-                        ImGui::TextDisabled("Ticks Per Line (TPL):");
-                        ImGui::SameLine();
-                        const char* tpl_names[] = { "8 Ticks", "12 Ticks", "16 Ticks", "24 Ticks" };
-                        ImGui::SetNextItemWidth(160);
-                        if (ImGui::Combo("##TimingTPL", &g_tracker_tpl_idx, tpl_names, 4)) {
-                            g_tracker_timing.tpl = g_tpl_options[g_tracker_tpl_idx];
-                        }
-
-                        int lines_pat = static_cast<int>(g_tracker_timing.lines_per_pattern);
-                        ImGui::TextDisabled("Pattern Length (Lines):");
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(150);
-                        if (ImGui::SliderInt("##PatLen", &lines_pat, 16, 256, "%d Lines")) {
-                            g_tracker_timing.lines_per_pattern = static_cast<uint32_t>(lines_pat);
-                        }
-
-                        // Realtime Timing Metrics
-                        g_tracker_timing.bpm = bpm;
-                        double line_ms = g_tracker_timing.line_duration_seconds() * 1000.0;
-                        double tick_ms = g_tracker_timing.tick_duration_seconds() * 1000.0;
-                        double spl = g_tracker_timing.samples_per_line(kSampleRate);
-                        double spt = g_tracker_timing.samples_per_tick(kSampleRate);
-
-                        uint64_t cur_sample = mixer.clock().sample_position();
-                        auto trk_pos = g_tracker_timing.position_at_sample(cur_sample, kSampleRate);
-
-                        ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.45f, 1.0f),
-                                           "LINE: %.2f ms (%.0f smp) | TICK: %.2f ms (%.0f smp)",
-                                           line_ms, spl, tick_ms, spt);
-                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.20f, 1.0f),
-                                           "TRACKER POS: PAT %02u | LINE %02u | TICK %02u (+%.2f)",
-                                           trk_pos.pattern_index, trk_pos.line_in_pattern,
-                                           trk_pos.tick_in_line, trk_pos.tick_fraction);
-
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        // 2. Musical Scale Catalog & Snap
-                        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.15f, 1.0f), "MUSICAL SCALE & QUANTIZE ENGINE");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        const char* root_names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-                        ImGui::TextDisabled("Root Note:");
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(70);
-                        ImGui::Combo("##ScaleRoot", &g_scale_root, root_names, 12);
-
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("Mode:");
-                        ImGui::SameLine();
-                        const char* scale_names[] = {
-                            "Chromatic", "Major (Ionian)", "Natural Minor", "Harmonic Minor",
-                            "Melodic Minor", "Dorian", "Phrygian", "Lydian", "Mixolydian",
-                            "Locrian", "Pentatonic Major", "Pentatonic Minor", "Blues",
-                            "Arabic Hijaz", "Japanese Insen", "Whole Tone",
-                            "Diminished (W-H)", "Diminished (H-W)", "Hungarian Minor", "Bhairav"
-                        };
-                        ImGui::SetNextItemWidth(170);
-                        if (ImGui::Combo("##ScaleType", &g_scale_type_idx, scale_names, 20)) {
-                            g_selected_scale = static_cast<tuning::ScaleType>(g_scale_type_idx);
-                        }
-
-                        const char* snap_names[] = { "Nearest", "Floor (Down)", "Ceil (Up)" };
-                        ImGui::TextDisabled("Snap Mode:");
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(130);
-                        if (ImGui::Combo("##SnapMode", &g_scale_snap_mode_idx, snap_names, 3)) {
-                            g_scale_snap_mode = static_cast<tuning::SnapMode>(g_scale_snap_mode_idx);
-                        }
-
-                        ImGui::SameLine();
-                        if (ImGui::Checkbox("Snap Active", &g_scale_snap_enabled)) {
-                            if (g_scale_snap_enabled) {
-                                std::snprintf(status_toast, sizeof(status_toast), "SCALE SNAP: %s %s (%s)",
-                                              root_names[g_scale_root], scale_names[g_scale_type_idx], snap_names[g_scale_snap_mode_idx]);
-                            }
-                        }
-                        if (g_scale_snap_enabled) {
-                            uint8_t test_snap = tuning::ScaleDictionary::snap_to_scale(
-                                61, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale, g_scale_snap_mode);
-                            ImGui::TextDisabled("Preview: C#4 -> %s", tuning::ScaleDictionary::note_name(test_snap).c_str());
-                        }
-
-                        // Visual 12-Tone Scale Degree Display
-                        ImGui::Spacing();
-                        ImGui::TextDisabled("Active Scale Tones:");
-                        for (int k = 0; k < 12; ++k) {
-                            uint8_t note_cand = static_cast<uint8_t>(60 + k);
-                            bool in_scale = tuning::ScaleDictionary::is_note_in_scale(note_cand, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale);
-                            int deg = tuning::ScaleDictionary::get_degree(note_cand, static_cast<uint8_t>(60 + g_scale_root), g_selected_scale);
-
-                            ImVec4 col = in_scale ? ImVec4(0.20f, 0.90f, 0.45f, 1.0f) : ImVec4(0.25f, 0.28f, 0.35f, 0.6f);
-                            ImGui::PushStyleColor(ImGuiCol_Button, col);
-                            char k_lbl[16];
-                            if (in_scale) {
-                                std::snprintf(k_lbl, sizeof(k_lbl), "%s%d", root_names[k], deg + 1);
-                            } else {
-                                std::snprintf(k_lbl, sizeof(k_lbl), "%s", root_names[k]);
-                            }
-                            ImGui::Button(k_lbl, ImVec2(28, 24));
-                            ImGui::PopStyleColor();
-                            if (k < 11) ImGui::SameLine(0, 3);
-                        }
-
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        // 3. Microtonal Tuning & Scala Parser
-                        ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.95f, 1.0f), "MICROTONAL TUNING & SCALA (.SCL)");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        const char* tuning_presets[] = {
-                            "12-TET Standard (Concert A4=440Hz)",
-                            "Just Intonation (5-Limit)",
-                            "24-EDO (Quarter-Tone Scale)",
-                            "Pythagorean (Pure 3:2 Fifths)",
-                            "Werckmeister III (Baroque Well-Temp)",
-                            "Bohlen-Pierce (3:1 Tritave, 13 steps)",
-                            "Arabic Maqam Rast (Neutral 3rd/7th)"
-                        };
-                        ImGui::TextDisabled("Preset:");
-                        ImGui::SetNextItemWidth(left_col_w - 30);
-                        if (ImGui::Combo("##TuningPreset", &g_tuning_preset_idx, tuning_presets, 7)) {
-                            switch (g_tuning_preset_idx) {
-                                case 0: g_tuning_table.make_12tet(440.0); break;
-                                case 1: g_tuning_table.make_just_intonation(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
-                                case 2: g_tuning_table.make_24edo(440.0); break;
-                                case 3: g_tuning_table.make_pythagorean(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
-                                case 4: g_tuning_table.make_werckmeister_iii(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
-                                case 5: g_tuning_table.make_bohlen_pierce(220.0); break;
-                                case 6: g_tuning_table.make_arabic_rast(static_cast<uint8_t>(60 + g_scale_root), 440.0); break;
-                            }
-                            std::snprintf(status_toast, sizeof(status_toast), "TUNING APPLIED: %s", g_tuning_table.name.c_str());
-                        }
-
-                        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.95f, 1.0f), "Active: %s", g_tuning_table.name.c_str());
-                        ImGui::TextDisabled("Ref: %s (Note %u) = %.2f Hz",
-                                            tuning::ScaleDictionary::note_name(g_tuning_table.reference_note).c_str(),
-                                            g_tuning_table.reference_note, g_tuning_table.reference_frequency);
-
-                        ImGui::Spacing();
-                        ImGui::TextDisabled("Import Huygens-Fokker Scala (.scl):");
-                        ImGui::InputTextMultiline("##SclImport", g_scl_import_buffer, sizeof(g_scl_import_buffer),
-                                                   ImVec2(left_col_w - 30, 75));
-                        if (ImGui::Button("PARSE SCALA STRING")) {
-                            if (g_scl_import_buffer[0] != '\0') {
-                                if (g_tuning_table.parse_scl(g_scl_import_buffer, static_cast<uint8_t>(60 + g_scale_root), 261.625565)) {
-                                    std::snprintf(status_toast, sizeof(status_toast), "SCALA IMPORTED: %s", g_tuning_table.name.c_str());
-                                } else {
-                                    std::snprintf(status_toast, sizeof(status_toast), "ERROR: Failed to parse Scala (.scl) format!");
-                                }
-                            }
-                        }
-                    }
-                    ImGui::EndChild();
-
-                    ImGui::SameLine();
-
-                    // ========================================================
-                    // RIGHT COLUMN: INSTRUMENT PHRASES & ARPEGGIATOR
-                    // ========================================================
-                    ImGui::BeginChild("RightPhraseArpCol", ImVec2(right_col_w, avail.y), true);
-                    {
-                        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.45f, 1.0f), "INSTRUMENT-OWNED PHRASES & ARPEGGIATOR");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        // Realtime Arp Track Target & Status
-                        ImGui::TextDisabled("Target Track:");
-                        ImGui::SameLine();
-                        const char* trk_targets[] = { "Track 1 (TRK 1)", "Track 2 (TRK 2)", "Track 3 (TRK 3)", "Track 4 (TRK 4)" };
-                        ImGui::SetNextItemWidth(140);
-                        if (ImGui::Combo("##PhraseTargetTrackCombo", &selected_track, trk_targets, 4)) {
-                            g_active_phrase_idx = g_track_phrase_assigned[selected_track];
-                        }
-                        ImGui::SameLine();
-                        bool cur_arp = g_track_phrase_arp_enabled[selected_track];
-                        if (cur_arp) {
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.05f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                        } else {
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.25f, 0.35f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
-                        }
-                        char arp_btn_lbl[48];
-                        std::snprintf(arp_btn_lbl, sizeof(arp_btn_lbl), "ARP: %s##Tab7Arp", cur_arp ? "ACTIVE [ON]" : "OFF");
-                        if (ImGui::Button(arp_btn_lbl)) {
-                            g_track_phrase_arp_enabled[selected_track] = !cur_arp;
-                            if (g_track_phrase_arp_enabled[selected_track]) {
-                                g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
-                                std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: LIVE PHRASE ARP ROUTING ENABLED", selected_track + 1);
-                            } else {
-                                g_phrase_player.all_notes_off();
-                                for (int v = 0; v < 16; ++v) mod_matrix.poly_note_off(v);
-                                std::snprintf(status_toast, sizeof(status_toast), "TRACK %d: ARP ROUTING DISABLED", selected_track + 1);
-                            }
-                        }
-                        ImGui::PopStyleColor(2);
-                        if (ImGui::IsItemHovered()) {
-                            ImGui::SetTooltip("When ACTIVE, incoming MIDI notes on Track %d trigger tracker-timed phrase playback through PolySynth.", selected_track + 1);
-                        }
-
-                        ImGui::Spacing();
-
-                        // Phrase Selector & Header Controls
-                        ImGui::TextDisabled("Active Phrase:");
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(180);
-                        std::vector<std::string> phrase_names;
-                        for (size_t p = 0; p < g_phrase_bank.phrases.size(); ++p) {
-                            phrase_names.push_back(std::to_string(p + 1) + ": " + g_phrase_bank.phrases[p].name);
-                        }
-                        std::vector<const char*> phrase_ptrs;
-                        for (const auto& nm : phrase_names) phrase_ptrs.push_back(nm.c_str());
-
-                        if (ImGui::Combo("##ActivePhraseCombo", &g_active_phrase_idx, phrase_ptrs.data(), static_cast<int>(phrase_ptrs.size()))) {
-                            g_phrase_bank.active_phrase_index = static_cast<size_t>(g_active_phrase_idx);
-                            g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
-                        }
-
-                        ImGui::SameLine();
-                        if (ImGui::Button("+ ADD PHRASE")) {
-                            g_phrase_bank.add_phrase("New Phrase", 16);
-                            g_active_phrase_idx = static_cast<int>(g_phrase_bank.phrases.size() - 1);
-                            g_track_phrase_assigned[selected_track] = g_active_phrase_idx;
-                        }
-
-                        auto* phrase = g_phrase_bank.get_phrase(static_cast<size_t>(g_active_phrase_idx));
-                        if (phrase) {
-                            g_phrase_player.set_phrase(phrase);
-
-                            // Mode Selector
-                            ImGui::Spacing();
-                            const char* mode_labels[] = {
-                                "Transposed (Melodic Root)",
-                                "Direct (Absolute Notes)",
-                                "Keymap (Drum Kit / Slices)",
-                                "Arp Up (Ascending Chord)",
-                                "Arp Down (Descending)",
-                                "Arp Up-Down (Ping-Pong)",
-                                "Arp Random (Generative)",
-                                "Arp Chord (Simultaneous)"
-                            };
-                            int cur_mode = static_cast<int>(phrase->playback_mode);
-                            ImGui::TextDisabled("Playback Mode:");
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(200);
-                            if (ImGui::Combo("##PhraseMode", &cur_mode, mode_labels, 8)) {
-                                phrase->playback_mode = static_cast<sequencer::PhraseArpMode>(cur_mode);
-                            }
-
-                            ImGui::SameLine();
-                            int p_lines = static_cast<int>(phrase->num_lines);
-                            ImGui::TextDisabled("Lines:");
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(90);
-                            if (ImGui::SliderInt("##PhraseLines", &p_lines, 4, 64)) {
-                                phrase->resize(static_cast<uint32_t>(p_lines));
-                            }
-
-                            ImGui::SameLine();
-                            ImGui::Checkbox("Loop", &phrase->loop);
-
-                            // Quick Generator Buttons
-                            ImGui::Spacing();
-                            ImGui::TextDisabled("Quick Builders:");
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Triad Arp")) {
-                                phrase->playback_mode = sequencer::PhraseArpMode::ArpUp;
-                                phrase->build_arpeggiator_pattern({0, 4, 7, 12, 16, 12, 7, 4}, 115);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Minor 9th Arp")) {
-                                phrase->playback_mode = sequencer::PhraseArpMode::ArpUp;
-                                phrase->build_arpeggiator_pattern({0, 3, 7, 10, 14, 12, 7, 3}, 110);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Jungle Break (Ratchet)")) {
-                                phrase->playback_mode = sequencer::PhraseArpMode::Keymap;
-                                phrase->build_drum_break_variation(0, 1, 2, true);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Clear")) {
-                                phrase->clear();
-                            }
-
-                            // Interactive Audition Buttons
-                            ImGui::SameLine(0, 20);
-                            if (ImGui::Button("[ AUDITION C-4 ]")) {
-                                g_phrase_player.all_notes_off();
-                                g_phrase_player.note_on(60, 110);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("[ AUDITION CHORD ]")) {
-                                g_phrase_player.all_notes_off();
-                                g_phrase_player.note_on(60, 110);
-                                g_phrase_player.note_on(64, 105);
-                                g_phrase_player.note_on(67, 100);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("[ STOP ]")) {
-                                g_phrase_player.all_notes_off();
-                                mod_matrix.poly_all_notes_off();
-                            }
-
-                            // Matrix Table
-                            ImGui::Spacing();
-                            ImGui::Separator();
-                            ImGui::Spacing();
-
-                            if (ImGui::BeginTable("PhraseLinesTable", 8,
-                                                  ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                                  ImGuiTableFlags_ScrollY, ImVec2(0, avail.y - 145))) {
-                                ImGui::TableSetupColumn("LN", ImGuiTableColumnFlags_WidthFixed, 32);
-                                ImGui::TableSetupColumn("Trig / Type", ImGuiTableColumnFlags_WidthFixed, 85);
-                                ImGui::TableSetupColumn("Note / Slice", ImGuiTableColumnFlags_WidthFixed, 100);
-                                ImGui::TableSetupColumn("Vel", ImGuiTableColumnFlags_WidthFixed, 55);
-                                ImGui::TableSetupColumn("Delay (Ticks)", ImGuiTableColumnFlags_WidthFixed, 75);
-                                ImGui::TableSetupColumn("Gate (Ticks)", ImGuiTableColumnFlags_WidthFixed, 75);
-                                ImGui::TableSetupColumn("Ratchet (Roll)", ImGuiTableColumnFlags_WidthFixed, 85);
-                                ImGui::TableSetupColumn("Prob %", ImGuiTableColumnFlags_WidthFixed, 60);
-                                ImGui::TableHeadersRow();
-
-                                const uint32_t cur_line = g_phrase_player.current_line();
-                                for (uint32_t l = 0; l < phrase->num_lines && l < phrase->lines.size(); ++l) {
-                                    auto& line = phrase->lines[l];
-                                    auto& note_col = line.columns[0];
-
-                                    ImGui::TableNextRow();
-                                    bool is_current = (g_phrase_player.is_playing() && cur_line == l);
-                                    if (is_current) {
-                                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.85f, 0.45f, 0.05f, 0.35f)));
-                                    }
-
-                                    // Col 0: Line #
-                                    ImGui::TableSetColumnIndex(0);
-                                    ImGui::Text("%02u", l);
-
-                                    // Col 1: Trig / Type
-                                    ImGui::TableSetColumnIndex(1);
-                                    ImGui::PushID(static_cast<int>(l));
-                                    if (ImGui::Checkbox("##Act", &note_col.active)) {
-                                        if (note_col.active && note_col.velocity == 0) note_col.velocity = 100;
-                                    }
-                                    ImGui::SameLine();
-                                    if (note_col.active) {
-                                        if (ImGui::SmallButton(note_col.is_slice ? "SLICE" : "NOTE")) {
-                                            note_col.is_slice = !note_col.is_slice;
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    // Col 2: Note / Slice
-                                    ImGui::TableSetColumnIndex(2);
-                                    if (note_col.active) {
-                                        if (note_col.is_slice) {
-                                            int s_id = static_cast<int>(note_col.slice_id);
-                                            ImGui::SetNextItemWidth(90);
-                                            if (ImGui::InputInt("##SliceId", &s_id, 1, 4)) {
-                                                note_col.slice_id = static_cast<uint16_t>(std::clamp(s_id, 0, 65535));
-                                            }
-                                        } else {
-                                            int n_off = static_cast<int>(note_col.note_offset);
-                                            ImGui::SetNextItemWidth(90);
-                                            if (ImGui::InputInt("##NoteOff", &n_off, 1, 12)) {
-                                                note_col.note_offset = static_cast<int8_t>(std::clamp(n_off, -60, 60));
-                                            }
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("...");
-                                    }
-
-                                    // Col 3: Velocity
-                                    ImGui::TableSetColumnIndex(3);
-                                    if (note_col.active) {
-                                        int vel = static_cast<int>(note_col.velocity);
-                                        ImGui::SetNextItemWidth(50);
-                                        if (ImGui::SliderInt("##Vel", &vel, 1, 127)) {
-                                            note_col.velocity = static_cast<uint8_t>(vel);
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    // Col 4: Delay Ticks
-                                    ImGui::TableSetColumnIndex(4);
-                                    if (note_col.active) {
-                                        int del = static_cast<int>(note_col.delay_ticks);
-                                        ImGui::SetNextItemWidth(65);
-                                        if (ImGui::SliderInt("##Del", &del, 0, 15)) {
-                                            note_col.delay_ticks = static_cast<uint8_t>(del);
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    // Col 5: Gate Ticks
-                                    ImGui::TableSetColumnIndex(5);
-                                    if (note_col.active) {
-                                        int gate = static_cast<int>(note_col.gate_ticks);
-                                        ImGui::SetNextItemWidth(65);
-                                        if (ImGui::SliderInt("##Gate", &gate, 1, 48)) {
-                                            note_col.gate_ticks = static_cast<uint16_t>(gate);
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    // Col 6: Ratchet Drill (Retrigger)
-                                    ImGui::TableSetColumnIndex(6);
-                                    if (note_col.active) {
-                                        int ratch = static_cast<int>(note_col.retrigger_ticks);
-                                        ImGui::SetNextItemWidth(75);
-                                        if (ImGui::SliderInt("##Ratch", &ratch, 0, 8, ratch == 0 ? "OFF" : "Every %d")) {
-                                            note_col.retrigger_ticks = static_cast<uint8_t>(ratch);
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    // Col 7: Probability
-                                    ImGui::TableSetColumnIndex(7);
-                                    if (note_col.active) {
-                                        int prob = static_cast<int>(note_col.probability);
-                                        ImGui::SetNextItemWidth(55);
-                                        if (ImGui::SliderInt("##Prob", &prob, 0, 100)) {
-                                            note_col.probability = static_cast<uint8_t>(prob);
-                                        }
-                                    } else {
-                                        ImGui::TextDisabled("--");
-                                    }
-
-                                    ImGui::PopID();
-                                }
-                                ImGui::EndTable();
-                            }
                         }
                     }
                     ImGui::EndChild();
