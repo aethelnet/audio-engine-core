@@ -34,7 +34,7 @@ inline std::shared_ptr<IProcessor> create_processor_by_name(std::string_view nam
         p = std::make_shared<dsp::Interstage>();
     } else if (name == "LiquidVactrol" || name == "LiquidVactrolProcessor" || name == "Liquid Vactrol Leveler") {
         p = std::make_shared<dsp::LiquidVactrolProcessor>(sample_rate);
-    } else if (name == "MultiHeadOde" || name == "MultiHeadOdeProcessor" || name == "Sovereign MultiHead ODE Compressor") {
+    } else if (name == "MultiHeadOde" || name == "MultiHeadOdeProcessor" || name == "MultiHeadOdeCompressor" || name == "Sovereign MultiHead ODE Compressor") {
         p = std::make_shared<dsp::MultiHeadOdeProcessor>(sample_rate);
     } else if (name == "LookaheadDnl" || name == "LookaheadDnlProcessor" || name == "Sovereign Lookahead Multiband DNL" || name == "MultibandDNL") {
         p = std::make_shared<dsp::LookaheadDnlProcessor>(sample_rate);
