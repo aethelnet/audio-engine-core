@@ -238,8 +238,6 @@ int main(int argc, char** argv) {
         drum_clip->channel(0)[i] = sample_waveform[i];
         drum_clip->channel(1)[i] = sample_waveform[i];
     }
-    trk0->set_clip(drum_clip, true);
-    trk0->set_sync_to_transport(true);
 
     // Load Acid Loop AudioClip into Track 1
     std::vector<float> acid_waveform = generate_synthetic_acid_loop(48000 * 4);
@@ -248,8 +246,6 @@ int main(int argc, char** argv) {
         acid_clip->channel(0)[i] = acid_waveform[i];
         acid_clip->channel(1)[i] = acid_waveform[i];
     }
-    trk1->set_clip(acid_clip, true);
-    trk1->set_sync_to_transport(true);
 
     // Load Vocal Chops AudioClip into Track 2
     std::vector<float> vocal_waveform = generate_synthetic_vocal_chops(48000 * 4);
@@ -258,8 +254,6 @@ int main(int argc, char** argv) {
         vocal_clip->channel(0)[i] = vocal_waveform[i];
         vocal_clip->channel(1)[i] = vocal_waveform[i];
     }
-    trk2->set_clip(vocal_clip, true);
-    trk2->set_sync_to_transport(true);
 
     // Initialize Track 3 (Percussion / Bus audio)
     auto perc_clip = std::make_shared<sampling::AudioClip>("Drums / Bus", kSampleRate, 2, static_cast<uint32_t>(sample_waveform.size()));
@@ -267,8 +261,6 @@ int main(int argc, char** argv) {
         perc_clip->channel(0)[i] = sample_waveform[i] * 0.7f;
         perc_clip->channel(1)[i] = sample_waveform[i] * 0.7f;
     }
-    trk3->set_clip(perc_clip, true);
-    trk3->set_sync_to_transport(true);
 
     // Auto-slice clips into 8-slice grids for StepSequencers
     if (drum_clip->slices().empty()) drum_clip->slice_grid(8);
@@ -627,10 +619,6 @@ int main(int argc, char** argv) {
         track_clips[t] = clip;
         if (clip->slices().empty()) clip->slice_grid(8);
         if (track_seq[t]) track_seq[t]->set_clip(clip);
-        if (t == 0) trk0->set_clip(clip, true);
-        else if (t == 1) trk1->set_clip(clip, true);
-        else if (t == 2) trk2->set_clip(clip, true);
-        else if (t == 3) trk3->set_clip(clip, true);
 
         if (!track_arranger_clips[t].empty()) {
             int sel_idx = std::clamp(g_selected_clip_idx, 0, static_cast<int>(track_arranger_clips[t].size() - 1));
@@ -1915,44 +1903,47 @@ int main(int argc, char** argv) {
                                         const uint32_t total_f = clip_ptr->num_frames();
                                         float wf_mid_y = ly + lane_h * 0.58f;
                                         float max_h = (lane_h - 18.0f) * 0.42f;
-                                        float clip_content_w = clip_x2 - clip_x1 - 8.0f;
-                                        int num_bars_draw = static_cast<int>(clip_content_w / 3.0f);
-                                        num_bars_draw = std::clamp(num_bars_draw, 4, 250);
+                                        float vis_x1 = std::max(clip_x1 + 3.0f, canvas_pos.x);
+                                        float vis_x2 = std::min(clip_x2 - 3.0f, canvas_pos.x + canvas_size.x);
+                                        const float* ch1 = (clip_ptr->num_channels() > 1 && clip_ptr->channel(1)) ? clip_ptr->channel(1) : nullptr;
 
-                                        double clip_bpm = (clip_ptr->bpm() > 10.0) ? clip_ptr->bpm() : 120.0;
-                                        uint32_t sr = clip_ptr->sample_rate();
-                                        uint32_t offset_f = c.start_offset_frames;
-                                        double clip_dur_sec = (c.len_bars * 4.0 / clip_bpm) * 60.0;
-                                        uint32_t visible_window_f = static_cast<uint32_t>(clip_dur_sec * static_cast<double>(sr));
-                                        if (visible_window_f == 0 || visible_window_f > total_f) visible_window_f = total_f;
+                                        if (vis_x1 < vis_x2) {
+                                            constexpr float step_px = 2.0f;
+                                            for (float px = vis_x1; px < vis_x2; px += step_px) {
+                                                float bar_s = x_to_bar(px);
+                                                float bar_e = x_to_bar(px + step_px);
+                                                float rel_b_s = std::clamp(bar_s - c.start_bar, 0.0f, c.len_bars);
+                                                float rel_b_e = std::clamp(bar_e - c.start_bar, 0.0f, c.len_bars);
+                                                if (rel_b_e <= rel_b_s) continue;
 
-                                        for (int wb = 0; wb < num_bars_draw; ++wb) {
-                                            float bx = clip_x1 + 4.0f + wb * 3.0f;
-                                            uint32_t f_start = 0, f_end = 0;
-                                            if (!c.warp_pins.empty()) {
-                                                float rel_b_s = (static_cast<float>(wb) / num_bars_draw) * c.len_bars;
-                                                float rel_b_e = (static_cast<float>(wb + 1) / num_bars_draw) * c.len_bars;
-                                                f_start = static_cast<uint32_t>(c.evaluate_warped_frame(rel_b_s, total_f));
-                                                f_end = static_cast<uint32_t>(c.evaluate_warped_frame(rel_b_e, total_f));
-                                                f_start %= total_f;
-                                                f_end %= total_f;
-                                            } else {
-                                                uint32_t rel_s = static_cast<uint32_t>((static_cast<float>(wb) / num_bars_draw) * visible_window_f);
-                                                uint32_t rel_e = static_cast<uint32_t>((static_cast<float>(wb + 1) / num_bars_draw) * visible_window_f);
-                                                f_start = (offset_f + rel_s) % total_f;
-                                                f_end = (offset_f + rel_e) % total_f;
+                                                double raw_s = c.evaluate_warped_frame(rel_b_s, total_f);
+                                                double raw_e = c.evaluate_warped_frame(rel_b_e, total_f);
+                                                double frame_s = std::fmod(raw_s, static_cast<double>(total_f));
+                                                if (frame_s < 0.0) frame_s += total_f;
+                                                double frame_e = std::fmod(raw_e, static_cast<double>(total_f));
+                                                if (frame_e < 0.0) frame_e += total_f;
+
+                                                uint32_t f_start = static_cast<uint32_t>(std::clamp(frame_s, 0.0, static_cast<double>(total_f - 1)));
+                                                uint32_t f_end = static_cast<uint32_t>(std::clamp(frame_e, 0.0, static_cast<double>(total_f)));
+                                                if (f_end <= f_start) f_end = total_f;
+
+                                                float peak_val = 0.0f;
+                                                uint32_t span = f_end - f_start;
+                                                uint32_t stride = std::max(1u, span / 32u);
+                                                for (uint32_t fi = f_start; fi < f_end; fi += stride) {
+                                                    float s = std::abs(ch0[fi]);
+                                                    if (ch1) s = std::max(s, std::abs(ch1[fi]));
+                                                    if (s > peak_val) peak_val = s;
+                                                }
+
+                                                float col_bar = 0.5f * (bar_s + bar_e);
+                                                peak_val *= c.evaluate_gain_at_bar(col_bar);
+
+                                                float h = std::clamp(peak_val * max_h, 1.0f, max_h);
+                                                draw_list->AddLine(ImVec2(px, wf_mid_y - h),
+                                                                   ImVec2(px, wf_mid_y + h),
+                                                                   is_sel ? ImColor(31, 97, 217, 160) : ImColor(100, 130, 170, 130), 1.5f);
                                             }
-                                            if (f_end <= f_start) f_end = total_f;
-
-                                            float peak_val = 0.0f;
-                                            uint32_t stride = std::max(1u, (f_end - f_start) / 16u);
-                                            for (uint32_t fi = f_start; fi < f_end; fi += stride) {
-                                                peak_val = std::max(peak_val, std::abs(ch0[fi]));
-                                            }
-                                            float h = std::clamp(peak_val * max_h, 1.0f, max_h);
-                                            draw_list->AddLine(ImVec2(bx, wf_mid_y - h),
-                                                               ImVec2(bx, wf_mid_y + h),
-                                                               is_sel ? ImColor(31, 97, 217, 150) : ImColor(100, 130, 170, 120), 1.5f);
                                         }
 
                                         // Transient Markers (Unpinned ticks)
@@ -3001,7 +2992,8 @@ int main(int argc, char** argv) {
                                         }
 
                                         if (ImGui::Button(slot_btn_lbl, ImVec2(150, 32))) {
-                                            mixer.launch_track_clip(t, s - 1, sequencer::LaunchQuantize::Bar, false);
+                                            uint32_t target_trk_id = trk ? trk->id() : static_cast<uint32_t>(t + 1);
+                                            mixer.launch_track_clip(target_trk_id, s - 1, sequencer::LaunchQuantize::Bar, false);
                                             std::snprintf(status_toast, sizeof(status_toast), "TRACK %d CLIP %d (%s) QUEUED FOR NEXT DOWNBEAT",
                                                           t + 1, s, slot_info.name.c_str());
                                         }
@@ -3020,7 +3012,8 @@ int main(int argc, char** argv) {
                                 ImGui::BeginGroup();
                                 {
                                     if (ImGui::Button("■ STOP TRACK##stpt", ImVec2(100, 32))) {
-                                        mixer.stop_track_clip(t, sequencer::LaunchQuantize::Bar);
+                                        uint32_t target_trk_id = trk ? trk->id() : static_cast<uint32_t>(t + 1);
+                                        mixer.stop_track_clip(target_trk_id, sequencer::LaunchQuantize::Bar);
                                         std::snprintf(status_toast, sizeof(status_toast), "TRACK %d STOPPING AT NEXT BAR", t + 1);
                                     }
                                     ImGui::TextDisabled("Bar-Quantized");
@@ -4133,39 +4126,95 @@ int main(int argc, char** argv) {
                         ImGui::PushID(t);
                         ImGui::BeginChild(track_names[t], ImVec2(240, 0), true);
                         {
-                            // Track header
+                            // Track header with instant A/B DSP Audition toggle
+                            auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
                             bool is_sel = (selected_track == t);
-                            if (ImGui::Selectable(track_names[t], is_sel)) {
+                            if (ImGui::Selectable(track_names[t], is_sel, 0, ImVec2(120, 22))) {
                                 selected_track = t;
+                            }
+                            ImGui::SameLine();
+                            bool dsp_bypassed = trk_ptr ? trk_ptr->is_dsp_bypassed() : false;
+                            if (dsp_bypassed) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.45f, 0.05f, 1.0f)); // Bright Orange DRY
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                if (ImGui::Button("DRY (RAW)##DspBypass", ImVec2(95, 22))) {
+                                    if (trk_ptr) trk_ptr->set_dsp_bypass(false);
+                                }
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.85f, 1.0f)); // Sapphire Blue DSP ON
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                if (ImGui::Button("DSP ACTIVE##DspBypass", ImVec2(95, 22))) {
+                                    if (trk_ptr) trk_ptr->set_dsp_bypass(true);
+                                }
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::SetTooltip("Instant A/B DSP Auditioning:\n[DSP ACTIVE] = Inserts 1-4 + Console Harmonic Saturation enabled\n[DRY (RAW)] = Full Insert & Console bypass to hear pure source recording");
                             }
                             ImGui::Separator();
 
-                            // INPUT SELECTION & PRE-INSERT GAIN/PHASE STAGING
-                            auto* trk_ptr = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                            // TACTILE SOURCE SELECTION: [ TIMELINE ] [ LIVE IN ] [ MERGE ]
                             TrackInputMode in_mode = trk_ptr ? trk_ptr->input_mode() : TrackInputMode::InternalClip;
-                            const char* mode_labels[4] = { "CLIP", "PIPEWIRE", "MERGE", "AOIP" };
-                            int cur_mode_idx = static_cast<int>(in_mode);
+                            bool is_timeline = (in_mode == TrackInputMode::InternalClip);
+                            bool is_live = (in_mode == TrackInputMode::PipeWireStream);
+                            bool is_merge = (in_mode == TrackInputMode::MergeAll);
 
-                            // Row 1: Input Mode & Phase Invert Button
-                            ImGui::TextDisabled("In:");
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(90);
-                            if (ImGui::Combo("##InMode", &cur_mode_idx, mode_labels, 4)) {
+                            // Segmented Source Selection Row
+                            if (is_timeline) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.75f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+                            }
+                            if (ImGui::Button("TIMELINE##src", ImVec2(68, 22))) {
                                 if (trk_ptr) {
-                                    auto new_mode = static_cast<TrackInputMode>(cur_mode_idx);
-                                    trk_ptr->set_input_mode(new_mode);
-                                    if (new_mode == TrackInputMode::InternalClip) {
-                                        pw.unlink_all_for_track(t + 1);
-                                    }
+                                    trk_ptr->set_input_mode(TrackInputMode::InternalClip);
+                                    pw.unlink_all_for_track(t + 1);
                                 }
                             }
-                            ImGui::SameLine();
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hear ONLY Timeline Arranger recordings.\n(Silence outside clips, zero microphone/line leakage)");
+
+                            ImGui::SameLine(0, 3);
+
+                            if (is_live) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.65f, 0.40f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+                            }
+                            if (ImGui::Button("LIVE IN##src", ImVec2(60, 22))) {
+                                if (trk_ptr) trk_ptr->set_input_mode(TrackInputMode::PipeWireStream);
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hear ONLY Live External Input (Microphone / Audio Interface stream)");
+
+                            ImGui::SameLine(0, 3);
+
+                            if (is_merge) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.48f, 0.05f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+                            }
+                            if (ImGui::Button("MERGE##src", ImVec2(52, 22))) {
+                                if (trk_ptr) trk_ptr->set_input_mode(TrackInputMode::MergeAll);
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sum Timeline recordings + Live external microphone input together");
+
+                            ImGui::SameLine(0, 4);
+
+                            // Phase Invert Button
                             bool phase_inv = trk_ptr ? trk_ptr->input_phase_invert() : false;
                             if (phase_inv) {
                                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
                                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                             }
-                            if (ImGui::Button("Ø##Phase", ImVec2(26, 20))) {
+                            if (ImGui::Button("Ø##Phase", ImVec2(24, 22))) {
                                 if (trk_ptr) trk_ptr->set_input_phase_invert(!phase_inv);
                             }
                             if (phase_inv) ImGui::PopStyleColor(2);

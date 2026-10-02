@@ -103,6 +103,7 @@ public:
         m_input_phase_invert.store(false, std::memory_order_relaxed);
         m_input_meter_peak_l.store(0.0f, std::memory_order_relaxed);
         m_input_meter_peak_r.store(0.0f, std::memory_order_relaxed);
+        m_dsp_bypass.store(false, std::memory_order_relaxed);
         for (auto& s : m_sends) {
             s.active = false;
         }
@@ -405,6 +406,9 @@ public:
     [[nodiscard]] std::pair<float, float> input_meter() const noexcept {
         return { m_input_meter_peak_l.load(std::memory_order_relaxed), m_input_meter_peak_r.load(std::memory_order_relaxed) };
     }
+
+    void set_dsp_bypass(bool bypass) noexcept { m_dsp_bypass.store(bypass, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_dsp_bypassed() const noexcept { return m_dsp_bypass.load(std::memory_order_relaxed); }
 
     void set_console_type(dsp::ConsoleType type) noexcept {
         m_console.set_type(type);
@@ -735,29 +739,31 @@ public:
         m_input_meter_peak_r.store(in_peak_r, std::memory_order_relaxed);
 
         // 1. Process Modular Insert Slots (Baxandall EQ, ButterComp2, MultiHeadOde, PurestDrive, WASM)
-        for (size_t s = 0; s < m_slots.size(); ++s) {
-            auto* proc = m_slots[s].processor();
-            if (proc) {
-                const uint32_t num_p = std::min<uint32_t>(static_cast<uint32_t>(kMaxSlotParams), proc->parameter_count());
-                for (uint32_t p = 0; p < num_p; ++p) {
-                    if (m_slot_automation_enabled[s][p].load(std::memory_order_relaxed)) {
-                        float val = m_slot_curves[s][p].evaluate_audio_sample(start_beat);
-                        proc->set_parameter(p, val);
+        if (!m_dsp_bypass.load(std::memory_order_relaxed)) {
+            for (size_t s = 0; s < m_slots.size(); ++s) {
+                auto* proc = m_slots[s].processor();
+                if (proc) {
+                    const uint32_t num_p = std::min<uint32_t>(static_cast<uint32_t>(kMaxSlotParams), proc->parameter_count());
+                    for (uint32_t p = 0; p < num_p; ++p) {
+                        if (m_slot_automation_enabled[s][p].load(std::memory_order_relaxed)) {
+                            float val = m_slot_curves[s][p].evaluate_audio_sample(start_beat);
+                            proc->set_parameter(p, val);
+                        }
                     }
                 }
+
+                const Sample* sc_l = nullptr;
+                const Sample* sc_r = nullptr;
+                if (matrix && matrix->has_track_sidechain(m_id, static_cast<uint32_t>(s))) {
+                    sc_l = matrix->track_sidechain_l(m_id, static_cast<uint32_t>(s));
+                    sc_r = matrix->track_sidechain_r(m_id, static_cast<uint32_t>(s));
+                }
+                m_slots[s].process_stereo(left, right, frames, sc_l, sc_r);
             }
 
-            const Sample* sc_l = nullptr;
-            const Sample* sc_r = nullptr;
-            if (matrix && matrix->has_track_sidechain(m_id, static_cast<uint32_t>(s))) {
-                sc_l = matrix->track_sidechain_l(m_id, static_cast<uint32_t>(s));
-                sc_r = matrix->track_sidechain_r(m_id, static_cast<uint32_t>(s));
-            }
-            m_slots[s].process_stereo(left, right, frames, sc_l, sc_r);
+            // 2. In-line Console Encode (Airwindows EveryConsole)
+            m_console.process_stereo(left, right, frames);
         }
-
-        // 2. In-line Console Encode (Airwindows EveryConsole)
-        m_console.process_stereo(left, right, frames);
 
         // 3. Measure Telemetry (Peak & RMS)
         float peak_l = 0.0f, peak_r = 0.0f;
@@ -874,6 +880,7 @@ private:
     std::atomic<bool> m_input_phase_invert{false};
     std::atomic<float> m_input_meter_peak_l{0.0f};
     std::atomic<float> m_input_meter_peak_r{0.0f};
+    std::atomic<bool> m_dsp_bypass{false};
     modulation::PolyphonicSynth* m_poly_synth{nullptr};
     modulation::ModulationMatrix* m_mod_matrix{nullptr};
     sampling::VariSpeedStreamer m_streamer;
