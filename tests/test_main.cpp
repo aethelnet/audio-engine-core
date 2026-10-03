@@ -1,3 +1,6 @@
+#undef NDEBUG
+#include <cassert>
+
 #include "audio_core/ring_buffer.hpp"
 #include "audio_core/dsp/oscillator.hpp"
 #include "audio_core/dsp/biquad_filter.hpp"

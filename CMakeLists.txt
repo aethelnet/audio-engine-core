@@ -127,6 +127,7 @@ add_executable(audio_tests
     tests/test_main.cpp
 )
 target_link_libraries(audio_tests PRIVATE audio_core)
+target_compile_options(audio_tests PRIVATE -UNDEBUG)
 
 add_test(NAME AudioCoreTestSuite COMMAND audio_tests)
 

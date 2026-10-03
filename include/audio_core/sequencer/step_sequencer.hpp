@@ -483,11 +483,9 @@ public:
             out_r[i] = 0.0f;
         }
 
-        // Ensure internal send buffers have at least frames capacity
-        if (m_send_a_buffer.num_frames() < frames) {
-            m_send_a_buffer.resize(2, frames);
-            m_send_b_buffer.resize(2, frames);
-        }
+        // Real-Time Safety (Pillar II): internal send buffers are pre-allocated (8192 frames).
+        // Zero allocations in the DSP path.
+        const uint32_t render_frames = std::min(frames, static_cast<uint32_t>(m_send_a_buffer.num_frames()));
 
         Sample* s_a_l_ptr = m_send_a_buffer.channel(0);
         Sample* s_a_r_ptr = m_send_a_buffer.channel(1);
@@ -990,8 +988,10 @@ private:
             target->filter_enabled = false;
         }
 
-        target->fade_in_remaining = kMicroFadeFrames;
-        target->fade_in_total = kMicroFadeFrames;
+        // Fresh one-shot voice trigger preserves attack transient 1:1 (zero initial fade-in).
+        // Micro-fade out (anti-click) is applied exclusively to choked playing voices.
+        target->fade_in_remaining = 0;
+        target->fade_in_total = 0;
         target->is_fading_out = false;
     }
 
@@ -1134,8 +1134,8 @@ private:
 
     RingBuffer<ManualTrigger> m_manual_queue;
 
-    AudioBuffer m_send_a_buffer{2, 2048};
-    AudioBuffer m_send_b_buffer{2, 2048};
+    AudioBuffer m_send_a_buffer{2, 8192};
+    AudioBuffer m_send_b_buffer{2, 8192};
 };
 
 } // namespace audio_core::sequencer
