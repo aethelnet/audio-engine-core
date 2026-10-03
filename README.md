@@ -229,3 +229,22 @@ We express our gratitude to Chris Johnson for his monumental contribution to ope
 
 Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.  
 See [`LICENSE`](LICENSE) for the full license text.
+
+---
+
+## 8. Architectural Roadmap: Film Post-Production, Frame-Locked Hierarchies & Multi-User Sync
+
+To serve demanding film, broadcast, and game post-production pipelines alongside music production, the following milestone extensions are scheduled:
+
+### 8.1 Frame-Locked SMPTE Timecode & Sub-Frame Video Anchor Points
+- **Standard Timecode Engines**: Direct support for 23.976, 24, 25, 29.97 DF/NDF, 30, and 59.94/60 fps with sub-frame sample-accurate anchor points.
+- **Picture-Lock Clamping**: Audio clips and automation nodes can be tethered directly to video frame indices rather than musical bars/beats, guaranteeing zero drift across picture re-edits and frame-rate conversions.
+
+### 8.2 Hierarchical Clip Groups & Relational Motion (Parent-Child Anchor Graphs)
+- **Decoupled from Audio Bus Routing**: Distinct separation between audio signal routing (e.g. Dialogue Bus, Foley Aux, Music Stem) and **Motion Hierarchies**.
+- **Relational Movement**: Linking secondary tracks (ADR, Foley, Room Tone, Sound Design) to primary anchor clips (e.g. Lead Dialogue). When an editor shifts, slips, or ripples the dialogue cut, all dependent tracks move in lockstep without requiring flat group tracks.
+- **Hierarchical Automation Offsetting**: Parent movement translates relative child automation lanes without destructive flattening.
+
+### 8.3 Multi-User Real-Time Project Collaboration (CRDT Engine)
+- **Distributed Session Graph**: Conflict-Free Replicated Data Types (CRDT / Yjs-inspired protocol) over WebSocket / AoIP.
+- **Concurrent Non-Destructive Editing**: Allows Foley artists, dialogue editors, and sound designers to work simultaneously within the same session timeline with lane-level locking, live cursor ghosting, and deterministic operational transformation.

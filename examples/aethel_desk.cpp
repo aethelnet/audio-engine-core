@@ -578,16 +578,30 @@ int main(int argc, char** argv) {
     static bool g_track_phrase_arp_enabled[4] = { false, true, false, false }; // Default Track 2 (Acid Lead) armed with phrase arp
     static int g_track_phrase_assigned[4] = { 0, 0, 1, 0 }; // Phrase index mapped to track
 
-    // Unified Pattern Studio Mode (FL Studio Channel Rack vs Renoise Multi-Tracker)
+    // Unified Pattern Studio Mode (FL Studio Channel Rack vs Renoise Multi-Tracker vs GridPie Live Matrix)
     enum class SequencerViewMode : uint8_t {
-        FlChannelRack = 0,      // Horizontal Multi-Track Step Rack (FL Studio style)
-        RenoiseMultiTracker = 1 // Vertical Multi-Track Pattern Matrix (Renoise style)
+        FlChannelRack = 0,       // Horizontal Multi-Track Step Rack (FL Studio style)
+        RenoiseMultiTracker = 1, // Vertical Multi-Track Pattern Matrix (Renoise style)
+        GridPieLiveMatrix = 2    // Renoise GridPie / Ableton-style Live Remix Matrix
     };
     static SequencerViewMode g_seq_view_mode = SequencerViewMode::FlChannelRack;
     static bool g_seq_show_phrase_lab = false;
     static bool g_tracker_auto_scroll = true;
     static int g_tracker_last_scrolled_line = -1;
     static int g_tracker_lines_preset = 16;
+
+    // Renoise GridPie Scene Presets & Live Remix State
+    struct GridPieScene {
+        char name[32];
+        uint32_t track_patterns[4];
+    };
+    static std::array<GridPieScene, 4> g_gridpie_scenes = {{
+        { "Intro Groove", {0, 0, 0, 0} },
+        { "Main Drop",    {1, 1, 1, 1} },
+        { "Half-Time",    {2, 2, 2, 2} },
+        { "Breakdown",    {3, 3, 3, 3} }
+    }};
+    static int g_gridpie_active_scene = 0;
 
     auto sync_step_to_phrase = [](const sequencer::Pattern& pat, sequencer::InstrumentPhrase& phr, uint32_t tpl) {
         phr.num_lines = std::clamp(pat.num_steps, 16u, 64u);
@@ -779,6 +793,53 @@ int main(int argc, char** argv) {
         ));
         std::snprintf(status_toast, sizeof(status_toast), "STAMPED PATTERN %d TO TRACK %d AT BAR %.2f",
                       p_idx + 1, t + 1, snap_bar + 1.0f);
+    };
+
+    auto bake_gridpie_scene_to_arranger = [&]() {
+        float cur_p_bar = playhead_seconds / get_seconds_per_bar(bpm);
+        float snap_bar = std::floor(cur_p_bar * 4.0f) * 0.25f;
+        float max_len_bars = 1.0f;
+        int baked_count = 0;
+
+        for (int t = 0; t < 4; ++t) {
+            auto seq = track_seq[t];
+            Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+            if (!seq || !trk || !trk->is_sequencer_enabled()) continue;
+
+            uint32_t p_idx = seq->current_pattern_index();
+            auto before = trk->arranger().clips();
+            sequencer::ArrangerClipInstance pat_inst;
+            pat_inst.type = sequencer::ArrangerClipType::Pattern;
+            pat_inst.pattern_index = p_idx;
+            pat_inst.clip = seq->clip() ? seq->clip() : track_clips[t];
+            pat_inst.name = "PAT " + std::to_string(p_idx + 1) + ": " + seq->pattern(p_idx).name;
+            pat_inst.start_bar = snap_bar;
+            float dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 16.0f;
+            if (seq->pattern(p_idx).subdivision == sequencer::StepSubdivision::ThirtySecond)
+                dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 32.0f;
+            else if (seq->pattern(p_idx).subdivision == sequencer::StepSubdivision::Eighth)
+                dur_bars = static_cast<float>(seq->pattern(p_idx).num_steps) / 8.0f;
+            pat_inst.len_bars = std::max(dur_bars, 0.25f);
+            pat_inst.base_len_bars = pat_inst.len_bars;
+            pat_inst.orig_len_bars = pat_inst.len_bars;
+            max_len_bars = std::max(max_len_bars, pat_inst.len_bars);
+
+            trk->arranger().add_clip(pat_inst);
+            track_arranger_clips[t] = trk->arranger().clips();
+            g_undo_mgr.push_action(std::make_unique<undo::ArrangerSingleTrackAction>(
+                trk, before, track_arranger_clips[t], "Bake GridPie Clip '" + pat_inst.name + "'"
+            ));
+            baked_count++;
+        }
+
+        if (baked_count > 0) {
+            // Auto-advance playhead by baked duration so successive Ctrl+B presses stitch contiguous scenes
+            playhead_seconds = (snap_bar + max_len_bars) * get_seconds_per_bar(bpm);
+            std::snprintf(status_toast, sizeof(status_toast), "GRIDPIE BAKED %d TRACKS TO ARRANGER AT BAR %.2f (ADVANCED +%.1fb)",
+                          baked_count, snap_bar + 1.0f, max_len_bars);
+        } else {
+            std::snprintf(status_toast, sizeof(status_toast), "GRIDPIE BAKE: NO TRACK SEQUENCERS ENABLED (CLICK 'ON' FIRST)");
+        }
     };
 
     // SampleTap Recorder & Quantized Bouncer State
@@ -1584,6 +1645,8 @@ int main(int argc, char** argv) {
                     }
                 } else if (ImGui::GetIO().KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                     stamp_pattern_to_arranger(selected_track, pattern_editor_pat_idx);
+                } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_B)) {
+                    bake_gridpie_scene_to_arranger();
                 }
             }
 
@@ -4208,6 +4271,20 @@ int main(int argc, char** argv) {
                             }
                             ImGui::PopStyleColor(2);
 
+                            ImGui::SameLine(0, 4);
+                            bool is_gp_view = (g_seq_view_mode == SequencerViewMode::GridPieLiveMatrix);
+                            if (is_gp_view) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.65f, 0.35f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.70f, 0.80f, 1.0f));
+                            }
+                            if (ImGui::SmallButton(" [⊞] GRIDPIE LIVE MATRIX (REMIX) ")) {
+                                g_seq_view_mode = SequencerViewMode::GridPieLiveMatrix;
+                            }
+                            ImGui::PopStyleColor(2);
+
                             ImGui::SameLine(0, 10);
                             if (g_seq_show_phrase_lab) {
                                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.35f, 0.45f, 1.0f));
@@ -4297,6 +4374,15 @@ int main(int argc, char** argv) {
                             }
                             ImGui::PopStyleColor(2);
                             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Instantiate current pattern into Timeline Arranger at playhead.");
+
+                            ImGui::SameLine(0, 6);
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.60f, 0.35f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            if (ImGui::SmallButton("⤓ BAKE SCENE (Ctrl+B)##gp_bake_hdr")) {
+                                bake_gridpie_scene_to_arranger();
+                            }
+                            ImGui::PopStyleColor(2);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bakes the active pattern combination of all 4 tracks to Timeline Arranger at playhead.");
 
                             // Pattern Swing Slider
                             ImGui::SameLine(0, 10);
@@ -4412,7 +4498,11 @@ int main(int argc, char** argv) {
 
                                         char st_lbl[24];
                                         if (st_act) {
-                                            std::snprintf(st_lbl, sizeof(st_lbl), "S%u##%d_%d", t_pat.steps[st].slice_id, t, st);
+                                            if (t_pat.steps[st].ratchet_count > 1) {
+                                                std::snprintf(st_lbl, sizeof(st_lbl), "S%u:R%u##%d_%d", t_pat.steps[st].slice_id, t_pat.steps[st].ratchet_count, t, st);
+                                            } else {
+                                                std::snprintf(st_lbl, sizeof(st_lbl), "S%u##%d_%d", t_pat.steps[st].slice_id, t, st);
+                                            }
                                             ImVec4 active_col;
                                             if (t == 0) active_col = ImVec4(0.15f, 0.45f, 0.90f, 0.95f);      // Drum Blue
                                             else if (t == 1) active_col = ImVec4(0.12f, 0.65f, 0.45f, 0.95f); // Acid Green
@@ -4674,6 +4764,14 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine(0, 15);
                                 ImGui::TextDisabled("[Left-click select/toggle | Right-click clear]");
 
+                                uint32_t num_tracker_lines = static_cast<uint32_t>(g_tracker_lines_preset);
+                                for (int t = 0; t < 4; ++t) {
+                                    if (track_seq[t]) {
+                                        num_tracker_lines = std::max(num_tracker_lines, track_seq[t]->pattern(pattern_editor_pat_idx).num_steps);
+                                    }
+                                }
+                                num_tracker_lines = std::clamp(num_tracker_lines, 16u, 64u);
+
                                 if (ImGui::BeginTable("RenoiseMultiTrackerTable", 5,
                                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                                       ImGuiTableFlags_ScrollY, ImVec2(0, 270))) {
@@ -4689,13 +4787,6 @@ int main(int argc, char** argv) {
                                     ImGui::TableHeadersRow();
 
                                     uint32_t active_step = seq->current_step_index();
-                                    uint32_t num_tracker_lines = static_cast<uint32_t>(g_tracker_lines_preset);
-                                    for (int t = 0; t < 4; ++t) {
-                                        if (track_seq[t]) {
-                                            num_tracker_lines = std::max(num_tracker_lines, track_seq[t]->pattern(pattern_editor_pat_idx).num_steps);
-                                        }
-                                    }
-                                    num_tracker_lines = std::clamp(num_tracker_lines, 16u, 64u);
 
                                     if (!seq_running) {
                                         g_tracker_last_scrolled_line = -1;
@@ -4742,11 +4833,15 @@ int main(int argc, char** argv) {
                                             if (step.active) {
                                                 char cell_txt[48];
                                                 int hex_vel = static_cast<int>(std::round(step.velocity * 127.0f));
+                                                char r_sfx[12] = "";
+                                                if (step.ratchet_count > 1) {
+                                                    std::snprintf(r_sfx, sizeof(r_sfx), " R%u", step.ratchet_count);
+                                                }
                                                 if (step.pitch_ratio > 0.01f && std::abs(step.pitch_ratio - 1.0f) > 1e-3f) {
                                                     int semi = static_cast<int>(std::round(12.0f * std::log2(step.pitch_ratio)));
-                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u %+2d %02X##c", step.slice_id, semi, hex_vel);
+                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u %+2d %02X%s##c", step.slice_id, semi, hex_vel, r_sfx);
                                                 } else {
-                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u -- %02X##c", step.slice_id, hex_vel);
+                                                    std::snprintf(cell_txt, sizeof(cell_txt), "S%02u -- %02X%s##c", step.slice_id, hex_vel, r_sfx);
                                                 }
 
                                                 ImVec4 cell_col;
@@ -4787,6 +4882,261 @@ int main(int argc, char** argv) {
                                     }
                                     ImGui::EndTable();
                                 }
+
+                                // Renoise Tracker Keyboard Navigation & Step Editing
+                                if (!ImGui::GetIO().WantTextInput) {
+                                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                                        if (pattern_editor_step_idx > 0) pattern_editor_step_idx--;
+                                        else pattern_editor_step_idx = static_cast<int>(num_tracker_lines - 1);
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                                        if (pattern_editor_step_idx < static_cast<int>(num_tracker_lines - 1)) pattern_editor_step_idx++;
+                                        else pattern_editor_step_idx = 0;
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                                        if (selected_track > 0) selected_track--;
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                                        if (selected_track < 3) selected_track++;
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+                                        auto t_seq = track_seq[selected_track];
+                                        if (t_seq) {
+                                            auto& t_pat = t_seq->pattern(pattern_editor_pat_idx);
+                                            t_pat.toggle_step(pattern_editor_step_idx, 0, 0.9f);
+                                        }
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+                                        auto t_seq = track_seq[selected_track];
+                                        if (t_seq) {
+                                            t_seq->pattern(pattern_editor_pat_idx).steps[pattern_editor_step_idx].active = false;
+                                        }
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+                                        if (!ImGui::GetIO().KeyCtrl) {
+                                            auto t_seq = track_seq[selected_track];
+                                            if (t_seq) {
+                                                auto& st_ref = t_seq->pattern(pattern_editor_pat_idx).steps[pattern_editor_step_idx];
+                                                t_seq->trigger_slice(st_ref.active ? st_ref.slice_id : 0, st_ref.active ? st_ref.velocity : 0.9f);
+                                            }
+                                        }
+                                    } else if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+                                        auto t_seq = track_seq[selected_track];
+                                        if (t_seq) {
+                                            auto& st_ref = t_seq->pattern(pattern_editor_pat_idx).steps[pattern_editor_step_idx];
+                                            if (!st_ref.active) {
+                                                st_ref.active = true;
+                                                st_ref.ratchet_count = 2;
+                                            } else {
+                                                st_ref.ratchet_count = (st_ref.ratchet_count >= 4) ? 1 : (st_ref.ratchet_count + 1);
+                                            }
+                                            std::snprintf(status_toast, sizeof(status_toast), "TRK %d LINE %02d: RATCHET %dx",
+                                                          selected_track + 1, pattern_editor_step_idx, st_ref.ratchet_count);
+                                        }
+                                    } else {
+                                        for (int k = 0; k < 8; ++k) {
+                                            if (ImGui::IsKeyPressed(static_cast<ImGuiKey>(ImGuiKey_1 + k))) {
+                                                auto t_seq = track_seq[selected_track];
+                                                if (t_seq) {
+                                                    auto& st_ref = t_seq->pattern(pattern_editor_pat_idx).steps[pattern_editor_step_idx];
+                                                    st_ref.active = true;
+                                                    st_ref.slice_id = static_cast<uint32_t>(k);
+                                                    std::snprintf(status_toast, sizeof(status_toast), "TRK %d LINE %02d: SLICE %d",
+                                                                  selected_track + 1, pattern_editor_step_idx, k);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ========================================================
+                            // PERSPECTIVE 3: RENOISE GRIDPIE LIVE MATRIX (SCENE REMIX)
+                            // ========================================================
+                            if (g_seq_view_mode == SequencerViewMode::GridPieLiveMatrix) {
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.18f, 0.75f, 0.40f, 1.0f), "RENOISE GRIDPIE // 4-TRACK PATTERN MATRIX & LIVE SCENE REMIX:");
+                                ImGui::SameLine(0, 15);
+                                ImGui::TextDisabled("Quantization: BAR-SYNC");
+                                ImGui::SameLine(0, 15);
+                                ImGui::TextDisabled("[Left-click Launch/Queue | Right-click Edit Pattern]");
+
+                                // Grid Matrix: 4 Tracks (rows) x 4 Patterns (cols)
+                                if (ImGui::BeginTable("GridPieMatrixTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, 150))) {
+                                    ImGui::TableSetupColumn("TRACK", ImGuiTableColumnFlags_WidthFixed, 130);
+                                    ImGui::TableSetupColumn("PATTERN 1", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("PATTERN 2", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("PATTERN 3", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("PATTERN 4", ImGuiTableColumnFlags_WidthStretch);
+                                    ImGui::TableSetupColumn("STATUS", ImGuiTableColumnFlags_WidthFixed, 85);
+                                    ImGui::TableHeadersRow();
+
+                                    for (int t = 0; t < 4; ++t) {
+                                        ImGui::TableNextRow();
+                                        auto t_seq = track_seq[t];
+                                        Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                        if (!t_seq || !trk) continue;
+
+                                        uint32_t active_p = t_seq->current_pattern_index();
+                                        bool has_queued = t_seq->has_queued_pattern();
+                                        uint32_t queued_p = t_seq->queued_pattern_index();
+
+                                        // Col 0: Track Header & Controls
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::PushID(t * 100);
+                                        bool is_sel_trk = (selected_track == t);
+                                        if (is_sel_trk) {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.95f, 0.95f));
+                                        } else {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.22f, 0.28f, 0.90f));
+                                        }
+                                        if (ImGui::Button(rack_trk_names[t], ImVec2(80, 24))) {
+                                            selected_track = t;
+                                        }
+                                        ImGui::PopStyleColor();
+
+                                        ImGui::SameLine(0, 4);
+                                        bool seq_on = trk->is_sequencer_enabled();
+                                        if (seq_on) {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.58f, 0.32f, 1.0f));
+                                        } else {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.28f, 0.35f, 0.8f));
+                                        }
+                                        if (ImGui::Button(seq_on ? "ON##gp" : "--##gp", ImVec2(28, 24))) {
+                                            trk->enable_sequencer(!seq_on);
+                                        }
+                                        ImGui::PopStyleColor();
+
+                                        // Cols 1..4: Pattern slots P1..P4
+                                        for (int p = 0; p < 4; ++p) {
+                                            ImGui::TableSetColumnIndex(p + 1);
+                                            char slot_lbl[64];
+                                            const auto& pat_info = t_seq->pattern(p);
+                                            std::snprintf(slot_lbl, sizeof(slot_lbl), "P%d: %s (%d st)##gp_%d_%d",
+                                                          p + 1, pat_info.name.c_str(), pat_info.num_steps, t, p);
+
+                                            bool is_active_playing = (active_p == static_cast<uint32_t>(p));
+                                            bool is_slot_queued = (has_queued && queued_p == static_cast<uint32_t>(p));
+
+                                            ImVec4 btn_col;
+                                            if (is_slot_queued) {
+                                                btn_col = ImVec4(0.95f, 0.65f, 0.10f, 1.0f);
+                                            } else if (is_active_playing) {
+                                                btn_col = ImVec4(0.15f, 0.65f, 0.35f, 1.0f);
+                                            } else {
+                                                btn_col = ImVec4(0.22f, 0.25f, 0.32f, 0.85f);
+                                            }
+
+                                            ImGui::PushStyleColor(ImGuiCol_Button, btn_col);
+                                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                            if (ImGui::Button(slot_lbl, ImVec2(-1, 24))) {
+                                                if (is_playing) {
+                                                    t_seq->queue_pattern_switch(p, sequencer::PatternSwitchMode::BarQuantized);
+                                                } else {
+                                                    t_seq->switch_pattern_immediate(p);
+                                                }
+                                                if (!trk->is_sequencer_enabled()) trk->enable_sequencer(true);
+                                            }
+                                            ImGui::PopStyleColor(2);
+
+                                            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                                                pattern_editor_pat_idx = p;
+                                                selected_track = t;
+                                                std::snprintf(status_toast, sizeof(status_toast), "EDITING TRACK %d PATTERN %d", t + 1, p + 1);
+                                            }
+                                        }
+
+                                        // Col 5: Status
+                                        ImGui::TableSetColumnIndex(5);
+                                        if (has_queued) {
+                                            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.10f, 1.0f), ">> P%u (BAR)", queued_p + 1);
+                                        } else if (seq_on) {
+                                            ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1.0f), "PLAY P%u", active_p + 1);
+                                        } else {
+                                            ImGui::TextDisabled("MUTED");
+                                        }
+
+                                        ImGui::PopID();
+                                    }
+                                    ImGui::EndTable();
+                                }
+
+                                // GridPie Scene Launchers
+                                ImGui::Spacing();
+                                ImGui::BeginGroup();
+                                {
+                                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "SCENE LAUNCHERS:");
+                                    ImGui::SameLine(0, 10);
+                                    for (int sc = 0; sc < 4; ++sc) {
+                                        char sc_lbl[48];
+                                        std::snprintf(sc_lbl, sizeof(sc_lbl), "► %s##sc%d", g_gridpie_scenes[sc].name, sc);
+                                        bool is_cur_sc = (g_gridpie_active_scene == sc);
+                                        if (is_cur_sc) {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.65f, 0.35f, 1.0f));
+                                        } else {
+                                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.28f, 0.35f, 0.9f));
+                                        }
+                                        if (ImGui::Button(sc_lbl, ImVec2(125, 24))) {
+                                            g_gridpie_active_scene = sc;
+                                            for (int t = 0; t < 4; ++t) {
+                                                if (track_seq[t]) {
+                                                    uint32_t tp = g_gridpie_scenes[sc].track_patterns[t];
+                                                    if (is_playing) track_seq[t]->queue_pattern_switch(tp, sequencer::PatternSwitchMode::BarQuantized);
+                                                    else track_seq[t]->switch_pattern_immediate(tp);
+                                                }
+                                            }
+                                            std::snprintf(status_toast, sizeof(status_toast), "LAUNCHED SCENE: %s", g_gridpie_scenes[sc].name);
+                                        }
+                                        ImGui::PopStyleColor();
+                                        ImGui::SameLine(0, 6);
+                                    }
+
+                                    if (ImGui::SmallButton("CAPTURE AS SCENE##gp_cap")) {
+                                        for (int t = 0; t < 4; ++t) {
+                                            if (track_seq[t]) g_gridpie_scenes[g_gridpie_active_scene].track_patterns[t] = track_seq[t]->current_pattern_index();
+                                        }
+                                        std::snprintf(status_toast, sizeof(status_toast), "CAPTURED CURRENT REMIX INTO SCENE %d", g_gridpie_active_scene + 1);
+                                    }
+                                }
+                                ImGui::EndGroup();
+
+                                // The GridPie Clou: Active Loop / Remix Row
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                                ImGui::BeginGroup();
+                                {
+                                    ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f), "ACTIVE REMIX LOOP (GRIDPIE BUFFER):");
+                                    ImGui::SameLine(0, 15);
+                                    for (int t = 0; t < 4; ++t) {
+                                        uint32_t p = track_seq[t] ? track_seq[t]->current_pattern_index() : 0;
+                                        ImGui::TextColored(ImVec4(0.20f, 0.75f, 0.95f, 1.0f), "[TRK %d: P%u]", t + 1, p + 1);
+                                        ImGui::SameLine(0, 6);
+                                    }
+
+                                    ImGui::SameLine(0, 20);
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.10f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                                    if (ImGui::Button("⤓ BAKE TO TIMELINE / ARRANGER (Ctrl+B)##gp_bake", ImVec2(280, 26))) {
+                                        bake_gridpie_scene_to_arranger();
+                                    }
+                                    ImGui::PopStyleColor(2);
+                                    if (ImGui::IsItemHovered()) {
+                                        ImGui::SetTooltip("Renoise GridPie 1-Key Action:\nStamps the entire active remix scene across all 4 tracks to the Arranger\nand auto-advances the playhead so pressing Ctrl+B again arranges consecutive bars!");
+                                    }
+
+                                    ImGui::SameLine(0, 10);
+                                    if (ImGui::Button("⇧ SHIFT REMIX UP TO PATTERN##gp_shift", ImVec2(230, 26))) {
+                                        for (int t = 0; t < 4; ++t) {
+                                            if (track_seq[t]) {
+                                                uint32_t cur_p = track_seq[t]->current_pattern_index();
+                                                if (cur_p != static_cast<uint32_t>(pattern_editor_pat_idx)) {
+                                                    track_seq[t]->pattern(pattern_editor_pat_idx) = track_seq[t]->pattern(cur_p);
+                                                }
+                                            }
+                                        }
+                                        std::snprintf(status_toast, sizeof(status_toast), "SHIFTED ACTIVE REMIX UP INTO PATTERN %d FOR ALL TRACKS", pattern_editor_pat_idx + 1);
+                                    }
+                                    if (ImGui::IsItemHovered()) {
+                                        ImGui::SetTooltip("Copies each track's currently playing remix pattern into Pattern %d so you can edit and preserve the remix as a unified pattern!", pattern_editor_pat_idx + 1);
+                                    }
+                                }
+                                ImGui::EndGroup();
                             }
 
                             // Shared Note Inspector & MPC Audition Pads (for selected_track and pattern_editor_step_idx)
@@ -4834,6 +5184,17 @@ int main(int argc, char** argv) {
                                 }
                                 ImGui::SameLine(0, 10);
                                 ImGui::Checkbox("Rev##StepProp", &step_ref.reverse);
+                                ImGui::SameLine(0, 10);
+                                int r_count = static_cast<int>(step_ref.ratchet_count);
+                                ImGui::SetNextItemWidth(65);
+                                if (ImGui::SliderInt("Ratchet##StepProp", &r_count, 1, 8, "%dx")) {
+                                    step_ref.ratchet_count = static_cast<uint8_t>(r_count);
+                                }
+                                if (step_ref.ratchet_count > 1) {
+                                    ImGui::SameLine(0, 8);
+                                    ImGui::SetNextItemWidth(70);
+                                    ImGui::SliderFloat("R-Decay##StepProp", &step_ref.ratchet_decay, 0.2f, 1.5f, "%.2fx");
+                                }
 
                                 // Second line: Micro-Timing & Quantize
                                 ImGui::Spacing();

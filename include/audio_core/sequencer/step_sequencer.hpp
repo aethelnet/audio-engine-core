@@ -58,6 +58,10 @@ struct StepTrigger {
     float drive{0.0f};             // [0.0 .. 1.0] soft saturation drive
     float send_a{0.0f};            // [0.0 .. 1.0] Aux Send A (Reverb)
     float send_b{0.0f};            // [0.0 .. 1.0] Aux Send B (Delay)
+
+    // Sub-Step Ratcheting (Trap Rolls, Glitch Bursts, Trills)
+    uint8_t ratchet_count{1};      // [1..8] 1 = single trigger, 2..8 = subdivide step into N rapid burst sub-triggers
+    float ratchet_decay{1.0f};     // [0.1f .. 2.0f] velocity multiplier per ratchet sub-burst (1.0 = flat, <1.0 = decay, >1.0 = ramp)
 };
 
 struct Pattern {
@@ -80,7 +84,8 @@ struct Pattern {
                   uint8_t choke_group = 0, float cutoff = 20000.0f, float res = 0.707f,
                   dsp::FilterType ftype = dsp::FilterType::Lowpass,
                   float decay_ms = 0.0f, float drive = 0.0f,
-                  float send_a = 0.0f, float send_b = 0.0f) noexcept {
+                  float send_a = 0.0f, float send_b = 0.0f,
+                  uint8_t ratchet_count = 1, float ratchet_decay = 1.0f) noexcept {
         if (idx < kMaxSteps) {
             steps[idx] = StepTrigger{
                 .active = true,
@@ -99,7 +104,9 @@ struct Pattern {
                 .decay_ms = std::max(0.0f, decay_ms),
                 .drive = std::clamp(drive, 0.0f, 1.0f),
                 .send_a = std::clamp(send_a, 0.0f, 1.0f),
-                .send_b = std::clamp(send_b, 0.0f, 1.0f)
+                .send_b = std::clamp(send_b, 0.0f, 1.0f),
+                .ratchet_count = std::clamp<uint8_t>(ratchet_count, 1, 8),
+                .ratchet_decay = std::clamp(ratchet_decay, 0.1f, 2.0f)
             };
         }
     }
@@ -553,7 +560,7 @@ public:
             bool reverse{false};
         };
 
-        static constexpr size_t kMaxPendingTriggers = 8;
+        static constexpr size_t kMaxPendingTriggers = 32;
         PendingTrigger pending[kMaxPendingTriggers];
         size_t num_pending = 0;
 
@@ -591,34 +598,43 @@ public:
                     trig_sample = 0; // Downbeat start guard
                 }
 
-                if (trig_sample >= static_cast<int64_t>(start_pos) &&
-                    trig_sample < static_cast<int64_t>(start_pos + frames)) {
+                // Step probability check (deterministic hash per step instance)
+                bool fire = true;
+                if (step.probability < 100) {
+                    uint32_t hash = static_cast<uint32_t>(S * 2654435761u);
+                    fire = (hash % 100) < step.probability;
+                }
 
-                    // Step probability check (deterministic hash per step instance)
-                    bool fire = true;
-                    if (step.probability < 100) {
-                        uint32_t hash = static_cast<uint32_t>(S * 2654435761u);
-                        fire = (hash % 100) < step.probability;
-                    }
+                if (fire) {
+                    const uint8_t r_count = std::clamp<uint8_t>(step.ratchet_count, 1, 8);
+                    const double sub_dur = (r_count > 1) ? (step_dur / static_cast<double>(r_count)) : 0.0;
+                    float cur_vel = step.velocity;
 
-                    if (fire) {
-                        const uint32_t f_idx = static_cast<uint32_t>(trig_sample - start_pos);
-                        pending[num_pending++] = PendingTrigger{
-                            .frame_offset = f_idx,
-                            .slice_id = step.slice_id,
-                            .velocity = step.velocity,
-                            .pitch_ratio = step.pitch_ratio,
-                            .pan = step.pan,
-                            .choke_group = step.choke_group,
-                            .filter_cutoff = step.filter_cutoff,
-                            .filter_res = step.filter_res,
-                            .filter_type = step.filter_type,
-                            .decay_ms = step.decay_ms,
-                            .drive = step.drive,
-                            .send_a = step.send_a,
-                            .send_b = step.send_b,
-                            .reverse = step.reverse
-                        };
+                    for (uint8_t r = 0; r < r_count && num_pending < kMaxPendingTriggers; ++r) {
+                        int64_t r_trig_sample = trig_sample + static_cast<int64_t>(std::round(static_cast<double>(r) * sub_dur));
+                        if (r_trig_sample >= static_cast<int64_t>(start_pos) &&
+                            r_trig_sample < static_cast<int64_t>(start_pos + frames)) {
+                            const uint32_t f_idx = static_cast<uint32_t>(r_trig_sample - start_pos);
+                            pending[num_pending++] = PendingTrigger{
+                                .frame_offset = f_idx,
+                                .slice_id = step.slice_id,
+                                .velocity = std::clamp(cur_vel, 0.01f, 1.0f),
+                                .pitch_ratio = step.pitch_ratio,
+                                .pan = step.pan,
+                                .choke_group = step.choke_group,
+                                .filter_cutoff = step.filter_cutoff,
+                                .filter_res = step.filter_res,
+                                .filter_type = step.filter_type,
+                                .decay_ms = (r_count > 1 && step.decay_ms <= 0.0f)
+                                            ? static_cast<float>((sub_dur / static_cast<double>(engine_sr)) * 1000.0)
+                                            : step.decay_ms,
+                                .drive = step.drive,
+                                .send_a = step.send_a,
+                                .send_b = step.send_b,
+                                .reverse = step.reverse
+                            };
+                        }
+                        cur_vel = std::clamp(cur_vel * step.ratchet_decay, 0.01f, 1.0f);
                     }
                 }
             }

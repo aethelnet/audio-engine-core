@@ -14586,6 +14586,89 @@ void test_live_midi_phrase_routing_and_track_arpeggiation() {
     }
 }
 
+void test_step_sequencer_substep_ratcheting_and_decay() {
+    std::cout << "[Test 95] StepSequencer Sub-Step Ratcheting & Velocity Decay Roll..." << std::endl;
+    using namespace audio_core;
+    using namespace audio_core::sequencer;
+
+    // Create a 1-second 48kHz audio clip with a sharp 64-sample click at slice 0
+    auto clip = std::make_shared<sampling::AudioClip>("ClickTest", 48000, 1, 48000);
+    clip->slices().push_back({0, 0, 1000, 1.0f});
+    float* ch0 = clip->channel(0);
+    for (size_t i = 0; i < 64; ++i) {
+        ch0[i] = 1.0f - static_cast<float>(i) / 64.0f;
+    }
+
+    clock::TimelineClock tl_clock(48000, 120.0);
+    tl_clock.set_playing(true);
+    tl_clock.set_sample_position(0);
+
+    // Part A: 4x Ratchet Roll with 0.5x Decay
+    {
+        StepSequencer seq(clip);
+        seq.set_voice_mode(VoiceMode::Polyphonic);
+        auto& pat = seq.pattern(0);
+        pat.clear();
+        // 4x ratchet at step 0, decay 0.5f, 10ms decay envelope
+        pat.set_step(0, 0, /*vel=*/1.0f, /*pitch=*/1.0f, /*prob=*/100, /*rev=*/false,
+                     /*pan=*/0.0f, /*micro=*/0.0f, /*quantize=*/0.0f, /*choke=*/0,
+                     /*cutoff=*/20000.0f, /*res=*/0.707f, dsp::FilterType::Lowpass,
+                     /*decay_ms=*/10.0f, /*drive=*/0.0f, /*send_a=*/0.0f, /*send_b=*/0.0f,
+                     /*ratchet_count=*/4, /*ratchet_decay=*/0.5f);
+
+        std::vector<float> out_l(6000, 0.0f);
+        std::vector<float> out_r(6000, 0.0f);
+
+        // Process in 500-sample blocks across the 6000-sample step
+        for (size_t blk = 0; blk < 12; ++blk) {
+            float* l_ptr = out_l.data() + (blk * 500);
+            float* r_ptr = out_r.data() + (blk * 500);
+            auto ev = tl_clock.advance_block(500);
+            seq.render(l_ptr, r_ptr, 500, tl_clock, ev);
+        }
+
+        // Sub-triggers are expected at samples 0, 1500, 3000, 4500
+        float pk0 = out_l[0];
+        float pk1 = out_l[1500];
+        float pk2 = out_l[3000];
+        float pk3 = out_l[4500];
+
+        assert(pk0 > 0.8f);
+        assert(pk1 > 0.4f && pk1 < 0.6f);  // 1.0 * 0.5 = 0.5
+        assert(pk2 > 0.2f && pk2 < 0.3f);  // 0.5 * 0.5 = 0.25
+        assert(pk3 > 0.1f && pk3 < 0.16f); // 0.25 * 0.5 = 0.125
+
+        // Silence between ratchets (sample 1000, 2500, 4000 should be near zero because click is 64 samples)
+        assert(std::abs(out_l[1000]) < 1e-4f);
+        assert(std::abs(out_l[2500]) < 1e-4f);
+        assert(std::abs(out_l[4000]) < 1e-4f);
+
+        std::cout << "  -> Part A (4x Sub-Step Ratchet with 0.5x Velocity Decay): PASSED (Peaks: "
+                  << pk0 << ", " << pk1 << ", " << pk2 << ", " << pk3 << ")" << std::endl;
+    }
+
+    // Part B: 1x Standard Trigger Invariant (no deviation from baseline)
+    {
+        tl_clock.set_sample_position(0);
+        StepSequencer seq(clip);
+        auto& pat = seq.pattern(0);
+        pat.clear();
+        pat.set_step(0, 0, 1.0f); // default ratchet_count = 1
+
+        std::vector<float> out_l(6000, 0.0f);
+        std::vector<float> out_r(6000, 0.0f);
+        auto ev = tl_clock.advance_block(6000);
+        seq.render(out_l.data(), out_r.data(), 6000, tl_clock, ev);
+
+        assert(out_l[0] > 0.8f);
+        // Only 1 trigger at sample 0; sample 1500 must be completely silent
+        assert(std::abs(out_l[1500]) < 1e-5f);
+        assert(std::abs(out_l[3000]) < 1e-5f);
+
+        std::cout << "  -> Part B (1x Standard Trigger Baseline Invariant): PASSED" << std::endl;
+    }
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   RUNNING AUDIO-ENGINE-CORE UNIT TESTS " << std::endl;
@@ -14685,11 +14768,13 @@ int main() {
     test_instrument_phrase_arpeggiator_and_drum_variations();
     test_scales_and_microtonal_scala_tuning_engine();
     test_live_midi_phrase_routing_and_track_arpeggiation();
+    test_step_sequencer_substep_ratcheting_and_decay();
 
     std::cout << "========================================" << std::endl;
     std::cout << "   ALL AUDIO CORE TESTS PASSED!         " << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
+
 
 
