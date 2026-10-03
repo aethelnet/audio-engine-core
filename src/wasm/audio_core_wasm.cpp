@@ -18,6 +18,7 @@ static audio_core::dsp::ButterComp2 g_comp;
 static audio_core::dsp::ClipOnly2 g_limiter;
 
 static uint32_t g_sample_rate = 48000;
+static float g_drive_amount = 0.4f;
 static bool g_drive_enabled = true;
 static bool g_eq_enabled = true;
 static bool g_comp_enabled = true;
@@ -39,7 +40,8 @@ void wasm_init(uint32_t sample_rate) {
     g_limiter.init(g_sample_rate);
     
     // Default musical parameters
-    g_drive.set_parameter(0, 0.4f);     // 40% saturation
+    g_drive_amount = 0.4f;
+    g_drive.set_parameter(0, g_drive_amount);     // 40% saturation
     g_baxandall.set_parameter(0, 3.0f); // +3dB Bass warmth
     g_baxandall.set_parameter(1, 1.5f); // +1.5dB Treble sheen
     g_comp.set_parameter(0, 0.35f);    // Smooth compression
@@ -50,7 +52,8 @@ float* wasm_get_left_buffer() { return g_left_buffer; }
 float* wasm_get_right_buffer() { return g_right_buffer; }
 
 void wasm_set_drive(float amount) {
-    g_drive.set_parameter(0, std::clamp(amount, 0.0f, 1.0f));
+    g_drive_amount = std::clamp(amount, 0.0f, 1.0f);
+    g_drive.set_parameter(0, g_drive_amount);
 }
 
 void wasm_set_bass(float db) {
@@ -106,7 +109,21 @@ void wasm_process(uint32_t frames) {
     // 2. Sequential Airwindows DSP processing in exact order:
     // PurestDrive -> Baxandall EQ -> ButterComp2 -> ClipOnly2
     if (g_drive_enabled) {
-        g_drive.process_stereo(g_left_buffer, g_right_buffer, frames);
+        if (g_drive_amount > 0.001f) {
+            const float in_gain = 1.0f + 3.0f * g_drive_amount;
+            const float out_gain = 1.0f / (1.0f + 1.2f * g_drive_amount);
+            for (uint32_t i = 0; i < frames; ++i) {
+                g_left_buffer[i] *= in_gain;
+                g_right_buffer[i] *= in_gain;
+            }
+            g_drive.process_stereo(g_left_buffer, g_right_buffer, frames);
+            for (uint32_t i = 0; i < frames; ++i) {
+                g_left_buffer[i] *= out_gain;
+                g_right_buffer[i] *= out_gain;
+            }
+        } else {
+            g_drive.process_stereo(g_left_buffer, g_right_buffer, frames);
+        }
     }
     if (g_eq_enabled) {
         g_baxandall.process_stereo(g_left_buffer, g_right_buffer, frames);
