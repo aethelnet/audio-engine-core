@@ -4,7 +4,7 @@
 > *Deterministic Zero-Allocation Audio Path // Lock-Free SPSC Streaming // Plugin Delay Compensation (PDC) // Sample-Accurate Parameter Ramping // Golden Master Bit-Exact Verification*
 
 [![Standard: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![CTest Suite: 89/89 Passed](https://img.shields.io/badge/CTest-89%2F89%20Passed%20(100%25)-brightgreen.svg)](#)
+[![CTest Suite: 95/95 Passed](https://img.shields.io/badge/CTest-95%2F95%20Passed%20(100%25)-brightgreen.svg)](#)
 [![Real-Time Safety: Zero Allocations](https://img.shields.io/badge/Real--Time-Zero%20Allocations%20%7C%20Lock--Free-success.svg)](#)
 [![RTKit: SCHED_FIFO Support](https://img.shields.io/badge/Linux%20RT-RTKit%20%7C%20SCHED__FIFO-blueviolet.svg)](#)
 [![Golden Master: Bit-Exact](https://img.shields.io/badge/Verification-Bit--Exact%20Golden%20Master-blueviolet.svg)](#)
@@ -187,24 +187,27 @@ ctest --test-dir build --output-on-failure
 ## 5. Directory Structure
 
 ```
-audio-engine-core/
-├── include/audio_core/
-│   ├── analysis/             # FFT, Spectrum, Golden Master Checksums
-│   ├── dynamics/             # Liquid ODE Compressor, Vactrol Opto-Leveler
-│   ├── filters/              # Cytomic SVF, Buchla 292 LPG, LR4 Crossovers
-│   ├── modeled/              # Airwindows DSP: DeRez2, ClipOnly2, Interstage, Baxandall
-│   ├── network/              # IEEE 1588 PTPv2, AES67 RTP L24 Framing
-│   ├── routing/              # Universal Routing Matrix, PDC Delay Lines
-│   ├── sampling/             # DiskStreamer, WSOLA Stretcher, Hermite Resampler
-│   ├── sequencer/            # Clip Launcher, Step Sequencer, MIDI Patterns
-│   ├── wasm/                 # Sandboxed Plugin Hot-Swap & Gas Watchdog
-│   ├── mixer_graph.hpp       # Lock-Free Multi-Track Mixer Graph
-│   └── ring_buffer.hpp       # Lock-Free SPSC Wait-Free Ring Buffer
-├── src/                      # Implementation sources
-├── tests/                    # 89 Automated Unit Test Suites
-├── examples/
-│   ├── aethel_desk.cpp       # ImGui Audio Workstation GUI
-│   └── golden_master_tool.cpp# Bit-Exact Checksum Verification CLI
+ audio-engine-core/
+ ├── include/audio_core/
+ │   ├── analysis/             # FFT, Spectrum, Golden Master Checksums
+ │   ├── dynamics/             # Liquid ODE Compressor, Vactrol Opto-Leveler
+ │   ├── dsp/                  # PurestDrive, TransientShaper, LookaheadDNL, ButterComp2
+ │   ├── filters/              # Cytomic SVF, Buchla 292 LPG, LR4 Crossovers
+ │   ├── modeled/              # Airwindows DSP: DeRez2, ClipOnly2, Interstage, Baxandall
+ │   ├── network/              # IEEE 1588 PTPv2, AES67 RTP L24 Framing
+ │   ├── routing/              # Universal Routing Matrix, PDC Delay Lines, MSEG Bridge
+ │   ├── sampling/             # DiskStreamer, WSOLA Stretcher, Hermite Resampler, AssetPool
+ │   ├── sequencer/            # Clip Launcher, Step Sequencer, Tracker Timing, Instrument Phrase
+ │   ├── tuning/               # Scala .scl Parser, TuningTable, Microtonal Scale Dictionary
+ │   ├── undo/                 # Real-Time Decoupled DAW Undo/Redo Command Engine
+ │   ├── wasm/                 # Sandboxed Plugin Hot-Swap & Gas Watchdog
+ │   ├── mixer_graph.hpp       # Lock-Free Multi-Track Mixer Graph
+ │   └── ring_buffer.hpp       # Lock-Free SPSC Wait-Free Ring Buffer
+ ├── src/                      # Implementation sources
+ ├── tests/                    # 95 Automated Unit Test Suites
+ ├── examples/
+ │   ├── aethel_desk.cpp       # ImGui Audio Workstation GUI
+ │   └── golden_master_tool.cpp# Bit-Exact Checksum Verification CLI
 ├── LICENSE                   # GNU AGPL-3.0
 └── CMakeLists.txt
 ```
