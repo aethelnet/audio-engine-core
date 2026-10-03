@@ -1070,15 +1070,15 @@ int main(int argc, char** argv) {
         float loop_end_sec = loop_st_sec + loop_len_sec;
 
         if (is_playing) {
-            if (pw_online) {
+            if (pw_online || desktop_online) {
                 playhead_seconds = static_cast<float>(mixer.clock().sample_position()) / static_cast<float>(kSampleRate);
-                if (loop_active && playhead_seconds >= loop_end_sec) {
+                if (loop_active && playhead_seconds >= loop_end_sec && loop_len_sec > 0.05f) {
                     playhead_seconds = loop_st_sec + std::fmod(std::max(0.0f, playhead_seconds - loop_st_sec), loop_len_sec);
-                    mixer.seek(static_cast<uint64_t>(playhead_seconds * kSampleRate));
+                    mixer.seek(static_cast<uint64_t>(playhead_seconds * static_cast<float>(kSampleRate)));
                 }
             } else {
-                playhead_seconds += dt * (bpm / 120.0f);
-                if (loop_active && playhead_seconds >= loop_end_sec) {
+                playhead_seconds += dt;
+                if (loop_active && playhead_seconds >= loop_end_sec && loop_len_sec > 0.05f) {
                     playhead_seconds = loop_st_sec + std::fmod(std::max(0.0f, playhead_seconds - loop_st_sec), loop_len_sec);
                 }
                 mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
@@ -1251,9 +1251,6 @@ int main(int argc, char** argv) {
 
         // Master Clock Transmission (24 PPQN Beat Clock & MTC SMPTE Timecode):
         if (mixer.clock().authority() == clock::ClockAuthority::Master) {
-            if (is_playing) {
-                mixer.clock().set_sample_position(static_cast<uint64_t>(playhead_seconds * 48000.0f));
-            }
             mixer.clock().set_playing(is_playing);
             mixer.clock().set_bpm(bpm);
             midi_rx.process_master_clock(is_playing ? mod_sim_frames : 0, mixer.clock());
@@ -3609,16 +3606,28 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.85f, 1.0f), "MASTER SCENES:");
                         ImGui::SameLine();
                         if (ImGui::Button("▶ SCENE 1 (MAIN)", ImVec2(160, 28))) {
+                            if (!is_playing) {
+                                is_playing = true;
+                                mixer.clock().set_playing(true);
+                            }
                             mixer.launch_scene(0, sequencer::LaunchQuantize::Bar);
                             std::snprintf(status_toast, sizeof(status_toast), "SCENE 1 (MAIN GROOVES) QUEUED FOR NEXT DOWNBEAT");
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("▶ SCENE 2 (WSOLA BREAK)", ImVec2(185, 28))) {
+                            if (!is_playing) {
+                                is_playing = true;
+                                mixer.clock().set_playing(true);
+                            }
                             mixer.launch_scene(1, sequencer::LaunchQuantize::Bar);
                             std::snprintf(status_toast, sizeof(status_toast), "SCENE 2 (WSOLA BREAK/MOD) QUEUED FOR NEXT DOWNBEAT");
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("▶ SCENE 3 (GLITCH/SUB)", ImVec2(175, 28))) {
+                            if (!is_playing) {
+                                is_playing = true;
+                                mixer.clock().set_playing(true);
+                            }
                             mixer.launch_scene(2, sequencer::LaunchQuantize::Bar);
                             std::snprintf(status_toast, sizeof(status_toast), "SCENE 3 (GLITCH/SUB/REV) QUEUED FOR NEXT DOWNBEAT");
                         }
@@ -3716,6 +3725,10 @@ int main(int argc, char** argv) {
 
                                         if (ImGui::Button(slot_btn_lbl, ImVec2(150, 32))) {
                                             uint32_t target_trk_id = trk ? trk->id() : static_cast<uint32_t>(t + 1);
+                                            if (!is_playing) {
+                                                is_playing = true;
+                                                mixer.clock().set_playing(true);
+                                            }
                                             mixer.launch_track_clip(target_trk_id, s - 1, sequencer::LaunchQuantize::Bar, false);
                                             std::snprintf(status_toast, sizeof(status_toast), "TRACK %d CLIP %d (%s) QUEUED FOR NEXT DOWNBEAT",
                                                           t + 1, s, slot_info.name.c_str());
@@ -5025,11 +5038,14 @@ int main(int argc, char** argv) {
                                             ImGui::PushStyleColor(ImGuiCol_Button, btn_col);
                                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                                             if (ImGui::Button(slot_lbl, ImVec2(-1, 24))) {
-                                                if (is_playing) {
-                                                    t_seq->queue_pattern_switch(p, sequencer::PatternSwitchMode::BarQuantized);
-                                                } else {
-                                                    t_seq->switch_pattern_immediate(p);
+                                                if (trk->is_clip_launcher_active()) {
+                                                    trk->clip_launcher().stop_immediate();
                                                 }
+                                                if (!is_playing) {
+                                                    is_playing = true;
+                                                    mixer.clock().set_playing(true);
+                                                }
+                                                t_seq->queue_pattern_switch(p, sequencer::PatternSwitchMode::BarQuantized);
                                                 if (!trk->is_sequencer_enabled()) trk->enable_sequencer(true);
                                             }
                                             ImGui::PopStyleColor(2);
@@ -5073,11 +5089,19 @@ int main(int argc, char** argv) {
                                         }
                                         if (ImGui::Button(sc_lbl, ImVec2(125, 24))) {
                                             g_gridpie_active_scene = sc;
+                                            if (!is_playing) {
+                                                is_playing = true;
+                                                mixer.clock().set_playing(true);
+                                            }
                                             for (int t = 0; t < 4; ++t) {
+                                                Track* trk = (t == 0) ? trk0 : ((t == 1) ? trk1 : ((t == 2) ? trk2 : trk3));
+                                                if (trk && trk->is_clip_launcher_active()) {
+                                                    trk->clip_launcher().stop_immediate();
+                                                }
                                                 if (track_seq[t]) {
                                                     uint32_t tp = g_gridpie_scenes[sc].track_patterns[t];
-                                                    if (is_playing) track_seq[t]->queue_pattern_switch(tp, sequencer::PatternSwitchMode::BarQuantized);
-                                                    else track_seq[t]->switch_pattern_immediate(tp);
+                                                    track_seq[t]->queue_pattern_switch(tp, sequencer::PatternSwitchMode::BarQuantized);
+                                                    if (trk && !trk->is_sequencer_enabled()) trk->enable_sequencer(true);
                                                 }
                                             }
                                             std::snprintf(status_toast, sizeof(status_toast), "LAUNCHED SCENE: %s", g_gridpie_scenes[sc].name);
