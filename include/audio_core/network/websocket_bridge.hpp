@@ -4,6 +4,9 @@
 #include "audio_core/protocol/command_packet.hpp"
 #include "audio_core/protocol/telemetry_packet.hpp"
 #include "audio_core/serialization/session_serializer.hpp"
+#include "audio_core/sequencer/tracker_timing.hpp"
+#include "audio_core/sequencer/step_sequencer.hpp"
+#include "audio_core/sequencer/clip_launcher.hpp"
 
 #include <string>
 #include <string_view>
@@ -854,6 +857,36 @@ private:
             cmd.type = protocol::MixerCommandType::StopAllClips;
             m_engine.send_command(cmd);
 
+        } else if (type == "sequencer_switch_pattern") {
+            uint32_t trk = obj.get("track_id") ? obj.get("track_id")->as_uint(1) : 1;
+            uint32_t pat = obj.get("pattern_index") ? obj.get("pattern_index")->as_uint(0) : 0;
+            std::string mode_str = obj.get("mode") ? obj.get("mode")->as_string() : "bar";
+            uint8_t mode = 2; // BarQuantized default
+            if (mode_str == "immediate") mode = 0;
+            else if (mode_str == "beat") mode = 1;
+            protocol::MixerCommand cmd{};
+            cmd.type = (mode == 0) ? protocol::MixerCommandType::SequencerSwitchPattern
+                                   : protocol::MixerCommandType::SequencerQueuePattern;
+            cmd.target_id = trk;
+            cmd.secondary_id = pat;
+            cmd.flags = mode;
+            m_engine.send_command(cmd);
+
+        } else if (type == "sequencer_trigger_pad" || type == "sequencer_trigger_slice") {
+            uint32_t trk = obj.get("track_id") ? obj.get("track_id")->as_uint(1) : 1;
+            uint32_t slice = obj.get("slice_id") ? obj.get("slice_id")->as_uint(0) : 0;
+            float vel = obj.get("velocity") ? obj.get("velocity")->as_float(1.0f) : 1.0f;
+            float pitch = obj.get("pitch_ratio") ? obj.get("pitch_ratio")->as_float(1.0f) : 1.0f;
+            uint32_t choke = obj.get("choke_group") ? obj.get("choke_group")->as_uint(0) : 0;
+            protocol::MixerCommand cmd{};
+            cmd.type = protocol::MixerCommandType::SequencerTriggerSlice;
+            cmd.target_id = trk;
+            cmd.secondary_id = slice;
+            cmd.value1 = vel;
+            cmd.value2 = pitch;
+            cmd.flags = choke;
+            m_engine.send_command(cmd);
+
         } else if (type == "subscribe") {
             const auto* fmt = obj.get("format");
             if (fmt && fmt->as_string() == "binary") {
@@ -887,6 +920,13 @@ private:
         const auto pos = m_engine.clock().position_snapshot();
         const float cpu = m_engine.cpu_load_percent();
 
+        sequencer::TrackerTiming tracker_timing{};
+        tracker_timing.bpm = pos.bpm;
+        tracker_timing.lpb = 4;
+        tracker_timing.tpl = 12;
+        tracker_timing.lines_per_pattern = 64;
+        const auto tracker_pos = tracker_timing.position_at_sample(pos.sample_position, m_engine.clock().sample_rate());
+
         // 1. Build JSON telemetry string
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(3);
@@ -900,8 +940,20 @@ private:
            << "\"playing\":" << (pos.is_playing ? "true" : "false") << ","
            << "\"bpm\":" << pos.bpm << ","
            << "\"sample_position\":" << pos.sample_position << ","
-           << "\"beat\":" << pos.total_beats
-           << "},"
+           << "\"beat\":" << pos.total_beats << ","
+           << "\"bar\":" << pos.bar_index << ","
+           << "\"beat_within_bar\":" << pos.beat_within_bar << ","
+           << "\"bar_progress\":" << pos.bar_progress << ","
+           << "\"tracker\":{"
+           << "\"pattern\":" << tracker_pos.pattern_index << ","
+           << "\"line\":" << tracker_pos.line_in_pattern << ","
+           << "\"tick\":" << tracker_pos.tick_in_line << ","
+           << "\"tick_fraction\":" << tracker_pos.tick_fraction << ","
+           << "\"total_lines\":" << tracker_pos.total_lines << ","
+           << "\"lpb\":4,"
+           << "\"tpl\":12,"
+           << "\"lines_per_pattern\":64"
+           << "}},"
            << "\"master\":{"
            << "\"peak_l\":" << telemetry.master_meter.peak_l << ","
            << "\"peak_r\":" << telemetry.master_meter.peak_r << ","
@@ -933,7 +985,34 @@ private:
                    << "\"peak_l\":" << tm.peak_l << ","
                    << "\"peak_r\":" << tm.peak_r << ","
                    << "\"rms_l\":" << tm.rms_l << ","
-                   << "\"rms_r\":" << tm.rms_r << "}";
+                   << "\"rms_r\":" << tm.rms_r;
+
+                // Sequencer Telemetry
+                if (trk->is_sequencer_enabled() && trk->sequencer()) {
+                    auto* seq = trk->sequencer();
+                    ss << ",\"sequencer\":{"
+                       << "\"enabled\":true,"
+                       << "\"pattern\":" << seq->current_pattern_index() << ","
+                       << "\"step\":" << seq->current_step_index() << ","
+                       << "\"queued_pattern\":" << seq->queued_pattern_index() << ","
+                       << "\"has_queued\":" << (seq->has_queued_pattern() ? "true" : "false") << ","
+                       << "\"voices\":" << seq->active_voice_count()
+                       << "}";
+                }
+
+                // Clip Launcher Telemetry
+                if (trk->is_clip_launcher_active()) {
+                    auto& cl = trk->clip_launcher();
+                    ss << ",\"clip_launcher\":{"
+                       << "\"active\":true,"
+                       << "\"current_slot\":" << cl.current_slot_idx() << ","
+                       << "\"queued_slot\":" << cl.queued_slot_idx() << ","
+                       << "\"is_stopping\":" << (cl.is_stopping() ? "true" : "false") << ","
+                       << "\"playhead\":" << cl.playhead()
+                       << "}";
+                }
+
+                ss << "}";
                 active_count++;
             }
         }

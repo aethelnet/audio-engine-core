@@ -7751,6 +7751,8 @@ void test_websocket_bridge_and_remote_control() {
     auto* trk1 = engine.mixer().allocate_track("Track 1");
     auto* trk2 = engine.mixer().allocate_track("Track 2");
     TEST_CHECK(trk1 != nullptr && trk2 != nullptr);
+    auto seq1 = std::make_shared<sequencer::StepSequencer>();
+    trk1->set_sequencer(seq1);
 
     constexpr uint16_t kTestPort = 18099;
     WebSocketBridge::Config cfg{};
@@ -7864,7 +7866,21 @@ void test_websocket_bridge_and_remote_control() {
     for (float s : audio_out) synth_e += std::abs(s);
     TEST_CHECK(synth_e > 1.0f);
 
-    std::cout << "  -> Bidirectional JSON & Binary Control: PASSED (Track Gain=0.73, Master=0.62, Mute=true, Pan=-0.45, MIDI Synth Energy=" << synth_e << ")" << std::endl;
+    // 7b. Test Remote Sequencer Pattern Switch Command
+    std::string seq_pat_cmd = "{\"type\":\"sequencer_switch_pattern\",\"track_id\":1,\"pattern_index\":3,\"mode\":\"immediate\"}";
+    send_masked_frame(0x1, seq_pat_cmd.data(), seq_pat_cmd.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+    TEST_CHECK(trk1->sequencer() != nullptr);
+    TEST_CHECK(trk1->sequencer()->current_pattern_index() == 3);
+
+    // 7c. Test Remote Sequencer Pad Trigger Command
+    std::string seq_pad_cmd = "{\"type\":\"sequencer_trigger_pad\",\"track_id\":1,\"slice_id\":0,\"velocity\":0.85}";
+    send_masked_frame(0x1, seq_pad_cmd.data(), seq_pad_cmd.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    engine.process_interleaved(audio_out.data(), 256, 2);
+
+    std::cout << "  -> Bidirectional JSON & Binary Control: PASSED (Track Gain=0.73, Master=0.62, Mute=true, Pan=-0.45, MIDI Synth Energy=" << synth_e << ", Sequencer Pattern=3)" << std::endl;
 
     // 8. Receive Telemetry Frame from Server
     timeval tv{};
@@ -7893,8 +7909,11 @@ void test_websocket_bridge_and_remote_control() {
     TEST_CHECK(tel_str.find("\"master\":") != std::string::npos);
     TEST_CHECK(tel_str.find("\"kinetic\":") != std::string::npos);
     TEST_CHECK(tel_str.find("\"tracks\":") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"tracker\":") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"line\":") != std::string::npos);
+    TEST_CHECK(tel_str.find("\"sequencer\":") != std::string::npos);
 
-    std::cout << "  -> Real-Time 30Hz Telemetry Broadcast: PASSED (Snapshot length: " << tel_len << " bytes)" << std::endl;
+    std::cout << "  -> Real-Time 30Hz Telemetry Broadcast (with Renoise Tracker & StepSequencer state): PASSED (Snapshot length: " << tel_len << " bytes)" << std::endl;
 
     close(client_fd);
 

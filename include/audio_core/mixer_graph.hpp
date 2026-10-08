@@ -2580,6 +2580,35 @@ public:
                 }
                 break;
             }
+            case protocol::MixerCommandType::SequencerSwitchPattern: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    if (auto* seq = trk->sequencer()) {
+                        seq->switch_pattern_immediate(cmd.secondary_id);
+                    }
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SequencerQueuePattern: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    if (auto* seq = trk->sequencer()) {
+                        auto mode = static_cast<sequencer::PatternSwitchMode>(cmd.flags & 0xFF);
+                        seq->queue_pattern_switch(cmd.secondary_id, mode);
+                    }
+                }
+                break;
+            }
+            case protocol::MixerCommandType::SequencerTriggerSlice: {
+                if (auto* trk = get_track(cmd.target_id)) {
+                    if (auto* seq = trk->sequencer()) {
+                        uint32_t slice_id = cmd.secondary_id;
+                        float vel = cmd.value1 > 0.0f ? cmd.value1 : 1.0f;
+                        float pitch = cmd.value2 > 0.0f ? cmd.value2 : 1.0f;
+                        uint8_t choke = static_cast<uint8_t>(cmd.flags & 0xFF);
+                        seq->trigger_slice(slice_id, vel, pitch, false, 0.0f, choke);
+                    }
+                }
+                break;
+            }
             default:
                 break;
         }

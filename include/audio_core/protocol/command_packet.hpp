@@ -46,6 +46,9 @@ enum class MixerCommandType : uint16_t {
     StopTrackClip,
     LaunchScene,
     StopAllClips,
+    SequencerSwitchPattern,
+    SequencerQueuePattern,
+    SequencerTriggerSlice,
 };
 
 // ============================================================================
