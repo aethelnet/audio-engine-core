@@ -33,14 +33,28 @@ target_include_directories(wasm3_core PUBLIC third_party/wasm3/source)
 target_compile_definitions(wasm3_core PUBLIC d_m3HasGasMetering=1)
 target_compile_options(wasm3_core PRIVATE -w) # Suppress warnings in vendored C library
 
-# PipeWire Integration
-set(PIPEWIRE_INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2
-)
-set(PIPEWIRE_LIB
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/lib64/libpipewire-0.3.so
-)
+# PipeWire Integration (prefer system pkg-config on ARM64/Debian/Ubuntu, fallback to vendored third_party/pipewire)
+find_package(PkgConfig QUIET)
+if (PKG_CONFIG_FOUND)
+    pkg_check_modules(SYS_PIPEWIRE QUIET libpipewire-0.3)
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/lib64/libpipewire-0.3.so")
+    set(PIPEWIRE_INCLUDE_DIRS
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2
+    )
+    set(PIPEWIRE_LIB
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/lib64/libpipewire-0.3.so
+    )
+    set(HAS_PIPEWIRE_DEPS TRUE)
+elseif (SYS_PIPEWIRE_FOUND)
+    set(PIPEWIRE_INCLUDE_DIRS ${SYS_PIPEWIRE_INCLUDE_DIRS})
+    set(PIPEWIRE_LIB ${SYS_PIPEWIRE_LIBRARIES})
+    set(HAS_PIPEWIRE_DEPS TRUE)
+else()
+    set(HAS_PIPEWIRE_DEPS FALSE)
+endif()
 
 # Ableton Link Integration
 set(LINK_INCLUDE_DIRS
@@ -61,12 +75,13 @@ target_include_directories(audio_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/pipewire-0.3>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/pipewire/usr/include/spa-0.2>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/link/modules/asio-standalone/asio/include>
     $<INSTALL_INTERFACE:include>
 )
+if (HAS_PIPEWIRE_DEPS)
+    target_include_directories(audio_core PUBLIC ${PIPEWIRE_INCLUDE_DIRS})
+endif()
 
 target_compile_definitions(audio_core PUBLIC LINK_PLATFORM_LINUX=1)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -77,7 +92,6 @@ find_package(Threads REQUIRED)
 
 # RTKit / systemd D-Bus Integration for Linux Real-Time Scheduling
 if (UNIX AND NOT APPLE AND NOT ANDROID)
-    find_package(PkgConfig QUIET)
     if (PKG_CONFIG_FOUND)
         pkg_check_modules(LIBSYSTEMD QUIET libsystemd)
     endif()
@@ -96,7 +110,7 @@ if (UNIX AND NOT APPLE AND NOT ANDROID)
 endif()
 
 # Platform Audio Driver Options
-if (UNIX AND NOT APPLE AND NOT ANDROID)
+if (UNIX AND NOT APPLE AND NOT ANDROID AND HAS_PIPEWIRE_DEPS)
     option(AUDIO_CORE_ENABLE_PIPEWIRE "Enable Linux PipeWire pro-audio backend" ON)
 else()
     option(AUDIO_CORE_ENABLE_PIPEWIRE "Enable Linux PipeWire pro-audio backend" OFF)
@@ -110,7 +124,7 @@ target_link_libraries(audio_core PUBLIC
     m
 )
 
-if (AUDIO_CORE_ENABLE_PIPEWIRE)
+if (AUDIO_CORE_ENABLE_PIPEWIRE AND HAS_PIPEWIRE_DEPS)
     target_link_libraries(audio_core PUBLIC ${PIPEWIRE_LIB})
     target_compile_definitions(audio_core PUBLIC AUDIO_CORE_HAS_PIPEWIRE=1)
 endif()
@@ -131,7 +145,7 @@ target_compile_options(audio_tests PRIVATE -UNDEBUG)
 
 add_test(NAME AudioCoreTestSuite COMMAND audio_tests)
 
-# Automatic Post-Build Verification: Compiling automatically runs the full 20-test harness!
+# Automatic Post-Build Verification: Compiling automatically runs the full test harness!
 # If ANY regression or audio bug is introduced, the build halts with an error.
 add_custom_command(TARGET audio_tests POST_BUILD
     COMMAND audio_tests
@@ -184,54 +198,61 @@ target_link_libraries(alsa_hardware_stress_bench PRIVATE audio_core)
 # ============================================================================
 # Dear ImGui & Desktop UI Workstation (aethel_desk)
 # ============================================================================
-find_package(OpenGL REQUIRED)
-find_package(glfw3 REQUIRED)
+find_package(OpenGL QUIET)
+find_package(glfw3 QUIET)
 
-set(IMGUI_SOURCES
-    third_party/imgui/imgui.cpp
-    third_party/imgui/imgui_draw.cpp
-    third_party/imgui/imgui_tables.cpp
-    third_party/imgui/imgui_widgets.cpp
-    third_party/imgui/backends/imgui_impl_glfw.cpp
-    third_party/imgui/backends/imgui_impl_opengl3.cpp
-)
-add_library(imgui_core STATIC ${IMGUI_SOURCES})
-target_include_directories(imgui_core PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
-)
-target_link_libraries(imgui_core PUBLIC
-    glfw
-    OpenGL::GL
-)
+if (OpenGL_FOUND AND glfw3_FOUND)
+    set(IMGUI_SOURCES
+        third_party/imgui/imgui.cpp
+        third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp
+        third_party/imgui/imgui_widgets.cpp
+        third_party/imgui/backends/imgui_impl_glfw.cpp
+        third_party/imgui/backends/imgui_impl_opengl3.cpp
+    )
+    add_library(imgui_core STATIC ${IMGUI_SOURCES})
+    target_include_directories(imgui_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
+    )
+    target_link_libraries(imgui_core PUBLIC
+        glfw
+        OpenGL::GL
+    )
 
-# Desktop Workstation Executable
-add_executable(aethel_desk
-    examples/aethel_desk.cpp
-)
-target_include_directories(aethel_desk PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
-)
-target_link_libraries(aethel_desk PRIVATE
-    audio_core
-    imgui_core
-    glfw
-    OpenGL::GL
-)
+    # Desktop Workstation Executable
+    add_executable(aethel_desk
+        examples/aethel_desk.cpp
+    )
+    target_include_directories(aethel_desk PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
+    )
+    target_link_libraries(aethel_desk PRIVATE
+        audio_core
+        imgui_core
+        glfw
+        OpenGL::GL
+    )
+else()
+    message(STATUS "OpenGL or GLFW3 not found: skipping desktop GUI target (aethel_desk); headless/WebMixer targets enabled.")
+endif()
 
 # ============================================================================
 # Standalone Audio Plugins (CLAP & VST3 for Renoise / Bitwig / Reaper)
 # ============================================================================
 option(BUILD_STANDALONE_PLUGINS "Build Standalone Audio Plugins (CLAP & VST3)" ON)
-if (BUILD_STANDALONE_PLUGINS)
+if (BUILD_STANDALONE_PLUGINS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/clap-wrapper/CMakeLists.txt")
     set(CLAP_WRAPPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(CLAP_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/clap" CACHE PATH "" FORCE)
     set(VST3_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vst3sdk" CACHE PATH "" FORCE)
     set(CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES FALSE CACHE BOOL "" FORCE)
     add_subdirectory(third_party/clap-wrapper third_party/clap-wrapper-build EXCLUDE_FROM_ALL)
     add_subdirectory(plugins/aethel_liquid_ode)
+elseif (BUILD_STANDALONE_PLUGINS)
+    message(STATUS "CLAP/VST3 SDKs not present in third_party/: skipping standalone plugin targets.")
 endif()
+
 
 
 
