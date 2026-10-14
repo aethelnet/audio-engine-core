@@ -59,7 +59,11 @@ public:
 
     // Set cutoff frequency in Hz (tau = 1 / (2*pi*fc))
     void set_cutoff(float fc_hz) noexcept {
-        m_cutoff_hz = std::clamp(fc_hz, 1.0f, (m_sample_rate * 0.499f));
+        const float clamped = std::clamp(fc_hz, 1.0f, (m_sample_rate * 0.499f));
+        if (std::abs(clamped - m_cutoff_hz) < 1e-3f && m_alpha > 0.0f) {
+            return;
+        }
+        m_cutoff_hz = clamped;
         m_tau = 1.0f / (2.0f * std::numbers::pi_v<float> * m_cutoff_hz);
         update_coefficients();
     }
@@ -342,8 +346,7 @@ public:
     LiquidBusProcessor(float sample_rate = 48000.0f, Mode mode = Mode::DifferentialMagneticGlue) noexcept
         : m_sample_rate(sample_rate),
           m_mode(mode),
-          m_ode_l(sample_rate, 35000.0f, 1.2f),
-          m_ode_r(sample_rate, 35000.0f, 1.2f),
+          m_ode_stereo(sample_rate, 35000.0f, 1.2f),
           m_flux_ode_l(sample_rate, 120.0f),
           m_flux_ode_r(sample_rate, 120.0f) {
         set_glue_characteristics(40.0f, 0.5f);
@@ -353,8 +356,7 @@ public:
     void set_sample_rate(float sr) noexcept {
         if (sr > 0.0f) {
             m_sample_rate = sr;
-            m_ode_l.set_sample_rate(sr);
-            m_ode_r.set_sample_rate(sr);
+            m_ode_stereo.set_sample_rate(sr);
             m_flux_ode_l.set_sample_rate(sr);
             m_flux_ode_r.set_sample_rate(sr);
             update_ballistics();
@@ -368,8 +370,7 @@ public:
         m_glue_amount = std::clamp(glue_amount, 0.0f, 1.0f);
 
         const float tau_seconds = m_tau_micros * 1e-6f;
-        m_ode_l.set_tau(tau_seconds);
-        m_ode_r.set_tau(tau_seconds);
+        m_ode_stereo.set_tau(tau_seconds);
     }
 
     void set_ballistics(float attack_ms, float release_ms, float glue_amount) noexcept {
@@ -381,13 +382,11 @@ public:
 
     void set_headroom(float sigma) noexcept {
         m_sigma = std::max(0.2f, sigma);
-        m_ode_l.set_sigma(m_sigma);
-        m_ode_r.set_sigma(m_sigma);
+        m_ode_stereo.set_sigma(m_sigma);
     }
 
     void reset() noexcept {
-        m_ode_l.reset();
-        m_ode_r.reset();
+        m_ode_stereo.reset();
         m_flux_ode_l.reset();
         m_flux_ode_r.reset();
         m_envelope = 0.0f;
@@ -402,7 +401,7 @@ public:
         if (m_mode == Mode::TransformerBus) {
             for (size_t i = 0; i < frames; ++i) {
                 float out_l = 0.0f, out_r = 0.0f;
-                m_ode_l.process_sample_stereo(buffer_l[i], buffer_r[i], out_l, out_r);
+                m_ode_stereo.process_sample_stereo(buffer_l[i], buffer_r[i], out_l, out_r);
                 buffer_l[i] = out_l;
                 buffer_r[i] = out_r;
             }
@@ -470,8 +469,7 @@ private:
     float m_release_coeff{0.0001f};
     float m_envelope{0.0f};
 
-    LiquidOdeIntegrator m_ode_l;
-    LiquidOdeIntegrator m_ode_r;
+    LiquidOdeIntegrator m_ode_stereo;
     LiquidOdeIntegrator m_flux_ode_l;
     LiquidOdeIntegrator m_flux_ode_r;
 };
@@ -492,8 +490,7 @@ class LiquidDynamicNoiseReducer {
 public:
     LiquidDynamicNoiseReducer(float sample_rate = 48000.0f) noexcept
         : m_sample_rate(sample_rate),
-          m_ode_filter_l(sample_rate, 20000.0f),
-          m_ode_filter_r(sample_rate, 20000.0f),
+          m_ode_filter_stereo(sample_rate, 20000.0f),
           m_hf_sidechain_l(sample_rate, 3000.0f),
           m_hf_sidechain_r(sample_rate, 3000.0f),
           m_smoother(sample_rate, 12.0f) // 12ms smooth glide
@@ -504,8 +501,7 @@ public:
     }
 
     void reset() noexcept {
-        m_ode_filter_l.reset();
-        m_ode_filter_r.reset();
+        m_ode_filter_stereo.reset();
         m_hf_sidechain_l.reset();
         m_hf_sidechain_r.reset();
         m_smoother.reset(0.0f);
@@ -515,8 +511,7 @@ public:
     void set_sample_rate(float sr) noexcept {
         if (sr > 0.0f) {
             m_sample_rate = sr;
-            m_ode_filter_l.set_sample_rate(sr);
-            m_ode_filter_r.set_sample_rate(sr);
+            m_ode_filter_stereo.set_sample_rate(sr);
             m_hf_sidechain_l.set_sample_rate(sr);
             m_hf_sidechain_r.set_sample_rate(sr);
             m_smoother.set_sample_rate(sr);
@@ -562,11 +557,9 @@ public:
         const float smooth_open = m_smoother.process_sample();
         const float active_fc = m_fc_closed + (m_fc_open - m_fc_closed) * smooth_open;
 
-        // 3. Update ODE filter cutoff and process audio
-        m_ode_filter_l.set_cutoff(active_fc);
-        m_ode_filter_r.set_cutoff(active_fc);
-
-        m_ode_filter_l.process_sample_stereo(in_l, in_r, out_l, out_r);
+        // 3. Update stereo ODE filter cutoff and process audio
+        m_ode_filter_stereo.set_cutoff(active_fc);
+        m_ode_filter_stereo.process_sample_stereo(in_l, in_r, out_l, out_r);
     }
 
 private:
@@ -577,8 +570,7 @@ private:
     float m_fc_open{20000.0f};
     float m_hf_envelope{0.0f};
 
-    LiquidOdeIntegrator m_ode_filter_l;
-    LiquidOdeIntegrator m_ode_filter_r;
+    LiquidOdeIntegrator m_ode_filter_stereo;
     LiquidOdeIntegrator m_hf_sidechain_l;
     LiquidOdeIntegrator m_hf_sidechain_r;
     LiquidParameterSmoother m_smoother;
