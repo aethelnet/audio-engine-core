@@ -134,7 +134,7 @@
           <span id="btn-label">AUDIO STARTEN (C++20 WASM)</span>
         </button>
         <span class="text-[9px] font-mono-tech text-[var(--text-muted)] text-center md:text-right">
-          📱 iOS / Mobil: Stummschalter am Gerät beachten
+          HINWEIS MOBIL / iOS: Hardware-Stummschalter beachten
         </span>
       </div>
     </div>
@@ -171,19 +171,30 @@
           <span class="text-[10px] text-rose-400">OSCILLATOR</span>
         </div>
         <div>
-          <label class="block text-[10px] text-[var(--text-secondary)] mb-1">WAVEFORM:</label>
-          <div class="grid grid-cols-3 gap-1">
-            <button class="wave-btn active px-2 py-1 rounded bg-rose-500 text-[var(--text-primary)] font-bold text-[10px]" data-wave="0">SAW</button>
-            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-[var(--text-secondary)] text-[10px]" data-wave="1">SQR</button>
-            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-white text-[var(--text-secondary)] text-[10px]" data-wave="2">SIN</button>
+          <label class="block text-[10px] text-[var(--text-secondary)] mb-1">WAVEFORM &amp; GATE:</label>
+          <div class="grid grid-cols-3 gap-1 mb-1.5">
+            <button class="wave-btn active px-2 py-1 rounded bg-rose-500 text-white font-bold text-[10px] cursor-pointer" data-wave="0">SAW</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-rose-400 text-[var(--text-secondary)] text-[10px] cursor-pointer" data-wave="1">SQR</button>
+            <button class="wave-btn px-2 py-1 rounded border border-[var(--border-hairline)] hover:border-rose-400 text-[var(--text-secondary)] text-[10px] cursor-pointer" data-wave="2">SIN</button>
+          </div>
+          <div class="grid grid-cols-2 gap-1">
+            <button id="mode-pulse-btn" class="px-2 py-1 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-500 font-bold text-[10px] cursor-pointer">ARP PULSE</button>
+            <button id="mode-drone-btn" class="px-2 py-1 rounded border border-[var(--border-hairline)] text-[var(--text-secondary)] text-[10px] cursor-pointer">STEADY DRONE</button>
           </div>
         </div>
         <div>
           <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
-            <span>FREQUENCY</span>
+            <span>BASE FREQ</span>
             <span id="freq-val" class="text-[var(--text-primary)] font-bold">110 Hz (A2)</span>
           </div>
-          <input type="range" id="slider-freq" min="55" max="880" step="1" value="110" class="w-full accent-rose-500 cursor-pointer" />
+          <input type="range" id="slider-freq" min="55" max="440" step="1" value="110" class="w-full accent-rose-500 cursor-pointer" />
+        </div>
+        <div>
+          <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
+            <span>MONITOR TRIM</span>
+            <span id="trim-val" class="text-[var(--text-primary)] font-bold">-8.0 dB</span>
+          </div>
+          <input type="range" id="slider-trim" min="-24" max="0" step="0.5" value="-8" class="w-full accent-rose-500 cursor-pointer" />
         </div>
       </div>
 
@@ -442,18 +453,27 @@
     </div>
   </footer>
 
-  <!-- 04 // WASM & WebAudio Runtime Glue -->
-  <script src="/audio_core.js"></script>
+  <!-- 04 // Off-Main-Thread AudioWorklet + C++20 WASM Runtime Glue -->
   <script>
-    let wasmModule = null;
     let audioCtx = null;
-    let scriptNode = null;
+    let workletNode = null;
+    let fallbackScriptNode = null;
+    let fallbackWasmMod = null;
+    let wasmJsSource = null;
+    let wasmBinaryBytes = null;
+    let wasmAssetsPromise = null;
+
     let isPlaying = false;
     let limiterActive = true;
     let currentWave = 0;
+    let pulseMode = true; // true = musical ARP PULSE, false = continuous DRONE
+    let monitorGain = Math.pow(10, -8.0 / 20.0);
 
-    let ptrLeft = 0;
-    let ptrRight = 0;
+    let latestPeakL = 0;
+    let latestPeakR = 0;
+    let lastPeakDomUpdate = 0;
+    let lastDbLStr = '';
+    let lastDbRStr = '';
 
     const btnToggle = document.getElementById('btn-audio-toggle');
     const btnLabel = document.getElementById('btn-label');
@@ -462,10 +482,12 @@
     const statusText = document.getElementById('engine-status-text');
     const statusDot = document.getElementById('engine-status-dot');
     const srReadout = document.getElementById('sr-readout');
+    const peakLEl = document.getElementById('peak-l-val');
+    const peakREl = document.getElementById('peak-r-val');
 
     const canvas = document.getElementById('scope-canvas');
     const ctx = canvas.getContext('2d');
-    let scopeData = new Float32Array(512);
+    const scopeData = new Float32Array(512);
 
     function resizeCanvas() {
       canvas.width = canvas.clientWidth * window.devicePixelRatio;
@@ -474,122 +496,379 @@
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
 
-    // 1. Initialize WASM Module
-    AudioCoreModule().then(mod => {
-      wasmModule = mod;
-      ptrLeft = mod._wasm_get_left_buffer();
-      ptrRight = mod._wasm_get_right_buffer();
-      console.log('C++20 Audio Core WASM initialized at pointers:', ptrLeft, ptrRight);
-      statusText.textContent = 'WASM LOADED // STANDBY';
-    }).catch(err => {
-      console.error('WASM load error:', err);
-      statusText.textContent = 'WASM LOAD ERROR';
-      statusDot.className = 'w-2 h-2 rounded-full bg-red-500';
-    });
+    // 1. Pre-fetch C++20 Emscripten glue & WASM binary once
+    function preloadWasmAssets() {
+      if (!wasmAssetsPromise) {
+        wasmAssetsPromise = Promise.all([
+          fetch('./audio_core.js').then(r => {
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' loading audio_core.js');
+            return r.text();
+          }),
+          fetch('./audio_core.wasm').then(r => {
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' loading audio_core.wasm');
+            return r.arrayBuffer();
+          })
+        ]).then(([jsText, wasmBuf]) => {
+          wasmJsSource = jsText;
+          wasmBinaryBytes = wasmBuf;
+          statusText.textContent = 'WASM LOADED // STANDBY';
+          return { jsText, wasmBuf };
+        }).catch(err => {
+          console.error('WASM preload error:', err);
+          statusText.textContent = 'WASM LOAD ERROR';
+          statusDot.className = 'w-2 h-2 rounded-full bg-red-500';
+          throw err;
+        });
+      }
+      return wasmAssetsPromise;
+    }
+    preloadWasmAssets();
 
-    // 2. Audio Context Toggle
-    btnToggle.addEventListener('click', async () => {
-      if (!wasmModule) {
-        console.warn('WASM module not yet loaded');
-        return;
+    function getCurrentParams() {
+      return {
+        playing: isPlaying,
+        freq: parseFloat(document.getElementById('slider-freq').value) || 110,
+        wave: currentWave,
+        pulseMode: pulseMode,
+        drive: parseFloat(document.getElementById('slider-drive').value) || 0.4,
+        bass: parseFloat(document.getElementById('slider-bass').value) || 3.0,
+        treble: parseFloat(document.getElementById('slider-treble').value) || 1.5,
+        comp: parseFloat(document.getElementById('slider-comp').value) || 0.35,
+        limiter: limiterActive ? 1 : 0,
+        monitorGain: monitorGain,
+      };
+    }
+
+    function sendParamToEngine(msg) {
+      if (workletNode) {
+        workletNode.port.postMessage(msg);
+      } else if (fallbackWasmMod) {
+        applyFallbackParam(msg);
+      }
+    }
+
+    // Build dedicated real-time AudioWorklet module containing C++20 WASM engine
+    function buildWorkletModuleUrl(emscriptenJs) {
+      const workletProcessorSource = `
+        if (typeof globalThis.setTimeout === 'undefined') {
+          globalThis.setTimeout = (fn) => Promise.resolve().then(fn);
+        }
+        ${emscriptenJs}
+
+        // Semitone ratios for musical C++ DSP demonstration (A minor pentatonic / fifths)
+        const ARP_RATIOS = [1.0, 1.5, 1.781797, 2.0, 2.378414, 1.781797, 1.5, 1.33484];
+
+        class AethelAudioCoreProcessor extends AudioWorkletProcessor {
+          constructor(options) {
+            super();
+            this.mod = null;
+            this.ptrL = 0;
+            this.ptrR = 0;
+            this.sr = sampleRate || 48000;
+
+            this.playing = false;
+            this.fadeEnv = 0.0;
+            this.baseFreq = 110.0;
+            this.smoothFreq = 110.0;
+            this.wave = 0;
+            this.pulseMode = true;
+            this.monitorGain = 0.398;
+
+            this.stepSamples = Math.round(this.sr * 0.165); // ~165ms 16th/8th groove
+            this.stepCounter = 0;
+            this.stepIndex = 0;
+            this.noteEnv = 1.0;
+
+            this.scopeRing = new Float32Array(512);
+            this.scopeWrite = 0;
+            this.telemetryDecim = 0;
+            this.peakHoldL = 0.0;
+            this.peakHoldR = 0.0;
+
+            const opts = (options && options.processorOptions) || {};
+            if (opts.initialParams) {
+              Object.assign(this, opts.initialParams);
+              if (typeof opts.initialParams.freq === 'number') {
+                this.baseFreq = opts.initialParams.freq;
+              }
+              this.smoothFreq = this.baseFreq;
+            }
+
+            this.port.onmessage = (ev) => {
+              const d = ev.data || {};
+              if (typeof d.playing === 'boolean') {
+                this.playing = d.playing;
+                if (this.playing && this.fadeEnv < 0.001) {
+                  this.stepCounter = 0;
+                  this.stepIndex = 0;
+                  this.noteEnv = 1.0;
+                }
+              }
+              if (typeof d.freq === 'number') this.baseFreq = d.freq;
+              if (typeof d.wave === 'number') {
+                this.wave = d.wave;
+                if (this.mod) this.mod._wasm_set_synth(1, this.smoothFreq, this.wave);
+              }
+              if (typeof d.pulseMode === 'boolean') {
+                this.pulseMode = d.pulseMode;
+                this.noteEnv = 1.0;
+              }
+              if (typeof d.monitorGain === 'number') this.monitorGain = d.monitorGain;
+              if (this.mod) {
+                if (typeof d.drive === 'number') this.mod._wasm_set_drive(d.drive);
+                if (typeof d.bass === 'number') this.mod._wasm_set_bass(d.bass);
+                if (typeof d.treble === 'number') this.mod._wasm_set_treble(d.treble);
+                if (typeof d.comp === 'number') this.mod._wasm_set_comp(d.comp);
+                if (typeof d.limiter === 'number') this.mod._wasm_set_limiter(d.limiter);
+              }
+            };
+
+            if (opts.wasmBinary) {
+              AudioCoreModule({ wasmBinary: opts.wasmBinary }).then((mod) => {
+                this.mod = mod;
+                this.ptrL = mod._wasm_get_left_buffer();
+                this.ptrR = mod._wasm_get_right_buffer();
+                mod._wasm_init(this.sr);
+                mod._wasm_set_drive(opts.initialParams ? opts.initialParams.drive : 0.4);
+                mod._wasm_set_bass(opts.initialParams ? opts.initialParams.bass : 3.0);
+                mod._wasm_set_treble(opts.initialParams ? opts.initialParams.treble : 1.5);
+                mod._wasm_set_comp(opts.initialParams ? opts.initialParams.comp : 0.35);
+                mod._wasm_set_limiter(opts.initialParams ? opts.initialParams.limiter : 1);
+                mod._wasm_set_synth(1, this.baseFreq, this.wave);
+                this.port.postMessage({ type: 'ready' });
+              });
+            }
+          }
+
+          process(inputs, outputs) {
+            const output = outputs[0];
+            if (!output || output.length === 0) return true;
+            const outL = output[0];
+            const outR = output.length > 1 ? output[1] : output[0];
+            const frames = outL.length;
+
+            if (!this.mod || (!this.playing && this.fadeEnv < 1e-4)) {
+              outL.fill(0);
+              if (outR !== outL) outR.fill(0);
+              return true;
+            }
+
+            // Musical note sequencing or steady drone before C++ DSP block
+            let targetHz = this.baseFreq;
+            if (this.pulseMode) {
+              targetHz = this.baseFreq * ARP_RATIOS[this.stepIndex % ARP_RATIOS.length];
+            }
+            this.smoothFreq += (targetHz - this.smoothFreq) * 0.22;
+            this.mod._wasm_set_synth(1, this.smoothFreq, this.wave);
+
+            // Execute native C++20 Airwindows chain (PurestDrive -> Baxandall -> ButterComp2 -> ClipOnly2)
+            this.mod._wasm_process(frames);
+
+            const idxL = this.ptrL >> 2;
+            const idxR = this.ptrR >> 2;
+            const heap = this.mod.HEAPF32;
+
+            const targetFade = this.playing ? 1.0 : 0.0;
+            const fadeCoeff = 1.0 - Math.exp(-1.0 / (0.012 * this.sr));
+            const decayCoeff = Math.exp(-1.0 / (0.095 * this.sr));
+
+            for (let i = 0; i < frames; i++) {
+              this.fadeEnv += (targetFade - this.fadeEnv) * fadeCoeff;
+
+              let gateGain = 1.0;
+              if (this.pulseMode) {
+                if (this.stepCounter === 0) {
+                  this.noteEnv = 1.0;
+                } else {
+                  this.noteEnv = 0.14 + (this.noteEnv - 0.14) * decayCoeff;
+                }
+                // 3ms micro-attack on step boundary to prevent step click
+                const atk = this.stepCounter < 144 ? (this.stepCounter / 144.0) : 1.0;
+                gateGain = this.noteEnv * (0.25 + 0.75 * atk);
+                this.stepCounter++;
+                if (this.stepCounter >= this.stepSamples) {
+                  this.stepCounter = 0;
+                  this.stepIndex = (this.stepIndex + 1) % ARP_RATIOS.length;
+                }
+              }
+
+              const dspL = heap[idxL + i] * gateGain * this.fadeEnv;
+              const dspR = heap[idxR + i] * gateGain * this.fadeEnv;
+
+              const al = Math.abs(dspL);
+              const ar = Math.abs(dspR);
+              if (al > this.peakHoldL) this.peakHoldL = al;
+              if (ar > this.peakHoldR) this.peakHoldR = ar;
+
+              this.scopeRing[this.scopeWrite] = dspL;
+              this.scopeWrite = (this.scopeWrite + 1) & 511;
+
+              outL[i] = dspL * this.monitorGain;
+              outR[i] = dspR * this.monitorGain;
+            }
+
+            this.telemetryDecim += frames;
+            if (this.telemetryDecim >= 2048) {
+              this.telemetryDecim = 0;
+              const snap = new Float32Array(512);
+              for (let i = 0; i < 512; i++) {
+                snap[i] = this.scopeRing[(this.scopeWrite + i) & 511];
+              }
+              this.port.postMessage({
+                type: 'telemetry',
+                peakL: this.peakHoldL,
+                peakR: this.peakHoldR,
+                scope: snap
+              }, [snap.buffer]);
+              this.peakHoldL *= 0.65;
+              this.peakHoldR *= 0.65;
+            }
+
+            return true;
+          }
+        }
+
+        registerProcessor('aethel-audio-core', AethelAudioCoreProcessor);
+      `;
+      return URL.createObjectURL(new Blob([workletProcessorSource], { type: 'application/javascript' }));
+    }
+
+    async function initAudioGraph() {
+      const assets = await preloadWasmAssets();
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+        alert('Web Audio API wird von diesem Browser nicht unterstuetzt.');
+        return false;
       }
 
-      if (!audioCtx) {
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextClass) {
-          alert('Web Audio API is not supported on this browser.');
-          return;
-        }
-
-        try {
-          audioCtx = new AudioContextClass({ sampleRate: 48000 });
-        } catch (e) {
-          console.warn('AudioContext({ sampleRate: 48000 }) fallback to default:', e);
-          audioCtx = new AudioContextClass();
-        }
-
-        // Synchronously unlock AudioContext on iOS/WebKit
-        if (audioCtx.state === 'suspended') {
-          try {
-            audioCtx.resume();
-          } catch (e) {
-            console.warn('Sync audioCtx.resume() failed:', e);
-          }
-        }
-
-        wasmModule._wasm_init(audioCtx.sampleRate);
-        srReadout.textContent = 'SR: ' + audioCtx.sampleRate + ' Hz';
-
-        // 1024 buffer size is universally supported across iOS Safari, Android, and Desktop
-        const bufSize = 1024;
-        scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 2);
-
-        // Dummy source prevents iOS Safari from garbage collecting or pausing ScriptProcessorNode
-        try {
-          const dummySrc = audioCtx.createBufferSource();
-          dummySrc.buffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
-          dummySrc.loop = true;
-          dummySrc.connect(scriptNode);
-          dummySrc.start(0);
-        } catch (e) {
-          console.warn('Dummy source setup ignored:', e);
-        }
-
-        scriptNode.onaudioprocess = (e) => {
-          const outL = e.outputBuffer.getChannelData(0);
-          const outR = e.outputBuffer.getChannelData(1);
-          const frames = e.outputBuffer.length;
-
-          if (!isPlaying || !wasmModule) {
-            outL.fill(0);
-            outR.fill(0);
-            return;
-          }
-
-          // Invoke C++ WASM Process
-          wasmModule._wasm_process(frames);
-
-          const heapL = wasmModule.HEAPF32.subarray(ptrLeft >> 2, (ptrLeft >> 2) + frames);
-          const heapR = wasmModule.HEAPF32.subarray(ptrRight >> 2, (ptrRight >> 2) + frames);
-
-          outL.set(heapL);
-          outR.set(heapR);
-
-          const scopeLen = Math.min(512, frames);
-          for (let i = 0; i < scopeLen; i++) {
-            scopeData[i] = heapL[i];
-          }
-
-          // Measure peak
-          let pkL = 0, pkR = 0;
-          for (let i = 0; i < frames; i++) {
-            const al = Math.abs(heapL[i]);
-            const ar = Math.abs(heapR[i]);
-            if (al > pkL) pkL = al;
-            if (ar > pkR) pkR = ar;
-          }
-          updatePeaks(pkL, pkR);
-        };
-        scriptNode.connect(audioCtx.destination);
+      try {
+        audioCtx = new AudioContextClass({ latencyHint: 'interactive', sampleRate: 48000 });
+      } catch (_e) {
+        audioCtx = new AudioContextClass();
       }
 
       if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      srReadout.textContent = 'SR: ' + audioCtx.sampleRate + ' Hz';
+
+      const initialParams = getCurrentParams();
+
+      if (audioCtx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        const modUrl = buildWorkletModuleUrl(assets.jsText);
         try {
-          await audioCtx.resume();
-        } catch (e) {
-          console.warn('Async audioCtx.resume() failed:', e);
+          await audioCtx.audioWorklet.addModule(modUrl);
+          URL.revokeObjectURL(modUrl);
+          workletNode = new AudioWorkletNode(audioCtx, 'aethel-audio-core', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+            processorOptions: {
+              wasmBinary: assets.wasmBuf.slice(0),
+              initialParams
+            }
+          });
+          workletNode.port.onmessage = (ev) => {
+            const d = ev.data;
+            if (d && d.type === 'telemetry') {
+              latestPeakL = d.peakL;
+              latestPeakR = d.peakR;
+              if (d.scope && d.scope.length === 512) {
+                scopeData.set(d.scope);
+              }
+            }
+          };
+          workletNode.connect(audioCtx.destination);
+          return true;
+        } catch (workletErr) {
+          console.warn('AudioWorklet fallback triggered:', workletErr);
+          URL.revokeObjectURL(modUrl);
         }
       }
 
+      // Legacy fallback without 1-sample loop bug and without DOM writes in callback
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = './audio_core.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+      fallbackWasmMod = await window.AudioCoreModule({ wasmBinary: assets.wasmBuf.slice(0) });
+      const pL = fallbackWasmMod._wasm_get_left_buffer();
+      const pR = fallbackWasmMod._wasm_get_right_buffer();
+      fallbackWasmMod._wasm_init(audioCtx.sampleRate);
+      applyFallbackParam(initialParams);
+      fallbackWasmMod._wasm_set_synth(1, initialParams.freq, initialParams.wave);
+
+      fallbackScriptNode = audioCtx.createScriptProcessor(2048, 0, 2);
+      let fbFade = 0.0;
+      fallbackScriptNode.onaudioprocess = (e) => {
+        const outL = e.outputBuffer.getChannelData(0);
+        const outR = e.outputBuffer.getChannelData(1);
+        const frames = e.outputBuffer.length;
+        if (!isPlaying && fbFade < 1e-4) {
+          outL.fill(0);
+          outR.fill(0);
+          return;
+        }
+        fallbackWasmMod._wasm_process(frames);
+        const heapL = fallbackWasmMod.HEAPF32.subarray(pL >> 2, (pL >> 2) + frames);
+        const heapR = fallbackWasmMod.HEAPF32.subarray(pR >> 2, (pR >> 2) + frames);
+        const target = isPlaying ? 1.0 : 0.0;
+        let pkL = 0, pkR = 0;
+        for (let i = 0; i < frames; i++) {
+          fbFade += (target - fbFade) * 0.002;
+          const sl = heapL[i] * fbFade;
+          const sr = heapR[i] * fbFade;
+          if (Math.abs(sl) > pkL) pkL = Math.abs(sl);
+          if (Math.abs(sr) > pkR) pkR = Math.abs(sr);
+          outL[i] = sl * monitorGain;
+          outR[i] = sr * monitorGain;
+          if (i < 512) scopeData[i] = sl;
+        }
+        latestPeakL = pkL;
+        latestPeakR = pkR;
+      };
+      fallbackScriptNode.connect(audioCtx.destination);
+      return true;
+    }
+
+    function applyFallbackParam(d) {
+      if (!fallbackWasmMod) return;
+      if (typeof d.freq === 'number' || typeof d.wave === 'number') {
+        const f = typeof d.freq === 'number' ? d.freq : parseFloat(document.getElementById('slider-freq').value);
+        fallbackWasmMod._wasm_set_synth(1, f, currentWave);
+      }
+      if (typeof d.drive === 'number') fallbackWasmMod._wasm_set_drive(d.drive);
+      if (typeof d.bass === 'number') fallbackWasmMod._wasm_set_bass(d.bass);
+      if (typeof d.treble === 'number') fallbackWasmMod._wasm_set_treble(d.treble);
+      if (typeof d.comp === 'number') fallbackWasmMod._wasm_set_comp(d.comp);
+      if (typeof d.limiter === 'number') fallbackWasmMod._wasm_set_limiter(d.limiter);
+    }
+
+    // 2. Audio Context Toggle
+    btnToggle.addEventListener('click', async () => {
+      if (!audioCtx) {
+        statusText.textContent = 'INITIALIZING AUDIOWORKLET...';
+        const ok = await initAudioGraph();
+        if (!ok) return;
+      }
+
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
       isPlaying = !isPlaying;
-      wasmModule._wasm_set_synth(isPlaying ? 1 : 0, parseFloat(document.getElementById('slider-freq').value), currentWave);
+      sendParamToEngine({ playing: isPlaying });
 
       if (isPlaying) {
         btnToggle.className = btnToggle.className.replace('bg-rose-500', 'bg-amber-500').replace('hover:bg-rose-400', 'hover:bg-amber-400');
         iconPlay.classList.add('hidden');
         iconPause.classList.remove('hidden');
         btnLabel.textContent = 'AUDIO STOPPEN';
-        statusText.textContent = 'C++ WASM AUDIO ACTIVE // ' + Math.round(audioCtx.sampleRate / 1000) + ' kHz';
+        const modeTag = workletNode ? 'AUDIOWORKLET' : 'LEGACY DSP';
+        statusText.textContent = 'C++20 WASM (' + modeTag + ') // ' + Math.round(audioCtx.sampleRate / 1000) + ' kHz';
         statusDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
       } else {
         btnToggle.className = btnToggle.className.replace('bg-amber-500', 'bg-rose-500').replace('hover:bg-amber-400', 'hover:bg-rose-400');
@@ -610,62 +889,80 @@
         });
         btn.classList.add('active', 'bg-rose-500', 'text-white');
         btn.classList.remove('border', 'border-[var(--border-hairline)]', 'text-[var(--text-secondary)]');
-        currentWave = parseInt(btn.getAttribute('data-wave'));
-        if (wasmModule && isPlaying) {
-          wasmModule._wasm_set_synth(1, parseFloat(document.getElementById('slider-freq').value), currentWave);
-        }
+        currentWave = parseInt(btn.getAttribute('data-wave'), 10);
+        sendParamToEngine({ wave: currentWave });
       });
+    });
+
+    const modePulseBtn = document.getElementById('mode-pulse-btn');
+    const modeDroneBtn = document.getElementById('mode-drone-btn');
+    function updateModeButtons() {
+      if (pulseMode) {
+        modePulseBtn.className = 'px-2 py-1 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-500 font-bold text-[10px] cursor-pointer';
+        modeDroneBtn.className = 'px-2 py-1 rounded border border-[var(--border-hairline)] text-[var(--text-secondary)] text-[10px] cursor-pointer';
+      } else {
+        modeDroneBtn.className = 'px-2 py-1 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-500 font-bold text-[10px] cursor-pointer';
+        modePulseBtn.className = 'px-2 py-1 rounded border border-[var(--border-hairline)] text-[var(--text-secondary)] text-[10px] cursor-pointer';
+      }
+    }
+    modePulseBtn.addEventListener('click', () => {
+      pulseMode = true;
+      updateModeButtons();
+      sendParamToEngine({ pulseMode: true });
+    });
+    modeDroneBtn.addEventListener('click', () => {
+      pulseMode = false;
+      updateModeButtons();
+      sendParamToEngine({ pulseMode: false });
     });
 
     document.getElementById('slider-freq').addEventListener('input', (e) => {
       const freq = parseFloat(e.target.value);
       document.getElementById('freq-val').textContent = Math.round(freq) + ' Hz';
-      if (wasmModule && isPlaying) {
-        wasmModule._wasm_set_synth(1, freq, currentWave);
-      }
+      sendParamToEngine({ freq });
+    });
+
+    document.getElementById('slider-trim').addEventListener('input', (e) => {
+      const db = parseFloat(e.target.value);
+      document.getElementById('trim-val').textContent = (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
+      monitorGain = Math.pow(10, db / 20.0);
+      sendParamToEngine({ monitorGain });
     });
 
     document.getElementById('slider-drive').addEventListener('input', (e) => {
       const val = parseFloat(e.target.value);
       document.getElementById('drive-val').textContent = Math.round(val * 100) + '%';
-      if (wasmModule) wasmModule._wasm_set_drive(val);
+      sendParamToEngine({ drive: val });
     });
 
     document.getElementById('slider-bass').addEventListener('input', (e) => {
       const val = parseFloat(e.target.value);
       document.getElementById('bass-val').textContent = (val >= 0 ? '+' : '') + val.toFixed(1) + ' dB';
-      if (wasmModule) wasmModule._wasm_set_bass(val);
+      sendParamToEngine({ bass: val });
     });
 
     document.getElementById('slider-treble').addEventListener('input', (e) => {
       const val = parseFloat(e.target.value);
       document.getElementById('treble-val').textContent = (val >= 0 ? '+' : '') + val.toFixed(1) + ' dB';
-      if (wasmModule) wasmModule._wasm_set_treble(val);
+      sendParamToEngine({ treble: val });
     });
 
     document.getElementById('slider-comp').addEventListener('input', (e) => {
       const val = parseFloat(e.target.value);
       document.getElementById('comp-val').textContent = Math.round(val * 100) + '%';
-      if (wasmModule) wasmModule._wasm_set_comp(val);
+      sendParamToEngine({ comp: val });
     });
 
     document.getElementById('btn-limiter').addEventListener('click', (e) => {
       limiterActive = !limiterActive;
       e.target.textContent = limiterActive ? 'CLIPONLY2: [AKTIV]' : 'CLIPONLY2: [BYPASS]';
       if (limiterActive) {
-        e.target.className = 'w-full py-1.5 px-3 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300 font-bold text-[10px] hover:bg-purple-500/30 transition-all';
+        e.target.className = 'w-full py-1.5 px-3 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300 font-bold text-[10px] hover:bg-purple-500/30 transition-all cursor-pointer';
       } else {
-        e.target.className = 'w-full py-1.5 px-3 rounded bg-gray-800 border border-gray-700 text-[var(--text-secondary)] font-bold text-[10px] hover:bg-gray-700 transition-all';
+        e.target.className = 'w-full py-1.5 px-3 rounded bg-gray-800 border border-gray-700 text-[var(--text-secondary)] font-bold text-[10px] hover:bg-gray-700 transition-all cursor-pointer';
       }
-      if (wasmModule) wasmModule._wasm_set_limiter(limiterActive ? 1 : 0);
+      sendParamToEngine({ limiter: limiterActive ? 1 : 0 });
     });
-
-    function updatePeaks(l, r) {
-      const dbL = l > 1e-4 ? (20 * Math.log10(l)).toFixed(1) + ' dB' : '-∞ dB';
-      const dbR = r > 1e-4 ? (20 * Math.log10(r)).toFixed(1) + ' dB' : '-∞ dB';
-      document.getElementById('peak-l-val').textContent = dbL;
-      document.getElementById('peak-r-val').textContent = dbR;
-    }
 
     // Theme Toggle Handler
     const themeBtn = document.getElementById('theme-toggle-btn');
@@ -690,9 +987,26 @@
       applyTheme(newTheme);
     });
 
-    // 4. Oscilloscope Canvas Animation
-    function drawScope() {
+    // 4. Oscilloscope & Throttled Peak Readout (strictly outside audio thread)
+    function drawScope(now) {
       requestAnimationFrame(drawScope);
+
+      if (now - lastPeakDomUpdate > 90) {
+        lastPeakDomUpdate = now;
+        const lVal = isPlaying ? latestPeakL : 0;
+        const rVal = isPlaying ? latestPeakR : 0;
+        const dbL = lVal > 1e-4 ? (20 * Math.log10(lVal)).toFixed(1) + ' dB' : '-inf dB';
+        const dbR = rVal > 1e-4 ? (20 * Math.log10(rVal)).toFixed(1) + ' dB' : '-inf dB';
+        if (dbL !== lastDbLStr) {
+          lastDbLStr = dbL;
+          peakLEl.textContent = dbL;
+        }
+        if (dbR !== lastDbRStr) {
+          lastDbRStr = dbR;
+          peakREl.textContent = dbR;
+        }
+      }
+
       const w = canvas.width;
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
@@ -702,7 +1016,6 @@
       const traceColor = isDark ? '#f43f5e' : '#e11d48';
       const flatlineColor = isDark ? 'rgba(244, 63, 94, 0.3)' : 'rgba(225, 29, 72, 0.35)';
 
-      // Grid
       ctx.strokeStyle = gridColor;
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -720,16 +1033,25 @@
         return;
       }
 
-      // Live Waveform trace straight from C++ memory
+      // Rising-edge zero-crossing trigger for stable standing waveform display
+      let trig = 0;
+      for (let i = 1; i < 256; i++) {
+        if (scopeData[i - 1] <= 0 && scopeData[i] > 0) {
+          trig = i;
+          break;
+        }
+      }
+
       ctx.strokeStyle = traceColor;
       ctx.lineWidth = 2 * window.devicePixelRatio;
       ctx.beginPath();
 
-      const sliceWidth = w / 512;
+      const drawSamples = 256;
+      const sliceWidth = w / drawSamples;
       let x = 0;
 
-      for (let i = 0; i < 512; i++) {
-        const v = scopeData[i];
+      for (let i = 0; i < drawSamples; i++) {
+        const v = scopeData[trig + i];
         const y = (h / 2) - (v * (h * 0.42));
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
